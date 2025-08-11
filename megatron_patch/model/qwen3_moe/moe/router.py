@@ -13,8 +13,23 @@ from megatron.core.transformer.moe.router import TopKRouter as _TopKRuter
 
 from .moe_utils import topk_softmax_with_capacity
 
+# Import trajectory tracking (optional)
+try:
+    from .rl_trajectory import get_trajectory_tracker
+    _TRAJECTORY_AVAILABLE = True
+except ImportError:
+    _TRAJECTORY_AVAILABLE = False
+
 class TopKRouter(_TopKRuter):
     """Route each token to the top-k experts."""
+
+    def __init__(self, config, model_comm_pgs=None):
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
+        # Cache trajectory tracker reference if needed
+        self._trajectory_tracker = None
+        self._use_trajectory_tracking = getattr(config, 'moe_router_use_trajectory_tracking', False)
+        if self._use_trajectory_tracking and _TRAJECTORY_AVAILABLE:
+            self._trajectory_tracker = get_trajectory_tracker()
 
     def compute_routing_scores_for_aux_loss(self, logits: torch.Tensor) -> torch.Tensor:
         """Compute routing scores based on the score function.
@@ -169,6 +184,17 @@ class TopKRouter(_TopKRuter):
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
         # Prevent extra local tokens accumulation on evaluation or activation recomputation
+        # Track trajectory if enabled
+        if self._use_trajectory_tracking and self._trajectory_tracker is not None:
+            # Store logits and routing decisions for trajectory tracking
+            original_logits = logits.view(seq_length, bsz, -1)
+            self._trajectory_tracker.add_layer_decision(
+                layer_num=self.layer_number,
+                logits=original_logits,
+                routing_map=routing_map.view(seq_length, bsz, -1),
+                probs=scores  # Store the 2D tensor directly
+            )
+
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
