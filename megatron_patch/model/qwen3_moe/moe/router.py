@@ -192,7 +192,7 @@ class TopKRouter(_TopKRuter):
                 layer_num=self.layer_number,
                 logits=original_logits,
                 routing_map=routing_map.view(seq_length, bsz, -1),
-                probs=scores  # Store the 2D tensor directly
+                scores=scores  # Store the 2D tensor directly
             )
 
         if self.enable_expert_bias and torch.is_grad_enabled():
