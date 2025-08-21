@@ -515,6 +515,8 @@ def get_patch_args(parser):
     group.add_argument('--freeze-ViT', action='store_true', default=False)
     group.add_argument('--language-model-type', type=str, required=False)
     group.add_argument('--vision-model-type', type=str, default="clip")
+    group.add_argument('--router-only-training', action='store_true', default=False,
+                      help='Freeze all parameters except MoE router weights')
     group.add_argument("--disable-vision-class-token", action="store_true", default=False)
     group.add_argument(
         "--allow-missing-vision-projection-checkpoint", action="store_true", default=False
