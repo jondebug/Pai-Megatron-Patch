@@ -523,13 +523,13 @@ def get_patch_args(parser):
                       help='RL algorithm to use: reinforce or ppo (default: reinforce)')
     group.add_argument('--rl-loss-coeff', type=float, default=0.1,
                       help='Coefficient for RL loss (default: 0.1)')
-    group.add_argument('--use-wandb', action='store_true', default=False,
+    group.add_argument('--enable-wandb-logging', action='store_true', default=False,
                       help='Enable wandb logging for training metrics')
-    group.add_argument('--wandb-project', type=str, default='qwen3-moe-training',
+    group.add_argument('--wandb-project-name', type=str, default='qwen3-moe-training',
                       help='Wandb project name (default: qwen3-moe-training)')
-    group.add_argument('--wandb-name', type=str, default=None,
+    group.add_argument('--wandb-run-name', type=str, default=None,
                       help='Wandb run name (default: auto-generated)')
-    group.add_argument('--wandb-tags', type=str, nargs='*', default=[],
+    group.add_argument('--wandb-run-tags', type=str, nargs='*', default=[],
                       help='Wandb tags for the run')
     group.add_argument("--disable-vision-class-token", action="store_true", default=False)
     group.add_argument(

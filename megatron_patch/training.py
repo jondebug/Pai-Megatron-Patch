@@ -388,7 +388,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     writer = get_tensorboard_writer()
     
     # Log to wandb if enabled
-    if getattr(args, 'use_wandb', False):
+    if getattr(args, 'enable_wandb_logging', False):
         try:
             import wandb
             from megatron.core import parallel_state as mpu
@@ -840,7 +840,7 @@ def evaluate_and_print_results(prefix, forward_step_func,
     string = ' validation loss at {} | '.format(prefix)
     
     # Log to wandb if enabled
-    if getattr(args, 'use_wandb', False):
+    if getattr(args, 'enable_wandb_logging', False):
         try:
             import wandb
             from megatron.core import parallel_state as mpu

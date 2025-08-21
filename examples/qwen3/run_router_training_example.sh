@@ -119,17 +119,17 @@ false \
 500 \
 /lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/output_router_finetuning \
 --router-only-training \
---use-wandb \
---wandb-project my-router-training \
---wandb-name router-experiment-1 \
---wandb-tags router-only moe-training
+--enable-wandb-logging \
+--wandb-project-name my-router-training \
+--wandb-run-name router-experiment-1 \
+--wandb-run-tags router-only moe-training
 
 echo ""
 echo "Wandb Options:"
-echo "--use-wandb                      # Enable wandb logging"
-echo "--wandb-project my-project       # Wandb project name"
-echo "--wandb-name my-experiment       # Experiment name"
-echo "--wandb-tags tag1 tag2           # Tags for organization"
+echo "--enable-wandb-logging           # Enable wandb logging"
+echo "--wandb-project-name my-project  # Wandb project name"
+echo "--wandb-run-name my-experiment   # Experiment name"
+echo "--wandb-run-tags tag1 tag2       # Tags for organization"
 echo ""
 echo "This will log:"
 echo "• train/lm_loss                  # Language modeling loss"

@@ -179,20 +179,20 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
                 print_rank_0(f"Enabled trajectory tracking for module: {module.__class__.__name__}")
 
     # Initialize wandb if enabled
-    if args.use_wandb:
+    if args.enable_wandb_logging:
         from megatron.core import parallel_state as mpu
         if mpu.get_data_parallel_rank() == 0:  # Only log from main process
             try:
                 import wandb
-                run_name = args.wandb_name or f"qwen3-moe-{args.save.split('/')[-1]}"
-                tags = args.wandb_tags.copy()
+                run_name = args.wandb_run_name or f"qwen3-moe-{args.save.split('/')[-1]}"
+                tags = args.wandb_run_tags.copy()
                 if args.router_only_training:
                     tags.append("router-only")
                 if args.use_rl_loss:
                     tags.append(f"rl-{args.rl_algorithm}")
                 
                 wandb.init(
-                    project=args.wandb_project,
+                    project=args.wandb_project_name,
                     name=run_name,
                     tags=tags,
                     config={
@@ -209,13 +209,13 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
                         "rl_loss_coeff": args.rl_loss_coeff if args.use_rl_loss else None,
                     }
                 )
-                print_rank_0(f"WANDB INITIALIZED: project={args.wandb_project}, name={run_name}")
+                print_rank_0(f"WANDB INITIALIZED: project={args.wandb_project_name}, name={run_name}")
             except ImportError:
                 print_rank_0("WARNING: wandb not installed. Install with: pip install wandb")
-                args.use_wandb = False
+                args.enable_wandb_logging = False
             except Exception as e:
                 print_rank_0(f"WARNING: Failed to initialize wandb: {e}")
-                args.use_wandb = False
+                args.enable_wandb_logging = False
 
     return model
 
