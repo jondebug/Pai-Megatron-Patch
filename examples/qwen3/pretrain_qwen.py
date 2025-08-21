@@ -216,6 +216,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
             except Exception as e:
                 print_rank_0(f"WARNING: Failed to initialize wandb: {e}")
                 args.enable_wandb_logging = False
+                raise e
 
     return model
 
