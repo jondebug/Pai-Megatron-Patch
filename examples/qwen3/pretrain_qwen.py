@@ -51,8 +51,8 @@ def freeze_router_parameters(model):
     frozen_params = 0
     
     for name, param in model.named_parameters():
-        # Check if this is a router parameter
-        is_router = any(keyword in name for keyword in ['router.weight', 'mlp.router', 'gate.weight'])
+        # Check if this is a router/gate parameter - be more flexible with naming
+        is_router = any(keyword in name.lower() for keyword in ['router', 'gate']) and 'weight' in name
         
         if is_router:
             param.requires_grad = True

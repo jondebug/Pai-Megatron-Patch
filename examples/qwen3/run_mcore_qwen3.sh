@@ -59,6 +59,11 @@ WARMUP_TOKENS=${26}
 ###############################
 
 OUTPUT_BASEPATH=${27}
+
+# Capture any additional arguments (like --router-only-training)
+shift 27  # Remove the first 27 positional arguments
+EXTRA_ARGS="$@"  # Capture all remaining arguments
+
 ### OTHERS ###
 
 
@@ -505,9 +510,9 @@ megatron_options="  \
 #         --te-rng-tracker \         --external-cuda-graph \        --cuda-graph-scope attn
 
 
-run_cmd="torchrun $DISTRIBUTED_ARGS pretrain_qwen.py
+run_cmd="torchrun $DISTRIBUTED_ARGS pretrain_qwen.py \
  ${megatron_options} ${dataset_options} ${pr_options} ${load_option} ${activation_checkpoint_options} \
- ${do_option} ${sp_option} ${moe_options} ${offload_option} ${sft_options} ${vp_option} ${packing_options} ${uneven_split_option} ${attn_backend_option} ${tie_option} ${gqa_options}"
+ ${do_option} ${sp_option} ${moe_options} ${offload_option} ${sft_options} ${vp_option} ${packing_options} ${uneven_split_option} ${attn_backend_option} ${tie_option} ${gqa_options} ${EXTRA_ARGS}"
 
 echo ${run_cmd}
 eval ${run_cmd}
