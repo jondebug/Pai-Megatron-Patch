@@ -387,6 +387,11 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     timers = get_timers()
     writer = get_tensorboard_writer()
     
+    # Debug: Check if we have any wandb-related args
+    if iteration == 1:  # Only print once
+        print(f"[DEBUG] Args check - enable_wandb_logging: {getattr(args, 'enable_wandb_logging', 'NOT_FOUND')}")
+        print(f"[DEBUG] All args with 'wandb' in name: {[attr for attr in dir(args) if 'wandb' in attr.lower()]}")
+    
     # Log to wandb if enabled
     wandb_enabled = getattr(args, 'enable_wandb_logging', False)
     if wandb_enabled:
