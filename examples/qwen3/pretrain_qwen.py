@@ -166,6 +166,12 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
         print_rank_0("ROUTER-ONLY TRAINING: Freezing all parameters except router weights")
         freeze_router_parameters(model)
 
+    # Initialize RL loss if enabled
+    if args.use_rl_loss:
+        print_rank_0(f"RL LOSS ENABLED: Using {args.rl_algorithm.upper()} algorithm with coefficient {args.rl_loss_coeff}")
+        if not args.router_only_training:
+            print_rank_0("WARNING: RL loss is typically used with router-only training")
+
     return model
 
 if __name__ == "__main__":
