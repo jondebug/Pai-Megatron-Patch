@@ -81,12 +81,12 @@ class RouterTrajectoryTracker:
         token_entropies = -(probs_from_logits * log_probs).sum(dim=-1)
         return token_entropies.mean()
     
-    def compute_reinforce_loss(self, trajectory_data: Dict, discount_factor: float = 0.99) -> torch.Tensor:
+    def compute_reinforce_loss(self, trajectory_data: Dict, discount_factor: float = 0.9) -> torch.Tensor:
         """Compute trajectory loss using entropy rewards with layer-wise discounting.
       
         Args:
             trajectory_data: Dictionary of layer decisions  
-            discount_factor: Discount factor γ for future rewards (0.99 = value future highly)
+            discount_factor: Discount factor γ for future rewards
             
         Returns:
             torch.Tensor: trajectory loss with discounted values
