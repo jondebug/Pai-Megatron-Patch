@@ -45,6 +45,27 @@ from megatron.training import get_args, pretrain, print_rank_0
 torch._dynamo.config.suppress_errors = True
 
 
+def freeze_router_parameters(model):
+    """Freeze all parameters except MoE router weights."""
+    router_params = 0
+    frozen_params = 0
+    
+    for name, param in model.named_parameters():
+        # Check if this is a router parameter
+        is_router = any(keyword in name for keyword in ['router.weight', 'mlp.router', 'gate.weight'])
+        
+        if is_router:
+            param.requires_grad = True
+            router_params += param.numel()
+            print_rank_0(f"[TRAINABLE] {name}")
+        else:
+            param.requires_grad = False
+            frozen_params += param.numel()
+    
+    total_params = router_params + frozen_params
+    print_rank_0(f"Router-only training: {router_params:,} trainable / {total_params:,} total parameters ({router_params/total_params:.1%})")
+
+
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
     """Builds the model.
 
@@ -139,6 +160,11 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
             rope_scaling=args.use_rope_scaling,
             mtp_block_spec=mtp_block_spec,
         )
+
+    # Apply router-only training if enabled
+    if args.router_only_training:
+        print_rank_0("ROUTER-ONLY TRAINING: Freezing all parameters except router weights")
+        freeze_router_parameters(model)
 
     return model
 
