@@ -178,91 +178,55 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
                 module.config.moe_router_use_trajectory_tracking = True
                 print_rank_0(f"Enabled trajectory tracking for module: {module.__class__.__name__}")
 
+    # Initialize wandb if enabled
+    if args.use_wandb:
+        from megatron.core import parallel_state as mpu
+        if mpu.get_data_parallel_rank() == 0:  # Only log from main process
+            try:
+                import wandb
+                run_name = args.wandb_name or f"qwen3-moe-{args.save.split('/')[-1]}"
+                tags = args.wandb_tags.copy()
+                if args.router_only_training:
+                    tags.append("router-only")
+                if args.use_rl_loss:
+                    tags.append(f"rl-{args.rl_algorithm}")
+                
+                wandb.init(
+                    project=args.wandb_project,
+                    name=run_name,
+                    tags=tags,
+                    config={
+                        "model_size": getattr(args, 'hidden_size', 'unknown'),
+                        "num_layers": getattr(args, 'num_layers', 'unknown'),
+                        "learning_rate": args.lr,
+                        "min_lr": args.min_lr,
+                        "global_batch_size": args.global_batch_size,
+                        "micro_batch_size": args.micro_batch_size,
+                        "seq_length": args.seq_length,
+                        "router_only": args.router_only_training,
+                        "use_rl_loss": args.use_rl_loss,
+                        "rl_algorithm": args.rl_algorithm if args.use_rl_loss else None,
+                        "rl_loss_coeff": args.rl_loss_coeff if args.use_rl_loss else None,
+                    }
+                )
+                print_rank_0(f"WANDB INITIALIZED: project={args.wandb_project}, name={run_name}")
+            except ImportError:
+                print_rank_0("WARNING: wandb not installed. Install with: pip install wandb")
+                args.use_wandb = False
+            except Exception as e:
+                print_rank_0(f"WARNING: Failed to initialize wandb: {e}")
+                args.use_wandb = False
+
     return model
 
-def forward_step_with_rl(data_iterator, model):
-    """Forward training step with RL loss integration."""
-    from megatron_patch.template.helper import forward_step as base_forward_step
-    from megatron_patch.model.qwen3_moe.moe.rl_trajectory import get_trajectory_tracker, reset_trajectory_tracker
-    from megatron.core import parallel_state as mpu
-    import torch
-    
-    args = get_args()
-    
-    # Reset trajectory tracker for new forward pass
-    if args.use_rl_loss:
-        reset_trajectory_tracker()
-    
-    # Call the base forward step to get LM loss
-    output_tensor, loss_func = base_forward_step(data_iterator, model)
-    
-    # Compute RL loss if enabled
-    if args.use_rl_loss:
-        tracker = get_trajectory_tracker()
-        
-        if len(tracker.layer_decisions) > 0:
-            # Compute RL loss based on algorithm choice
-            if args.rl_algorithm == 'reinforce':
-                rl_loss = tracker.compute_reinforce_loss(tracker.layer_decisions)
-            elif args.rl_algorithm == 'ppo':
-                old_trajectory = getattr(tracker, 'old_layer_decisions', {})
-                rl_loss = tracker.compute_ppo_loss(tracker.layer_decisions, old_trajectory)
-            else:
-                rl_loss = torch.tensor(0.0, device=output_tensor.device)
-            
-            # Scale RL loss by coefficient
-            scaled_rl_loss = rl_loss * args.rl_loss_coeff
-            
-            if mpu.get_tensor_model_parallel_rank() == 0:
-                print_rank_0(f"RL Loss: {rl_loss:.6f}, Scaled: {scaled_rl_loss:.6f}")
-        else:
-            scaled_rl_loss = torch.tensor(0.0, device=output_tensor.device)
-        
-        # Create a wrapper loss function that adds RL loss
-        def loss_func_with_rl(loss_mask, num_seqs, output_tensor):
-            result = loss_func(loss_mask, num_seqs, output_tensor)
-            
-            if num_seqs is None:
-                # Returns: (loss, losses_reduced_dict)
-                lm_loss, losses_reduced = result
-                total_loss = lm_loss + scaled_rl_loss
-                
-                # Add RL loss to reporting
-                losses_reduced = losses_reduced.copy()
-                losses_reduced["rl loss"] = scaled_rl_loss
-                
-                return total_loss, losses_reduced
-            else:
-                # Returns: (loss, num_seqs, losses_reduced_dict)  
-                lm_loss, num_seqs_sum, losses_reduced = result
-                total_loss = lm_loss + scaled_rl_loss
-                
-                # Add RL loss to reporting
-                losses_reduced = losses_reduced.copy()
-                losses_reduced["rl loss"] = scaled_rl_loss
-                
-                return total_loss, num_seqs_sum, losses_reduced
-        
-        return output_tensor, partial(loss_func_with_rl)
-    
-    # If no RL loss, return original
-    return output_tensor, loss_func
-
 if __name__ == "__main__":
-    from functools import partial
+    from megatron_patch.template.helper import forward_step
     train_valid_test_datasets_provider.is_distributed = True
-
-    # Use RL-enhanced forward step if RL loss is enabled
-    args = get_args()
-    if args.use_rl_loss:
-        forward_step_func = forward_step_with_rl
-    else:
-        from megatron_patch.template.helper import forward_step as forward_step_func
 
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
         ModelType.encoder_or_decoder,
-        forward_step_func,
+        forward_step,
         extra_args_provider=get_patch_args,
     )

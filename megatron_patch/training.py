@@ -386,6 +386,50 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     args = get_args()
     timers = get_timers()
     writer = get_tensorboard_writer()
+    
+    # Log to wandb if enabled
+    if getattr(args, 'use_wandb', False):
+        try:
+            import wandb
+            from megatron.core import parallel_state as mpu
+            
+            if mpu.get_data_parallel_rank() == 0 and not skipped_iter:  # Only log from main process
+                metrics = {"iteration": iteration}
+                
+                # Log losses
+                for key, loss_value in loss_dict.items():
+                    if hasattr(loss_value, 'item'):
+                        metrics[f"train/{key}"] = loss_value.item()
+                    else:
+                        metrics[f"train/{key}"] = float(loss_value)
+                
+                # Log additional metrics
+                if learning_rate is not None:
+                    metrics["train/learning_rate"] = learning_rate
+                if grad_norm is not None:
+                    metrics["train/grad_norm"] = grad_norm
+                if params_norm is not None:
+                    metrics["train/params_norm"] = params_norm
+                if num_zeros_in_grad is not None:
+                    metrics["train/num_zeros_in_grad"] = num_zeros_in_grad
+                if loss_scale is not None:
+                    metrics["train/loss_scale"] = loss_scale
+                
+                # Log throughput if available
+                if hasattr(timers, 'get_tflops_per_gpu'):
+                    try:
+                        throughput = timers.get_tflops_per_gpu()
+                        if throughput is not None:
+                            metrics["train/throughput_tflops_per_gpu"] = throughput
+                    except:
+                        pass
+                
+                wandb.log(metrics, step=iteration)
+        except Exception as e:
+            # Only print warning once to avoid spam
+            if not hasattr(training_log, '_wandb_warning_shown'):
+                print(f"WARNING: Failed to log to wandb: {e}")
+                training_log._wandb_warning_shown = True
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -794,6 +838,30 @@ def evaluate_and_print_results(prefix, forward_step_func,
         forward_step_func, data_iterator, model,
         process_non_loss_data_func, config, verbose)
     string = ' validation loss at {} | '.format(prefix)
+    
+    # Log to wandb if enabled
+    if getattr(args, 'use_wandb', False):
+        try:
+            import wandb
+            from megatron.core import parallel_state as mpu
+            
+            if mpu.get_data_parallel_rank() == 0:  # Only log from main process
+                eval_metrics = {"iteration": iteration}
+                
+                for key in total_loss_dict:
+                    loss_value = total_loss_dict[key].item()
+                    ppl = math.exp(min(20, loss_value))
+                    
+                    eval_metrics[f"eval/{key}"] = loss_value
+                    eval_metrics[f"eval/{key}_ppl"] = ppl
+                
+                wandb.log(eval_metrics, step=iteration)
+        except Exception as e:
+            # Only print warning once to avoid spam
+            if not hasattr(evaluate_and_print_results, '_wandb_warning_shown'):
+                print(f"WARNING: Failed to log evaluation to wandb: {e}")
+                evaluate_and_print_results._wandb_warning_shown = True
+    
     for key in total_loss_dict:
         string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
         ppl = math.exp(min(20, total_loss_dict[key].item()))
