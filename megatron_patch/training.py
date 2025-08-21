@@ -388,20 +388,32 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     writer = get_tensorboard_writer()
     
     # Log to wandb if enabled
-    if getattr(args, 'enable_wandb_logging', False):
+    wandb_enabled = getattr(args, 'enable_wandb_logging', False)
+    if wandb_enabled:
         try:
             import wandb
             from megatron.core import parallel_state as mpu
             
-            if mpu.get_data_parallel_rank() == 0 and not skipped_iter:  # Only log from main process
+            rank = mpu.get_data_parallel_rank()
+            
+            # Debug prints (only from rank 0)
+            if rank == 0:
+                print(f"[WANDB DEBUG] Iteration {iteration}, skipped_iter={skipped_iter}, loss_dict keys: {list(loss_dict.keys())}")
+                print(f"[WANDB DEBUG] Learning rate: {learning_rate}, grad_norm: {grad_norm}")
+            
+            if rank == 0 and not skipped_iter:  # Only log from main process
                 metrics = {"iteration": iteration}
                 
                 # Log losses
                 for key, loss_value in loss_dict.items():
-                    if hasattr(loss_value, 'item'):
-                        metrics[f"train/{key}"] = loss_value.item()
-                    else:
-                        metrics[f"train/{key}"] = float(loss_value)
+                    try:
+                        if hasattr(loss_value, 'item'):
+                            metrics[f"train/{key}"] = loss_value.item()
+                        else:
+                            metrics[f"train/{key}"] = float(loss_value)
+                        print(f"[WANDB DEBUG] Added metric train/{key}: {metrics[f'train/{key}']}")
+                    except Exception as e:
+                        print(f"[WANDB DEBUG] Failed to add metric {key}: {e}")
                 
                 # Log additional metrics
                 if learning_rate is not None:
@@ -424,12 +436,14 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                     except:
                         pass
                 
+                print(f"[WANDB DEBUG] Logging metrics: {list(metrics.keys())}")
                 wandb.log(metrics, step=iteration)
+                print(f"[WANDB DEBUG] Successfully logged to wandb")
         except Exception as e:
-            # Only print warning once to avoid spam
-            if not hasattr(training_log, '_wandb_warning_shown'):
-                print(f"WARNING: Failed to log to wandb: {e}")
-                training_log._wandb_warning_shown = True
+            # Always print wandb errors for debugging
+            print(f"ERROR: Failed to log to wandb: {e}")
+            import traceback
+            traceback.print_exc()
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
