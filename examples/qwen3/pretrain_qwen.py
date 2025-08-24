@@ -40,10 +40,124 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 from megatron_patch.arguments import get_patch_args
 from megatron_patch.data import train_valid_test_datasets_provider
-from megatron.training import get_args, print_rank_0
-from megatron_patch.training import pretrain
+from megatron.training import get_args, pretrain, print_rank_0
 
 torch._dynamo.config.suppress_errors = True
+
+
+def setup_wandb_logging():
+    """Monkey patch the training_log function to add Wandb logging"""
+    args = get_args()
+    
+    if getattr(args, 'enable_wandb_logging', False):
+        try:
+            import wandb
+            from megatron.training.training import training_log as original_training_log
+            from megatron.core import parallel_state as mpu
+            
+            def enhanced_training_log(loss_dict, total_loss_dict, learning_rate, iteration,
+                                    loss_scale, report_memory_flag, skipped_iter,
+                                    grad_norm, params_norm, num_zeros_in_grad):
+                """Enhanced training_log with Wandb integration"""
+                
+                # Call original training_log first
+                result = original_training_log(loss_dict, total_loss_dict, learning_rate, iteration,
+                                             loss_scale, report_memory_flag, skipped_iter,
+                                             grad_norm, params_norm, num_zeros_in_grad)
+                
+                # Add Wandb logging
+                try:
+                    rank = mpu.get_data_parallel_rank()
+                    
+                    if rank == 0 and not skipped_iter:  # Only log from main process
+                        metrics = {"iteration": iteration}
+                        
+                        # Log losses
+                        for key, loss_value in loss_dict.items():
+                            try:
+                                if hasattr(loss_value, 'item'):
+                                    metrics[f"train/{key}"] = loss_value.item()
+                                else:
+                                    metrics[f"train/{key}"] = float(loss_value)
+                            except Exception as e:
+                                print_rank_0(f"[WANDB DEBUG] Failed to add metric {key}: {e}")
+                        
+                        # Log additional metrics
+                        if learning_rate is not None:
+                            metrics["train/learning_rate"] = learning_rate
+                        if grad_norm is not None:
+                            metrics["train/grad_norm"] = grad_norm
+                        if params_norm is not None:
+                            metrics["train/params_norm"] = params_norm
+                        if num_zeros_in_grad is not None:
+                            metrics["train/num_zeros_in_grad"] = num_zeros_in_grad
+                        if loss_scale is not None:
+                            metrics["train/loss_scale"] = loss_scale
+                        
+                        wandb.log(metrics, step=iteration)
+                        print_rank_0(f"[WANDB DEBUG] Logged metrics at iteration {iteration}: {list(metrics.keys())}")
+                        
+                except Exception as e:
+                    print_rank_0(f"ERROR: Failed to log to wandb: {e}")
+                
+                return result
+            
+            # Also enhance evaluate_and_print_results for evaluation metrics
+            try:
+                from megatron.training.training import evaluate_and_print_results as original_evaluate
+                
+                def enhanced_evaluate_and_print_results(prefix, forward_step_func, 
+                                                       data_iterator, model, 
+                                                       process_non_loss_data_func, config, 
+                                                       verbose=False, write_to_tensorboard=True, 
+                                                       iteration=0):
+                    """Enhanced evaluate function with Wandb integration"""
+                    
+                    # Call original function first
+                    result = original_evaluate(prefix, forward_step_func, data_iterator, model, 
+                                             process_non_loss_data_func, config, verbose, 
+                                             write_to_tensorboard, iteration)
+                    
+                    # Add Wandb logging for evaluation metrics
+                    try:
+                        rank = mpu.get_data_parallel_rank()
+                        if rank == 0 and iteration > 0:
+                            eval_metrics = {}
+                            
+                            # Log evaluation results if available
+                            if hasattr(result, 'items'):
+                                for key, value in result.items():
+                                    try:
+                                        if hasattr(value, 'item'):
+                                            eval_metrics[f"eval/{prefix}_{key}"] = value.item()
+                                        else:
+                                            eval_metrics[f"eval/{prefix}_{key}"] = float(value)
+                                    except:
+                                        pass
+                            
+                            if eval_metrics:
+                                wandb.log(eval_metrics, step=iteration)
+                                print_rank_0(f"[WANDB DEBUG] Logged eval metrics at iteration {iteration}: {list(eval_metrics.keys())}")
+                    
+                    except Exception as e:
+                        print_rank_0(f"ERROR: Failed to log eval metrics to wandb: {e}")
+                    
+                    return result
+                
+                training_module.evaluate_and_print_results = enhanced_evaluate_and_print_results
+                
+            except Exception as e:
+                print_rank_0(f"WARNING: Failed to enhance evaluate function: {e}")
+            
+            # Replace the training_log function in the training module
+            import megatron.training.training as training_module
+            training_module.training_log = enhanced_training_log
+            print_rank_0("WANDB: Enhanced training_log and evaluate functions installed")
+            
+        except ImportError:
+            print_rank_0("WARNING: wandb not installed. Install with: pip install wandb")
+        except Exception as e:
+            print_rank_0(f"WARNING: Failed to setup wandb logging: {e}")
 
 
 def freeze_router_parameters(model):
@@ -211,6 +325,10 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
                     }
                 )
                 print_rank_0(f"WANDB INITIALIZED: project={args.wandb_project_name}, name={run_name}")
+                
+                # Setup enhanced logging functions
+                setup_wandb_logging()
+                
             except ImportError:
                 print_rank_0("WARNING: wandb not installed. Install with: pip install wandb")
                 args.enable_wandb_logging = False

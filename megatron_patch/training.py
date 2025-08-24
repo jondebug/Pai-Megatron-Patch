@@ -387,31 +387,14 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     timers = get_timers()
     writer = get_tensorboard_writer()
     
-    # ALWAYS print this to confirm function is called
-    print(f"=== TRAINING_LOG CALLED: iteration={iteration} ===")
-    
-    # Debug: Check if we have any wandb-related args
-    if iteration <= 3:  # Print for first few iterations
-        print(f"[DEBUG] Args check - enable_wandb_logging: {getattr(args, 'enable_wandb_logging', 'NOT_FOUND')}")
-        print(f"[DEBUG] All args with 'wandb' in name: {[attr for attr in dir(args) if 'wandb' in attr.lower()]}")
-        print(f"[DEBUG] Loss dict keys: {list(loss_dict.keys())}")
-    
     # Log to wandb if enabled
     wandb_enabled = getattr(args, 'enable_wandb_logging', False)
-    print(f"[DEBUG] wandb_enabled = {wandb_enabled}")
     if wandb_enabled:
-        print(f"=== ENTERING WANDB LOGGING SECTION ===")
         try:
             import wandb
             from megatron.core import parallel_state as mpu
             
             rank = mpu.get_data_parallel_rank()
-            print(f"[DEBUG] MPI rank: {rank}")
-            
-            # Debug prints (only from rank 0)
-            if rank == 0:
-                print(f"[WANDB DEBUG] Iteration {iteration}, skipped_iter={skipped_iter}, loss_dict keys: {list(loss_dict.keys())}")
-                print(f"[WANDB DEBUG] Learning rate: {learning_rate}, grad_norm: {grad_norm}")
             
             if rank == 0 and not skipped_iter:  # Only log from main process
                 metrics = {"iteration": iteration}
@@ -423,9 +406,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                             metrics[f"train/{key}"] = loss_value.item()
                         else:
                             metrics[f"train/{key}"] = float(loss_value)
-                        print(f"[WANDB DEBUG] Added metric train/{key}: {metrics[f'train/{key}']}")
                     except Exception as e:
-                        print(f"[WANDB DEBUG] Failed to add metric {key}: {e}")
+                        pass
                 
                 # Log additional metrics
                 if learning_rate is not None:
@@ -448,9 +430,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                     except:
                         pass
                 
-                print(f"[WANDB DEBUG] Logging metrics: {list(metrics.keys())}")
                 wandb.log(metrics, step=iteration)
-                print(f"[WANDB DEBUG] Successfully logged to wandb")
         except Exception as e:
             # Always print wandb errors for debugging
             print(f"ERROR: Failed to log to wandb: {e}")
