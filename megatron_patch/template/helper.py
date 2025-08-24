@@ -161,10 +161,39 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
     # LINK: https://github.com/NVIDIA/Megatron-LM/issues/906
     # The issue is solved since 0926
 
+    # Create loss dictionary starting with main loss
+    loss_dict = {"lm loss": averaged_loss}
+    
+    # Collect auxiliary losses from MoE layers (like load_balancing_loss)
+    from megatron.core.transformer.moe.moe_utils import (
+        get_moe_layer_wise_logging_tracker,
+        reduce_aux_losses_tracker_across_ranks,
+        clear_aux_losses_tracker,
+    )
+    
+    # Get the auxiliary losses tracker
+    tracker = get_moe_layer_wise_logging_tracker()
+    
+    if tracker:  # Only process if there are auxiliary losses
+        # Reduce auxiliary losses across ranks
+        reduce_aux_losses_tracker_across_ranks()
+        
+        # Add auxiliary losses to the loss dictionary
+        for name, loss_data in tracker.items():
+            if 'values' in loss_data:
+                aux_loss_values = loss_data['values'].float()
+                # Average across all MoE layers
+                aux_loss_avg = aux_loss_values.sum() / max(1, len(aux_loss_values.nonzero()))
+                loss_dict[name] = aux_loss_avg
+        
+        # Clear the tracker for next iteration
+        clear_aux_losses_tracker()
+        
+
     if num_seqs is None:
         # average on token-level
-        return loss[0] / loss[1] * args.context_parallel_size, {"lm loss": averaged_loss}
-    return loss[0] * args.context_parallel_size, num_seqs.sum(), {"lm loss": averaged_loss}
+        return loss[0] / loss[1] * args.context_parallel_size, loss_dict
+    return loss[0] * args.context_parallel_size, num_seqs.sum(), loss_dict
 
 def forward_step(data_iterator, model):
     """Forward training step.
