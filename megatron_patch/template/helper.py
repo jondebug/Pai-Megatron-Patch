@@ -185,6 +185,10 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
                 # Average across all MoE layers
                 aux_loss_avg = aux_loss_values.sum() / max(1, len(aux_loss_values.nonzero()))
                 loss_dict[name] = aux_loss_avg
+                max_aux_loss_value = torch.max(aux_loss_values)
+                min_aux_loss_value = torch.min(aux_loss_values)
+                loss_dict[f"{name}_max"] = max_aux_loss_value
+                loss_dict[f"{name}_min"] = min_aux_loss_value
         
         # Clear the tracker for next iteration
         clear_aux_losses_tracker()
