@@ -299,6 +299,24 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
         if mpu.get_data_parallel_rank() == 0:  # Only log from main process
             try:
                 import wandb
+                import os
+                
+                # Set Wandb directories to lustre filesystem to avoid root quota issues
+                wandb_base_dir = "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/wandb_data"
+                os.makedirs(wandb_base_dir, exist_ok=True)
+                
+                # Set environment variables for Wandb directories
+                os.environ["WANDB_DIR"] = wandb_base_dir
+                os.environ["WANDB_CONFIG_DIR"] = wandb_base_dir + "/config"
+                os.environ["WANDB_CACHE_DIR"] = wandb_base_dir + "/cache"
+                os.environ["WANDB_DATA_DIR"] = wandb_base_dir + "/data"
+                
+                # Create necessary directories
+                for dir_path in [wandb_base_dir + "/config", wandb_base_dir + "/cache", wandb_base_dir + "/data"]:
+                    os.makedirs(dir_path, exist_ok=True)
+                
+                print_rank_0(f"WANDB directories set to: {wandb_base_dir}")
+                
                 run_name = args.wandb_run_name or f"qwen3-moe-{args.save.split('/')[-1]}"
                 tags = args.wandb_run_tags.copy()
                 if args.router_only_training:
@@ -310,6 +328,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
                     project=args.wandb_project_name,
                     name=run_name,
                     tags=tags,
+                    dir=wandb_base_dir,  # Explicit directory setting
                     config={
                         "model_size": getattr(args, 'hidden_size', 'unknown'),
                         "num_layers": getattr(args, 'num_layers', 'unknown'),
