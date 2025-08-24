@@ -387,19 +387,26 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     timers = get_timers()
     writer = get_tensorboard_writer()
     
+    # ALWAYS print this to confirm function is called
+    print(f"=== TRAINING_LOG CALLED: iteration={iteration} ===")
+    
     # Debug: Check if we have any wandb-related args
-    if iteration == 1:  # Only print once
+    if iteration <= 3:  # Print for first few iterations
         print(f"[DEBUG] Args check - enable_wandb_logging: {getattr(args, 'enable_wandb_logging', 'NOT_FOUND')}")
         print(f"[DEBUG] All args with 'wandb' in name: {[attr for attr in dir(args) if 'wandb' in attr.lower()]}")
+        print(f"[DEBUG] Loss dict keys: {list(loss_dict.keys())}")
     
     # Log to wandb if enabled
     wandb_enabled = getattr(args, 'enable_wandb_logging', False)
+    print(f"[DEBUG] wandb_enabled = {wandb_enabled}")
     if wandb_enabled:
+        print(f"=== ENTERING WANDB LOGGING SECTION ===")
         try:
             import wandb
             from megatron.core import parallel_state as mpu
             
             rank = mpu.get_data_parallel_rank()
+            print(f"[DEBUG] MPI rank: {rank}")
             
             # Debug prints (only from rank 0)
             if rank == 0:
