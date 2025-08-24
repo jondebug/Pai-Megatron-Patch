@@ -54,15 +54,16 @@ def setup_wandb_logging():
             import wandb
             from megatron.training.training import training_log as original_training_log
             from megatron.core import parallel_state as mpu
+            import megatron.training.training as training_module  # Import at the top
             
-            def enhanced_training_log(loss_dict, total_loss_dict, learning_rate, iteration,
-                                    loss_scale, report_memory_flag, skipped_iter,
+            def enhanced_training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_rate, 
+                                    iteration, loss_scale, report_memory_flag, skipped_iter,
                                     grad_norm, params_norm, num_zeros_in_grad):
                 """Enhanced training_log with Wandb integration"""
                 
                 # Call original training_log first
-                result = original_training_log(loss_dict, total_loss_dict, learning_rate, iteration,
-                                             loss_scale, report_memory_flag, skipped_iter,
+                result = original_training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_rate,
+                                             iteration, loss_scale, report_memory_flag, skipped_iter,
                                              grad_norm, params_norm, num_zeros_in_grad)
                 
                 # Add Wandb logging
@@ -81,6 +82,7 @@ def setup_wandb_logging():
                                     metrics[f"train/{key}"] = float(loss_value)
                             except Exception as e:
                                 print_rank_0(f"[WANDB DEBUG] Failed to add metric {key}: {e}")
+                                raise e
                         
                         # Log additional metrics
                         if learning_rate is not None:
@@ -99,6 +101,7 @@ def setup_wandb_logging():
                         
                 except Exception as e:
                     print_rank_0(f"ERROR: Failed to log to wandb: {e}")
+                    raise e
                 
                 return result
             
@@ -144,20 +147,22 @@ def setup_wandb_logging():
                     
                     return result
                 
+                # Now training_module is available
                 training_module.evaluate_and_print_results = enhanced_evaluate_and_print_results
                 
             except Exception as e:
                 print_rank_0(f"WARNING: Failed to enhance evaluate function: {e}")
             
             # Replace the training_log function in the training module
-            import megatron.training.training as training_module
             training_module.training_log = enhanced_training_log
             print_rank_0("WANDB: Enhanced training_log and evaluate functions installed")
             
         except ImportError:
             print_rank_0("WARNING: wandb not installed. Install with: pip install wandb")
+            raise ImportError("wandb not installed")
         except Exception as e:
             print_rank_0(f"WARNING: Failed to setup wandb logging: {e}")
+            raise e
 
 
 def freeze_router_parameters(model):
@@ -351,6 +356,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
             except ImportError:
                 print_rank_0("WARNING: wandb not installed. Install with: pip install wandb")
                 args.enable_wandb_logging = False
+                raise ImportError("wandb not installed")
             except Exception as e:
                 print_rank_0(f"WARNING: Failed to initialize wandb: {e}")
                 args.enable_wandb_logging = False
