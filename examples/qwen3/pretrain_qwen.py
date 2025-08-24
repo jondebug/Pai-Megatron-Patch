@@ -40,7 +40,8 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 from megatron_patch.arguments import get_patch_args
 from megatron_patch.data import train_valid_test_datasets_provider
-from megatron.training import get_args, pretrain, print_rank_0
+from megatron.training import get_args, print_rank_0
+from megatron_patch.training import pretrain
 
 torch._dynamo.config.suppress_errors = True
 
