@@ -206,14 +206,23 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
         
         trajectory_tracker = get_trajectory_tracker()
         if hasattr(trajectory_tracker, 'layer_decisions') and len(trajectory_tracker.layer_decisions) > 0:
-            # Compute REINFORCE loss from the complete trajectory
-            rl_loss = trajectory_tracker.compute_reinforce_loss(
-                trajectory_tracker.layer_decisions,
-                discount_factor=0.9  # Can be made configurable via args
-            )
-            
-            # Scale the RL loss (can be made configurable via args)
+            # Get RL loss coefficient
             rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
+            
+            # Compute total REINFORCE loss from the complete trajectory
+            
+            use_per_layer_loss = getattr(args, 'use_per_layer_loss', False)
+
+            if use_per_layer_loss:
+                rl_loss = trajectory_tracker.compute_reinforce_loss_per_layer(
+                    trajectory_tracker.layer_decisions,
+                    discount_factor=0.9  # Can be made configurable via args
+                )
+            else:
+                rl_loss = trajectory_tracker.compute_reinforce_loss(
+                    trajectory_tracker.layer_decisions,
+                    discount_factor=0.9  # Can be made configurable via args
+                )
             rl_loss = rl_loss * rl_loss_coeff
             
             # Add RL loss directly to the main loss
