@@ -14,7 +14,7 @@ class RouterRLLossScaler(torch.autograd.Function):
         Args:
             output (torch.Tensor): The output tensor (router probs/scores)
             rl_loss (torch.Tensor): The RL loss tensor
-            loss_scale (float): Scaling factor for the loss
+            loss_scale (float): Scaling fac@tor for the loss
         """
         ctx.save_for_backward(rl_loss)
         ctx.loss_scale = loss_scale

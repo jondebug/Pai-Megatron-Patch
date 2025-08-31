@@ -195,7 +195,38 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
         
         # Clear the tracker for next iteration
         clear_aux_losses_tracker()
+    
+    # Add RL loss computation if trajectory tracking is enabled
+    rl_loss = torch.tensor(0.0, device=averaged_loss.device)
+    try:
+        from megatron_patch.model.qwen3_moe.moe.rl_trajectory import (
+            get_trajectory_tracker, 
+            reset_trajectory_tracker
+        )
         
+        trajectory_tracker = get_trajectory_tracker()
+        if hasattr(trajectory_tracker, 'layer_decisions') and len(trajectory_tracker.layer_decisions) > 0:
+            # Compute REINFORCE loss from the complete trajectory
+            rl_loss = trajectory_tracker.compute_reinforce_loss(
+                trajectory_tracker.layer_decisions,
+                discount_factor=0.9  # Can be made configurable via args
+            )
+            
+            # Scale the RL loss (can be made configurable via args)
+            rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
+            rl_loss = rl_loss * rl_loss_coeff
+            
+            # Add RL loss directly to the main loss
+            if rl_loss.item() != 0.0:
+                averaged_loss = averaged_loss + rl_loss
+                loss_dict["rl_loss"] = rl_loss.detach()
+                
+            # Reset trajectory for next iteration
+            reset_trajectory_tracker()
+            
+    except ImportError:
+        # Trajectory tracking not available, skip RL loss
+        pass
 
     if num_seqs is None:
         # average on token-level
