@@ -81,7 +81,6 @@ def setup_wandb_logging():
                                 else:
                                     metrics[f"train/{key}"] = float(loss_value)
                             except Exception as e:
-                                print_rank_0(f"[WANDB DEBUG] Failed to add metric {key}: {e}")
                                 raise e
                         
                         # Log additional metrics
@@ -97,7 +96,6 @@ def setup_wandb_logging():
                             metrics["train/loss_scale"] = loss_scale
                         
                         wandb.log(metrics, step=iteration)
-                        print_rank_0(f"[WANDB DEBUG] Logged metrics at iteration {iteration}: {list(metrics.keys())}")
                         
                 except Exception as e:
                     print_rank_0(f"ERROR: Failed to log to wandb: {e}")
@@ -140,7 +138,6 @@ def setup_wandb_logging():
                             
                             if eval_metrics:
                                 wandb.log(eval_metrics, step=iteration)
-                                print_rank_0(f"[WANDB DEBUG] Logged eval metrics at iteration {iteration}: {list(eval_metrics.keys())}")
                     
                     except Exception as e:
                         print_rank_0(f"ERROR: Failed to log eval metrics to wandb: {e}")
@@ -320,8 +317,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
                 for dir_path in [wandb_base_dir + "/config", wandb_base_dir + "/cache", wandb_base_dir + "/data"]:
                     os.makedirs(dir_path, exist_ok=True)
                 
-                print_rank_0(f"WANDB directories set to: {wandb_base_dir}")
-                
+               
                 run_name = args.wandb_run_name or f"qwen3-moe-{args.save.split('/')[-1]}"
                 tags = args.wandb_run_tags.copy()
                 if args.router_only_training:
