@@ -284,6 +284,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
         freeze_router_parameters(model)
 
     # Initialize RL loss if enabled
+    print_rank_0(f"[RL DEBUG] Initializing training with use_rl_loss={args.use_rl_loss}")
     if args.use_rl_loss:
         print_rank_0(f"RL LOSS ENABLED: Using {args.rl_algorithm.upper()} algorithm with coefficient {args.rl_loss_coeff}")
         if not args.router_only_training:
@@ -298,25 +299,21 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
             modules_found += 1
             if 'router' in module.__class__.__name__.lower():
                 router_modules_found += 1
-                print_rank_0(f"[RL DEBUG] Found router module: {module.__class__.__name__}")
+                if router_modules_found == 1:
+                    print_rank_0(f"[RL DEBUG] Found router module: {module.__class__.__name__}")
                 
                 # Set the trajectory tracking attribute directly on the config
-                if hasattr(module, 'config'):
-                    module.config.moe_router_use_trajectory_tracking = True
-                    trajectory_enabled_count += 1
-                    print_rank_0(f"[RL DEBUG] Enabled trajectory tracking for {module.__class__.__name__}")
-                    
+            
+                module.config.moe_router_use_trajectory_tracking = True
+                trajectory_enabled_count += 1
+                print_rank_0(f"[RL DEBUG] Enabled trajectory tracking for {module.__class__.__name__}")
+                
                     # Also reinitialize the router's trajectory tracking since config changed
-                    if hasattr(module, '_use_trajectory_tracking'):
-                        module._use_trajectory_tracking = True
-                        if hasattr(module, '_trajectory_tracker') and module._trajectory_tracker is None:
-                            try:
-                                from megatron_patch.model.qwen3_moe.moe.rl_trajectory import get_trajectory_tracker
-                                module._trajectory_tracker = get_trajectory_tracker()
-                                print_rank_0(f"[RL DEBUG] Initialized trajectory tracker for {module.__class__.__name__}")
-                            except ImportError:
-                                print_rank_0(f"[RL DEBUG] WARNING: Could not import trajectory tracker")
-        
+                module._use_trajectory_tracking = True
+                from megatron_patch.model.qwen3_moe.moe.rl_trajectory import get_trajectory_tracker
+                module._trajectory_tracker = get_trajectory_tracker()
+                print_rank_0(f"[RL DEBUG] Initialized trajectory tracker for {module.__class__.__name__}")
+
         print_rank_0(f"[RL DEBUG] Searched {modules_found} modules, found {router_modules_found} router modules, enabled trajectory tracking on {trajectory_enabled_count}")
 
     # Initialize wandb if enabled
