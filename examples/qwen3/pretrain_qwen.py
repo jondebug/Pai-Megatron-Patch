@@ -290,31 +290,19 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
         if not args.router_only_training:
             print_rank_0("WARNING: RL loss is typically used with router-only training")
         
-        # Enable trajectory tracking in MoE config
-        modules_found = 0
-        router_modules_found = 0
-        trajectory_enabled_count = 0
         
         for module in model.modules():
-            modules_found += 1
             if 'router' in module.__class__.__name__.lower():
-                router_modules_found += 1
-                if router_modules_found == 1:
-                    print_rank_0(f"[RL DEBUG] Found router module: {module.__class__.__name__}")
                 
                 # Set the trajectory tracking attribute directly on the config
             
                 module.config.moe_router_use_trajectory_tracking = True
-                trajectory_enabled_count += 1
-                print_rank_0(f"[RL DEBUG] Enabled trajectory tracking for {module.__class__.__name__}")
-                
+              
                     # Also reinitialize the router's trajectory tracking since config changed
                 module._use_trajectory_tracking = True
                 from megatron_patch.model.qwen3_moe.moe.rl_trajectory import get_trajectory_tracker
                 module._trajectory_tracker = get_trajectory_tracker()
-                print_rank_0(f"[RL DEBUG] Initialized trajectory tracker for {module.__class__.__name__}")
 
-        print_rank_0(f"[RL DEBUG] Searched {modules_found} modules, found {router_modules_found} router modules, enabled trajectory tracking on {trajectory_enabled_count}")
 
     # Initialize wandb if enabled
     if args.enable_wandb_logging:
