@@ -198,15 +198,15 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
         clear_aux_losses_tracker()
     
     # Add RL loss computation if trajectory tracking is enabled
+    trajectory_tracker = get_trajectory_tracker()
     rl_loss = torch.tensor(0.0, device=averaged_loss.device)
-    print_rank_0(f"[RL DEBUG] Computing RL loss from {len(trajectory_tracker.layer_decisions)} layers")
+
     try:
         from megatron_patch.model.qwen3_moe.moe.rl_trajectory import (
             get_trajectory_tracker, 
             reset_trajectory_tracker
         )
         
-        trajectory_tracker = get_trajectory_tracker()
         if hasattr(trajectory_tracker, 'layer_decisions') and len(trajectory_tracker.layer_decisions) > 0:
             print_rank_0(f"[RL DEBUG] Computing RL loss from {len(trajectory_tracker.layer_decisions)} layers")
             
