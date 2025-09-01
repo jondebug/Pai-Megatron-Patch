@@ -517,7 +517,7 @@ def get_patch_args(parser):
     group.add_argument('--vision-model-type', type=str, default="clip")
     group.add_argument('--router-only-training', action='store_true', default=False,
                       help='Freeze all parameters except MoE router weights')
-    group.add_argument('--use-rl-loss', action='store_true', default=False,
+    group.add_argument('--use_rl_loss', action='store_true', default=False,
                       help='Enable reinforcement learning loss for router training')
     group.add_argument('--rl-algorithm', type=str, default='reinforce', choices=['reinforce', 'ppo'],
                       help='RL algorithm to use: reinforce or ppo (default: reinforce)')

@@ -197,168 +197,208 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
         # Clear the tracker for next iteration
         clear_aux_losses_tracker()
     
-    # Add RL loss computation if trajectory tracking is enabled
-    from megatron_patch.model.qwen3_moe.moe.rl_trajectory import (
-            get_trajectory_tracker, 
-            reset_trajectory_tracker
+    if num_seqs is None:
+        # average on token-level
+        return loss[0] / loss[1] * args.context_parallel_size, loss_dict
+    return loss[0] * args.context_parallel_size, num_seqs.sum(), loss_dict
+
+
+def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: torch.Tensor):
+    """Loss function that includes RL auxiliary loss.
+
+    Assumes trajectory tracking is available and supported.
+    """
+    args = get_args()
+
+    losses = output_tensor.float()
+    loss_mask = loss_mask.view(-1).float()
+
+    # NOTE: for each seq, sum(loss_mask) == 1 if num_seqs is not None, 
+    # otherwise sum(loss_mask) == n_tokens
+    loss = torch.stack([torch.sum(losses.view(-1) * loss_mask), loss_mask.sum()])
+    if args.context_parallel_size > 1:
+        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+
+    # Check individual rank losses are not NaN prior to DP all-reduce.
+    if args.check_for_nan_in_loss_and_grad:
+        global_rank = torch.distributed.get_rank()
+        assert not loss.isnan().any(), (
+            f"Rank {global_rank}: found NaN in local forward loss calculation. "
+            f"Device: {torch.cuda.current_device()}, node: {os.uname()[1]}"
+        )
+
+    averaged_loss = average_losses_across_data_parallel_group(loss)
+    averaged_loss = averaged_loss[0] / averaged_loss[1]
+
+    # Create loss dictionary starting with main loss
+    loss_dict = {"lm loss": averaged_loss}
+    
+    # Collect auxiliary losses from MoE layers (like load_balancing_loss)
+    from megatron.core.transformer.moe.moe_utils import (
+        get_moe_layer_wise_logging_tracker,
+        reduce_aux_losses_tracker_across_ranks,
+        clear_aux_losses_tracker,
     )
+    
+    # Get the auxiliary losses tracker
+    tracker = get_moe_layer_wise_logging_tracker()
+    
+    if tracker:  # Only process if there are auxiliary losses
+        # Reduce auxiliary losses across ranks
+        reduce_aux_losses_tracker_across_ranks()
         
+        # Add auxiliary losses to the loss dictionary
+        for name, loss_data in tracker.items():
+            if 'values' in loss_data:
+                loss_values = loss_data['values'].float()
+                
+                # Average across all MoE layers
+                loss_avg = loss_values.sum() / max(1, len(loss_values.nonzero()))
+                loss_dict[name] = loss_avg
+                max_loss_value = torch.max(loss_values)
+                min_loss_value = torch.min(loss_values)
+                layer_0_loss_value = loss_values[0]
+                loss_dict[f"{name}_max"] = max_loss_value
+                loss_dict[f"{name}_min"] = min_loss_value
+                loss_dict[f"{name}_layer_0"] = layer_0_loss_value
+        
+        # Clear the tracker for next iteration
+        clear_aux_losses_tracker()
+
+    # RL loss computation (assumes tracker exists)
+    from megatron_patch.model.qwen3_moe.moe.rl_trajectory import (
+        get_trajectory_tracker,
+        reset_trajectory_tracker,
+    )
+
     trajectory_tracker = get_trajectory_tracker()
     rl_loss = torch.tensor(0.0, device=averaged_loss.device)
 
-    try:
+    if trajectory_tracker.layer_decisions and len(trajectory_tracker.layer_decisions) > 0:
+        print_rank_0(f"[RL DEBUG] Computing RL loss from {len(trajectory_tracker.layer_decisions)} layers")
+        
+        # Get RL loss coefficient
+        rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
+        use_per_layer_loss = getattr(args, 'use_per_layer_loss', False)
+        
+        # Compute REINFORCE loss from the complete trajectory
+        if use_per_layer_loss:
+            rl_loss = trajectory_tracker.compute_reinforce_loss_per_layer(
+                trajectory_tracker.layer_decisions,
+                discount_factor=0.9
+            )
+        else:
+            rl_loss = trajectory_tracker.compute_reinforce_loss(
+                trajectory_tracker.layer_decisions,
+                discount_factor=0.9
+            )
+        
+        # ---------- RL DEBUG (prints + optional wandb) ----------
+        rl_debug = True
+        print_rank_0(f"[RL DEBUG] rl_debug={rl_debug}")
+        from megatron.core import parallel_state as mpu
+        is_main_rank = (mpu.get_data_parallel_rank() == 0)
+        is_main_rank = True
+        print_rank_0(f"[RL DEBUG] is_main_rank={is_main_rank}")
 
-        if hasattr(trajectory_tracker, 'layer_decisions') and len(trajectory_tracker.layer_decisions) > 0:
-            print_rank_0(f"[RL DEBUG] Computing RL loss from {len(trajectory_tracker.layer_decisions)} layers")
-            
-            # Get RL loss coefficient
-            rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
-            use_per_layer_loss = getattr(args, 'use_per_layer_loss', False)
-            
-            # Compute REINFORCE loss from the complete trajectory
-            if use_per_layer_loss:
-                rl_loss = trajectory_tracker.compute_reinforce_loss_per_layer(
-                    trajectory_tracker.layer_decisions,
-                    discount_factor=0.9  # Can be made configurable via args
+        # Predefine summary vars for potential zero-loss print below
+        total_tokens_selected = None
+        total_logprob = None
+        total_layer_loss_mag = None
+        reward_mean = None
+        state_mean = None
+
+        if rl_debug and is_main_rank:
+            # Recompute per-layer debug stats (logprob, reward, state_value, layer_loss)
+            sorted_layers = sorted(trajectory_tracker.layer_decisions.keys())
+            layer_rewards = {}
+            for layer_num in sorted_layers:
+                _, _, _, reward = trajectory_tracker.layer_decisions[layer_num]
+                layer_rewards[layer_num] = reward
+
+            discount_factor = 0.9
+            layer_values = {}
+            accumulated_value = torch.tensor(0.0, device=averaged_loss.device)
+            for layer_num in reversed(sorted_layers):
+                accumulated_value = layer_rewards[layer_num] + discount_factor * accumulated_value
+                layer_values[layer_num] = accumulated_value
+
+            debug_metrics = {
+                "debug/rl/num_layers": float(len(sorted_layers)),
+                "debug/rl/coeff": float(rl_loss_coeff),
+                "debug/rl/use_per_layer": float(1.0 if use_per_layer_loss else 0.0),
+            }
+
+            print_rank_0(f"[RL DEBUG] layers={len(sorted_layers)}, coeff={rl_loss_coeff}, per_layer={use_per_layer_loss}")
+            total_tokens_selected = 0.0
+            total_logprob = 0.0
+            total_layer_loss_mag = 0.0
+            reward_values = []
+            state_values = []
+
+            for layer_num in sorted_layers:
+                logits, routing_map, _, reward = trajectory_tracker.layer_decisions[layer_num]
+                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                chosen_log_probs = log_probs * routing_map.float()
+                layer_log_prob = chosen_log_probs.sum()
+                state_value = layer_values[layer_num]
+                layer_loss_dbg = -(layer_log_prob * (state_value if not use_per_layer_loss else reward))
+                tokens_selected = float(routing_map.sum().item())
+
+                print_rank_0(
+                    f"[RL DEBUG] L{layer_num}: tokens={int(tokens_selected)}, reward={reward.item():.6e}, logprob={layer_log_prob.item():.6e}, state_value={state_value.item():.6e}, layer_loss={layer_loss_dbg.item():.6e}"
                 )
-            else:
-                rl_loss = trajectory_tracker.compute_reinforce_loss(
-                    trajectory_tracker.layer_decisions,
-                    discount_factor=0.9  # Can be made configurable via args
-                )
-            
-            # ---------- RL DEBUG (prints + optional wandb) ----------
-            rl_debug = True
-            from megatron.core import parallel_state as mpu
-            is_main_rank = (mpu.get_data_parallel_rank() == 0)
-            is_main_rank = True
 
-            # Predefine summary vars for potential zero-loss print below
-            total_tokens_selected = None
-            total_logprob = None
-            total_layer_loss_mag = None
-            reward_mean = None
-            state_mean = None
+                # Accumulate summaries
+                total_tokens_selected += tokens_selected
+                total_logprob += float(layer_log_prob.item())
+                total_layer_loss_mag += float(abs(layer_loss_dbg.item()))
+                reward_values.append(reward)
+                state_values.append(state_value)
 
-            if rl_debug and is_main_rank:
-                # Recompute per-layer debug stats (logprob, reward, state_value, layer_loss)
-                sorted_layers = sorted(trajectory_tracker.layer_decisions.keys())
-                layer_rewards = {}
-                for layer_num in sorted_layers:
-                    _, _, _, reward = trajectory_tracker.layer_decisions[layer_num]
-                    layer_rewards[layer_num] = reward
+                # Wandb debug metrics (compact)
+                debug_metrics[f"debug/rl/l{layer_num}_tokens"] = float(tokens_selected)
+                debug_metrics[f"debug/rl/l{layer_num}_reward"] = float(reward.item())
+                debug_metrics[f"debug/rl/l{layer_num}_logprob"] = float(layer_log_prob.item())
+                debug_metrics[f"debug/rl/l{layer_num}_state"] = float(state_value.item())
+                debug_metrics[f"debug/rl/l{layer_num}_loss"] = float(layer_loss_dbg.item())
 
-                discount_factor = 0.9
-                layer_values = {}
-                accumulated_value = torch.tensor(0.0, device=averaged_loss.device)
-                for layer_num in reversed(sorted_layers):
-                    accumulated_value = layer_rewards[layer_num] + discount_factor * accumulated_value
-                    layer_values[layer_num] = accumulated_value
+            # Log current unscaled/scaled rl losses as debug
+            debug_metrics["debug/rl/loss_unscaled"] = float(rl_loss.item())
 
-                debug_metrics = {
-                    "debug/rl/num_layers": float(len(sorted_layers)),
-                    "debug/rl/coeff": float(rl_loss_coeff),
-                    "debug/rl/use_per_layer": float(1.0 if use_per_layer_loss else 0.0),
-                }
+            # Add summary stats into loss_dict so they appear in training_log and wandb
+            try:
+                reward_mean = torch.stack(reward_values).mean()
+                state_mean = torch.stack(state_values).mean()
+            except Exception:
+                reward_mean = torch.tensor(0.0, device=averaged_loss.device)
+                state_mean = torch.tensor(0.0, device=averaged_loss.device)
 
-                print_rank_0(f"[RL DEBUG] layers={len(sorted_layers)}, coeff={rl_loss_coeff}, per_layer={use_per_layer_loss}")
-                total_tokens_selected = 0.0
-                total_logprob = 0.0
-                total_layer_loss_mag = 0.0
-                reward_values = []
-                state_values = []
+            # Use magnitudes to ensure positive values for console printing filter
+            loss_dict["debug_rl_num_layers"] = torch.tensor(float(len(sorted_layers)), device=averaged_loss.device)
+            loss_dict["debug_rl_tokens_selected"] = torch.tensor(total_tokens_selected, device=averaged_loss.device)
+            loss_dict["debug_rl_logprob_mag"] = torch.tensor(abs(total_logprob), device=averaged_loss.device)
+            loss_dict["debug_rl_layer_loss_mag"] = torch.tensor(total_layer_loss_mag, device=averaged_loss.device)
+            loss_dict["debug_rl_reward_mean"] = reward_mean
+            loss_dict["debug_rl_state_mean"] = state_mean
 
-                for layer_num in sorted_layers:
-                    logits, routing_map, _, reward = trajectory_tracker.layer_decisions[layer_num]
-                    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-                    chosen_log_probs = log_probs * routing_map.float()
-                    layer_log_prob = chosen_log_probs.sum()
-                    state_value = layer_values[layer_num]
-                    layer_loss_dbg = -(layer_log_prob * (state_value if not use_per_layer_loss else reward))
-                    tokens_selected = float(routing_map.sum().item())
+        # Scale and add RL loss
+        rl_loss = rl_loss * rl_loss_coeff
 
-                    print_rank_0(
-                        f"[RL DEBUG] L{layer_num}: tokens={int(tokens_selected)}, reward={reward.item():.6e}, logprob={layer_log_prob.item():.6e}, state_value={state_value.item():.6e}, layer_loss={layer_loss_dbg.item():.6e}"
-                    )
-
-                    # Accumulate summaries
-                    total_tokens_selected += tokens_selected
-                    total_logprob += float(layer_log_prob.item())
-                    total_layer_loss_mag += float(abs(layer_loss_dbg.item()))
-                    reward_values.append(reward)
-                    state_values.append(state_value)
-
-                    # Wandb debug metrics (compact)
-                    debug_metrics[f"debug/rl/l{layer_num}_tokens"] = float(tokens_selected)
-                    debug_metrics[f"debug/rl/l{layer_num}_reward"] = float(reward.item())
-                    debug_metrics[f"debug/rl/l{layer_num}_logprob"] = float(layer_log_prob.item())
-                    debug_metrics[f"debug/rl/l{layer_num}_state"] = float(state_value.item())
-                    debug_metrics[f"debug/rl/l{layer_num}_loss"] = float(layer_loss_dbg.item())
-
-                # Log current unscaled/scaled rl losses as debug
-                debug_metrics["debug/rl/loss_unscaled"] = float(rl_loss.item())
-
-                # Add summary stats into loss_dict so they appear in training_log and wandb
-                try:
-                    reward_mean = torch.stack(reward_values).mean()
-                    state_mean = torch.stack(state_values).mean()
-                except Exception:
-                    reward_mean = torch.tensor(0.0, device=averaged_loss.device)
-                    state_mean = torch.tensor(0.0, device=averaged_loss.device)
-
-                # Use magnitudes to ensure positive values for console printing filter
-                loss_dict["debug_rl_num_layers"] = torch.tensor(float(len(sorted_layers)), device=averaged_loss.device)
-                loss_dict["debug_rl_tokens_selected"] = torch.tensor(total_tokens_selected, device=averaged_loss.device)
-                loss_dict["debug_rl_logprob_mag"] = torch.tensor(abs(total_logprob), device=averaged_loss.device)
-                loss_dict["debug_rl_layer_loss_mag"] = torch.tensor(total_layer_loss_mag, device=averaged_loss.device)
-                loss_dict["debug_rl_reward_mean"] = reward_mean
-                loss_dict["debug_rl_state_mean"] = state_mean
-            
-            # --------------------------------------------------------
-
-            rl_loss = rl_loss * rl_loss_coeff
-            
-            # Always expose rl_loss for logging (even if zero)
-            loss_dict["rl_loss"] = rl_loss.detach()
-
-            # Add RL loss directly to the main loss only if non-zero
-            if rl_loss.item() != 0.0:
-                old_loss_value = averaged_loss.item()
-                averaged_loss = averaged_loss + rl_loss
-                print_rank_0(f"[RL DEBUG] Added RL loss: {old_loss_value:.6f} + {rl_loss.item():.6f} = {averaged_loss.item():.6f}")
-            else:
-                if rl_debug and is_main_rank:
-                    # Print explicit zero-loss reason summary
-                    try:
-                        print_rank_0(
-                            f"[RL DEBUG] RL loss is zero; layers={len(sorted_layers)}, tokens_total={int(total_tokens_selected) if total_tokens_selected is not None else 'NA'}, "
-                            f"reward_mean={(reward_mean.item() if reward_mean is not None else 'NA')}, logprob_sum={(total_logprob if total_logprob is not None else 'NA')}"
-                        )
-                    except Exception:
-                        print_rank_0("[RL DEBUG] RL loss is zero; no debug summary available")
-                    if 'debug_metrics' in locals():
-                        debug_metrics["debug/rl/zero"] = 1.0
-                
-            # Log debug metrics to wandb (if enabled and requested)
-            if 'debug_metrics' in locals():
-                try:
-                    if getattr(args, 'enable_wandb_logging', False):
-                        import wandb
-                        wandb.log(debug_metrics)
-                except Exception:
-                    pass
-
-            # Reset trajectory for next iteration
-            reset_trajectory_tracker()
-            
-    except ImportError:
-        print_rank_0(f"[RL DEBUG] ImportError: Could not import trajectory tracker")
-        # Trajectory tracking not available, skip RL loss
-        pass
-
-    # Ensure rl_loss is always present in logs (default to 0.0 when not computed)
-    if "rl_loss" not in loss_dict:
+        # Always expose rl_loss for logging (even if zero)
         loss_dict["rl_loss"] = rl_loss.detach()
+
+        # Add RL loss directly to the main loss only if non-zero
+        if rl_loss.item() != 0.0:
+            old_loss_value = averaged_loss.item()
+            averaged_loss = averaged_loss + rl_loss
+            print_rank_0(f"[RL DEBUG] Added RL loss: {old_loss_value:.6f} + {rl_loss.item():.6f} = {averaged_loss.item():.6f}")
+    else:
+        # Expose zero RL loss for logging
+        loss_dict["rl_loss"] = rl_loss.detach()
+
+    # Reset trajectory for next iteration
+    reset_trajectory_tracker()
 
     if num_seqs is None:
         # average on token-level
@@ -385,4 +425,8 @@ def forward_step(data_iterator, model):
     else:
         output_tensor = model(tokens, position_ids, attention_mask, labels=labels, packed_seq_params=packed_seq_params)
 
-    return output_tensor, partial(loss_func, loss_mask, num_seqs)
+    # Choose loss function based on CLI arg parsed by Megatron
+    use_rl_loss = getattr(args, 'use_rl_loss', False)
+    print_rank_0(f"[RL DEBUG] using {"loss_func_with_rl" if use_rl_loss else "loss_func"}")
+    selected_loss_func = loss_func_with_rl if use_rl_loss else loss_func
+    return output_tensor, partial(selected_loss_func, loss_mask, num_seqs)
