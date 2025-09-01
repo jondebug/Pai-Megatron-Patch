@@ -67,6 +67,7 @@ class RouterTrajectoryTracker:
         # Store detached copies to avoid keeping gradients
         logits = logits
         entropy_reward = self.compute_entropy_reward(logits)
+        print(f"[RL DEBUG] Layer added decision {layer_num}: Entropy reward: {entropy_reward}")
         self.layer_decisions[layer_num] = (
             logits,
             routing_map,

@@ -309,6 +309,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
 
     if rl_debug and is_main_rank:
         # Recompute per-layer debug stats (logprob, reward, state_value, layer_loss)
+        print_rank_0(trajectory_tracker.layer_decisions)
         sorted_layers = sorted(trajectory_tracker.layer_decisions.keys())
         layer_rewards = {}
         for layer_num in sorted_layers:
