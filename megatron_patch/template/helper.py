@@ -34,6 +34,7 @@ from megatron_patch.data.utils import (
     get_batch_on_this_tp_rank_idxmap_sft,
     get_position_id_on_this_tp_rank_idxmap_sft_packing
 )
+from megatron.training.utils import print_rank_0
 
 def get_batch(data_iterator):
     """Generate a batch."""
@@ -206,13 +207,13 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
         
         trajectory_tracker = get_trajectory_tracker()
         if hasattr(trajectory_tracker, 'layer_decisions') and len(trajectory_tracker.layer_decisions) > 0:
+            print_rank_0(f"[RL DEBUG] Computing RL loss from {len(trajectory_tracker.layer_decisions)} layers")
+            
             # Get RL loss coefficient
             rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
-            
-            # Compute total REINFORCE loss from the complete trajectory
-            
             use_per_layer_loss = getattr(args, 'use_per_layer_loss', False)
-
+            
+            # Compute REINFORCE loss from the complete trajectory
             if use_per_layer_loss:
                 rl_loss = trajectory_tracker.compute_reinforce_loss_per_layer(
                     trajectory_tracker.layer_decisions,
@@ -223,12 +224,15 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
                     trajectory_tracker.layer_decisions,
                     discount_factor=0.9  # Can be made configurable via args
                 )
+            
             rl_loss = rl_loss * rl_loss_coeff
             
             # Add RL loss directly to the main loss
             if rl_loss.item() != 0.0:
+                old_loss_value = averaged_loss.item()
                 averaged_loss = averaged_loss + rl_loss
                 loss_dict["rl_loss"] = rl_loss.detach()
+                print_rank_0(f"[RL DEBUG] Added RL loss: {old_loss_value:.6f} + {rl_loss.item():.6f} = {averaged_loss.item():.6f}")
                 
             # Reset trajectory for next iteration
             reset_trajectory_tracker()

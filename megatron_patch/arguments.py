@@ -523,6 +523,8 @@ def get_patch_args(parser):
                       help='RL algorithm to use: reinforce or ppo (default: reinforce)')
     group.add_argument('--rl-loss-coeff', type=float, default=0.1,
                       help='Coefficient for RL loss (default: 0.1)')
+    group.add_argument('--use-per-layer-loss', action='store_true', default=False,
+                      help='Use per-layer discounted RL loss instead of independent layer losses')
     group.add_argument('--enable-wandb-logging', action='store_true', default=False,
                       help='Enable wandb logging for training metrics')
     group.add_argument('--wandb-project-name', type=str, default='qwen3-moe-training',

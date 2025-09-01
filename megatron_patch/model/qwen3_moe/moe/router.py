@@ -194,6 +194,7 @@ class TopKRouter(_TopKRuter):
                 routing_map=routing_map.view(seq_length, bsz, -1),
                 scores=scores  # Store the 2D tensor directly
             )
+            print(f"[RL DEBUG] Layer {self.layer_number}: Trajectory decision added")
 
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
