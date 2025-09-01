@@ -225,6 +225,59 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
                     discount_factor=0.9  # Can be made configurable via args
                 )
             
+            # ---------- RL DEBUG (prints + optional wandb) ----------
+            rl_debug = True
+            from megatron.core import parallel_state as mpu
+            is_main_rank = (mpu.get_data_parallel_rank() == 0)
+            is_main_rank = True
+
+            if rl_debug and is_main_rank:
+                # Recompute per-layer debug stats (logprob, reward, state_value, layer_loss)
+                sorted_layers = sorted(trajectory_tracker.layer_decisions.keys())
+                layer_rewards = {}
+                for layer_num in sorted_layers:
+                    _, _, _, reward = trajectory_tracker.layer_decisions[layer_num]
+                    layer_rewards[layer_num] = reward
+
+                discount_factor = 0.9
+                layer_values = {}
+                accumulated_value = torch.tensor(0.0, device=averaged_loss.device)
+                for layer_num in reversed(sorted_layers):
+                    accumulated_value = layer_rewards[layer_num] + discount_factor * accumulated_value
+                    layer_values[layer_num] = accumulated_value
+
+                debug_metrics = {
+                    "debug/rl/num_layers": float(len(sorted_layers)),
+                    "debug/rl/coeff": float(rl_loss_coeff),
+                    "debug/rl/use_per_layer": float(1.0 if use_per_layer_loss else 0.0),
+                }
+
+                print_rank_0(f"[RL DEBUG] layers={len(sorted_layers)}, coeff={rl_loss_coeff}, per_layer={use_per_layer_loss}")
+                for layer_num in sorted_layers:
+                    logits, routing_map, _, reward = trajectory_tracker.layer_decisions[layer_num]
+                    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                    chosen_log_probs = log_probs * routing_map.float()
+                    layer_log_prob = chosen_log_probs.sum()
+                    state_value = layer_values[layer_num]
+                    layer_loss_dbg = -(layer_log_prob * (state_value if not use_per_layer_loss else reward))
+                    tokens_selected = routing_map.sum().item()
+
+                    print_rank_0(
+                        f"[RL DEBUG] L{layer_num}: tokens={int(tokens_selected)}, reward={reward.item():.6e}, logprob={layer_log_prob.item():.6e}, state_value={state_value.item():.6e}, layer_loss={layer_loss_dbg.item():.6e}"
+                    )
+
+                    # Wandb debug metrics (compact)
+                    debug_metrics[f"debug/rl/l{layer_num}_tokens"] = float(tokens_selected)
+                    debug_metrics[f"debug/rl/l{layer_num}_reward"] = float(reward.item())
+                    debug_metrics[f"debug/rl/l{layer_num}_logprob"] = float(layer_log_prob.item())
+                    debug_metrics[f"debug/rl/l{layer_num}_state"] = float(state_value.item())
+                    debug_metrics[f"debug/rl/l{layer_num}_loss"] = float(layer_loss_dbg.item())
+
+                # Log current unscaled/scaled rl losses as debug
+                debug_metrics["debug/rl/loss_unscaled"] = float(rl_loss.item())
+            
+            # --------------------------------------------------------
+
             rl_loss = rl_loss * rl_loss_coeff
             
             # Always expose rl_loss for logging (even if zero)
@@ -236,6 +289,15 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
                 averaged_loss = averaged_loss + rl_loss
                 print_rank_0(f"[RL DEBUG] Added RL loss: {old_loss_value:.6f} + {rl_loss.item():.6f} = {averaged_loss.item():.6f}")
                 
+            # Log debug metrics to wandb (if enabled and requested)
+            if 'debug_metrics' in locals():
+                try:
+                    if getattr(args, 'enable_wandb_logging', False):
+                        import wandb
+                        wandb.log(debug_metrics)
+                except Exception:
+                    pass
+
             # Reset trajectory for next iteration
             reset_trajectory_tracker()
             
