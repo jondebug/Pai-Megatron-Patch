@@ -290,10 +290,21 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
             print_rank_0("WARNING: RL loss is typically used with router-only training")
         
         # Enable trajectory tracking in MoE config
+        modules_found = 0
+        router_modules_found = 0
         for module in model.modules():
+            modules_found += 1
+            if 'router' in module.__class__.__name__.lower():
+                router_modules_found += 1
+                print_rank_0(f"[RL DEBUG] Found router module: {module.__class__.__name__}, has config: {hasattr(module, 'config')}")
+                if hasattr(module, 'config'):
+                    print_rank_0(f"[RL DEBUG] Config attributes: {dir(module.config)}")
+            
             if hasattr(module, 'config') and hasattr(module.config, 'moe_router_use_trajectory_tracking'):
                 module.config.moe_router_use_trajectory_tracking = True
-                print_rank_0(f"Enabled trajectory tracking for module: {module.__class__.__name__}")
+                print_rank_0(f"[RL DEBUG] Enabled trajectory tracking for module: {module.__class__.__name__}")
+        
+        print_rank_0(f"[RL DEBUG] Searched {modules_found} modules, found {router_modules_found} router modules")
 
     # Initialize wandb if enabled
     if args.enable_wandb_logging:
