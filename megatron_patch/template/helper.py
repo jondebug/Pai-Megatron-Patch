@@ -227,11 +227,13 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
             
             rl_loss = rl_loss * rl_loss_coeff
             
-            # Add RL loss directly to the main loss
+            # Always expose rl_loss for logging (even if zero)
+            loss_dict["rl_loss"] = rl_loss.detach()
+
+            # Add RL loss directly to the main loss only if non-zero
             if rl_loss.item() != 0.0:
                 old_loss_value = averaged_loss.item()
                 averaged_loss = averaged_loss + rl_loss
-                loss_dict["rl_loss"] = rl_loss.detach()
                 print_rank_0(f"[RL DEBUG] Added RL loss: {old_loss_value:.6f} + {rl_loss.item():.6f} = {averaged_loss.item():.6f}")
                 
             # Reset trajectory for next iteration
@@ -240,6 +242,10 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
     except ImportError:
         # Trajectory tracking not available, skip RL loss
         pass
+
+    # Ensure rl_loss is always present in logs (default to 0.0 when not computed)
+    if "rl_loss" not in loss_dict:
+        loss_dict["rl_loss"] = rl_loss.detach()
 
     if num_seqs is None:
         # average on token-level
