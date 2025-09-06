@@ -398,18 +398,6 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
                 f"logits.requires_grad={sample_logits.requires_grad} "
                 f"tokens_selected={float(sample_routing.sum().item())}"
             )
-            if rl_loss.requires_grad and sample_logits.requires_grad:
-                grad_list = torch.autograd.grad(
-                    rl_loss, sample_logits, retain_graph=True, allow_unused=True
-                )
-                grad_norm = float('nan')
-                if isinstance(grad_list, (list, tuple)) and len(grad_list) > 0 and grad_list[0] is not None:
-                    grad_norm = grad_list[0].norm().item()
-                print_rank_0(
-                    f"[RL DBG] d(rl_loss)/d(logits[L{first_key}]) norm={grad_norm:.6e}"
-                )
-            else:
-                print_rank_0("[RL DBG] Skipping grad() check: tensors do not require grad")
     except Exception as e:
         print_rank_0(f"[RL DBG] grad_check_error: {e}")
 
