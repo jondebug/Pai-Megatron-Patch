@@ -119,69 +119,21 @@ class RouterTrajectoryTracker:
         for layer_num in sorted_layers:
             logits, routing_map, scores, reward = trajectory_data[layer_num]
             state_value = layer_values[layer_num].detach()
-            
+
             # Get log probabilities of chosen actions
             log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
             chosen_log_probs = log_probs * routing_map.float()
-            layer_log_prob = chosen_log_probs.sum()
-            
+            # Average over routed assignments to keep scale comparable to LM loss
+            num_tokens_routed = routing_map.sum().clamp_min(1).float()
+            layer_log_prob = chosen_log_probs.sum() / num_tokens_routed
+
             # REINFORCE loss: -log_prob(action) * state_value
-            # Higher state value -> higher expected future return -> encourage this action
             layer_loss = -layer_log_prob * state_value
             total_loss += layer_loss
-            
+
+        # Average across layers
+        total_loss = total_loss / max(1, len(sorted_layers))
         return total_loss
-
-    def compute_reinforce_loss_per_layer(self, trajectory_data: Dict, discount_factor: float = 0.9) -> torch.Tensor:
-        """Compute trajectory loss using entropy rewards with layer-wise discounting.
-      
-        Args:
-            trajectory_data: Dictionary of layer decisions  
-            discount_factor: Discount factor γ for future rewards
-            
-        Returns:
-            torch.Tensor: trajectory loss with discounted values
-        """
-        if len(trajectory_data) == 0:
-            return torch.tensor(0.0)
-
-        first_layer = next(iter(trajectory_data.values()))
-        device = first_layer[0].device  # logits device
-        
-        layer_rewards = {}
-        sorted_layers = sorted(trajectory_data.keys())
-        
-        for layer_num in sorted_layers:
-            _, _, _, reward = trajectory_data[layer_num]
-            layer_rewards[layer_num] = reward
-        
-        #Calculate discounted state values using future rewards in reverse
-        layer_values = {}
-        accumulated_value = torch.tensor(0.0, device=device)
-        
- 
-        for layer_num in reversed(sorted_layers):
-            accumulated_value = layer_rewards[layer_num] + discount_factor * accumulated_value
-            layer_values[layer_num] = accumulated_value
-        
-        # Step 3: Apply REINFORCE loss using state values
-        per_layer_losses = {}
-        
-        for layer_num in sorted_layers:
-            logits, routing_map, scores, reward = trajectory_data[layer_num]
-            state_value = layer_values[layer_num]
-            
-            # Get log probabilities of chosen actions
-            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-            chosen_log_probs = log_probs * routing_map.float()
-            layer_log_prob = chosen_log_probs.sum()
-            
-            # REINFORCE loss: -log_prob(action) * state_value
-            # Higher state value -> higher expected future return -> encourage this action
-            layer_loss = -layer_log_prob * state_value
-            per_layer_losses[layer_num] = layer_loss
-            
-        return per_layer_losses
 
 
 
