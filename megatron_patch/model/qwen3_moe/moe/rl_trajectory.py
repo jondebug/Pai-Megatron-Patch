@@ -118,7 +118,7 @@ class RouterTrajectoryTracker:
         
         for layer_num in sorted_layers:
             logits, routing_map, scores, reward = trajectory_data[layer_num]
-            state_value = layer_values[layer_num]
+            state_value = layer_values[layer_num].detach()
             
             # Get log probabilities of chosen actions
             log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
@@ -273,8 +273,8 @@ class RouterTrajectoryTracker:
         
         for layer_num in sorted_layers:
             logits, routing_map, scores, reward = trajectory_data[layer_num]
-            advantage = advantages[layer_num]
-            return_value = returns[layer_num]
+            advantage = advantages[layer_num].detach()
+            return_value = returns[layer_num].detach()
             baseline_value = values[layer_num]
             
             # Current policy log probabilities
