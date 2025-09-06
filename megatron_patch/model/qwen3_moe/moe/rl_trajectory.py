@@ -114,8 +114,8 @@ class RouterTrajectoryTracker:
             layer_values[layer_num] = accumulated_value
         
         # Step 3: Apply REINFORCE loss using state values
-        total_loss = torch.tensor(0.0, device=device)
-        
+        total_loss = None
+
         for layer_num in sorted_layers:
             logits, routing_map, scores, reward = trajectory_data[layer_num]
             state_value = layer_values[layer_num].detach()
@@ -129,7 +129,7 @@ class RouterTrajectoryTracker:
 
             # REINFORCE loss: -log_prob(action) * state_value
             layer_loss = -layer_log_prob * state_value
-            total_loss += layer_loss
+            total_loss = layer_loss if total_loss is None else (total_loss + layer_loss)
 
         # Average across layers
         total_loss = total_loss / max(1, len(sorted_layers))
