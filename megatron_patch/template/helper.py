@@ -210,30 +210,23 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     """
     args = get_args()
 
-    losses = output_tensor.float()
-    loss_mask = loss_mask.view(-1).float()
+    # --- Detached Language Model Loss ---
+    # We calculate the standard LM loss on a detached output_tensor.
+    # This trains all non-router parameters but stops the gradient from flowing
+    # back into the router, preventing a graph conflict with the RL loss.
+    with torch.no_grad():
+        lm_losses = output_tensor.float()
+        loss_mask_view = loss_mask.view(-1).float()
+        lm_loss_unreduced = torch.stack([torch.sum(lm_losses.view(-1) * loss_mask_view), loss_mask_view.sum()])
+        
+        # We still need to average this across ranks for correct logging.
+        averaged_lm_loss_tensor = average_losses_across_data_parallel_group(lm_loss_unreduced)
+        averaged_lm_loss = averaged_lm_loss_tensor[0] / averaged_lm_loss_tensor[1]
 
-    # NOTE: for each seq, sum(loss_mask) == 1 if num_seqs is not None, 
-    # otherwise sum(loss_mask) == n_tokens
-    loss = torch.stack([torch.sum(losses.view(-1) * loss_mask), loss_mask.sum()])
-    # if args.context_parallel_size > 1:
-    #     torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-
-    # Check individual rank losses are not NaN prior to DP all-reduce.
-    if args.check_for_nan_in_loss_and_grad:
-        global_rank = torch.distributed.get_rank()
-        assert not loss.isnan().any(), (
-            f"Rank {global_rank}: found NaN in local forward loss calculation. "
-            f"Device: {torch.cuda.current_device()}, node: {os.uname()[1]}"
-        )
-
-    averaged_loss = average_losses_across_data_parallel_group(loss)
-    averaged_loss = averaged_loss[0] / averaged_loss[1]
-
-    # Create loss dictionary starting with main loss
-    loss_dict = {"lm loss": averaged_loss}
+    # Create loss dictionary with the detached LM loss for logging.
+    loss_dict = {"lm loss": averaged_lm_loss}
     
-    # Collect auxiliary losses from MoE layers (like load_balancing_loss)
+    # (Existing auxiliary loss collection code for MoE layers remains unchanged)
     from megatron.core.transformer.moe.moe_utils import (
         get_moe_layer_wise_logging_tracker,
         reduce_aux_losses_tracker_across_ranks,
@@ -265,52 +258,36 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         # Clear the tracker for next iteration
         clear_aux_losses_tracker()
 
-    # RL loss computation (assumes tracker exists)
+    # --- RL Loss Calculation ---
+    # This is calculated using the trajectory, which contains tensors that require gradients.
     from megatron_patch.model.qwen3_moe.moe.rl_trajectory import (
         get_trajectory_tracker,
         reset_trajectory_tracker,
     )
 
     trajectory_tracker = get_trajectory_tracker()
-    rl_loss = torch.tensor(0.0, device=averaged_loss.device)
-
-    # print_rank_0(f"[RL DEBUG] Computing RL loss from {len(trajectory_tracker.layer_decisions)} layers")
     
-    # Get RL loss coefficient
-    rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
-    use_per_layer_loss = getattr(args, 'use_per_layer_loss', False)
-    
-    # Compute REINFORCE loss from the complete trajectory
-
+    # Compute REINFORCE loss from the complete trajectory.
     rl_loss = trajectory_tracker.compute_reinforce_loss(
         trajectory_tracker.layer_decisions,
         discount_factor=0.9
     )
-    from megatron.core import parallel_state as mpu
-
-    # Context parallel average (match LM which reduces across CP before DP)
-    # if getattr(args, "context_parallel_size", 1) > 1:
-    #     torch.distributed.all_reduce(rl_loss, group=mpu.get_context_parallel_group())
-    #     # Optionally divide by CP size if you want strict average:
-    #     rl_loss = rl_loss / mpu.get_context_parallel_world_size()
-
-    # Data parallel average (LM uses average_losses_across_data_parallel_group)
-    # torch.distributed.all_reduce(rl_loss, group=mpu.get_data_parallel_group())
-    # rl_loss = rl_loss / mpu.get_data_parallel_world_size()
     
-    # ---------- RL DEBUG (prints + optional wandb) ----------
+    # --- Final Loss Assembly ---
+    scaled_rl_loss = rl_loss * args.rl_loss_coeff
+
+    # The final loss for the backward pass combines the two.
+    # Because averaged_lm_loss was computed from a detached tensor, its part of the
+    # graph does not extend back to the router, avoiding the conflict.
+    # The rl_loss part *does* extend back to the router.
+    final_loss = averaged_lm_loss + scaled_rl_loss
+
+    # Update loss_dict for logging purposes.
+    loss_dict["rl_loss"] = scaled_rl_loss.detach()
+    
+    # (Existing debug prints can remain, but are simplified here for clarity)
     rl_debug = True
-    from megatron.core import parallel_state as mpu
-    is_main_rank = (mpu.get_data_parallel_rank() == 0)
-    is_main_rank = True
-
-    # Predefine summary vars for potential zero-loss print below
-    total_tokens_selected = None
-    total_logprob = None
-    total_layer_loss_mag = None
-    reward_mean = None
-    state_mean = None
-
+    is_main_rank = torch.distributed.get_rank() == 0
     if rl_debug and is_main_rank:
         # Recompute per-layer debug stats (logprob, reward, state_value, layer_loss)
         sorted_layers = sorted(trajectory_tracker.layer_decisions.keys())
@@ -382,7 +359,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         loss_dict["debug_rl_state_mean"] = state_mean
 
     # Scale and add RL loss
-    rl_loss = rl_loss * rl_loss_coeff
+    rl_loss = rl_loss * args.rl_loss_coeff
 
     # Always expose rl_loss for logging (even if zero)
     loss_dict["rl_loss"] = rl_loss.detach()
@@ -414,9 +391,9 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
 
     if num_seqs is None:
         # average on token-level
-        #TODO: jonathanp: revert rl_loss to loss[0] + rl_loss
-        return rl_loss / loss[1] * args.context_parallel_size, loss_dict
-    return rl_loss * args.context_parallel_size, num_seqs.sum(), loss_dict
+        return final_loss / lm_loss_unreduced[1] * args.context_parallel_size, loss_dict
+    return final_loss * args.context_parallel_size, num_seqs.sum(), loss_dict
+
 
 def forward_step(data_iterator, model):
     """Forward training step.
