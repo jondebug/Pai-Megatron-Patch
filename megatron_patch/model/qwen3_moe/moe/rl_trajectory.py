@@ -133,6 +133,14 @@ class RouterTrajectoryTracker:
 
         # Average across layers
         total_loss = total_loss / max(1, len(sorted_layers))
+
+        # --- Debug Prints ---
+        from megatron.training.utils import print_rank_0
+        print_rank_0(
+            f"[RL TRAJECTORY] compute_reinforce_loss raw value: {total_loss.item():.6f}, "
+            f"requires_grad: {total_loss.requires_grad}"
+        )
+
         return total_loss
 
 
