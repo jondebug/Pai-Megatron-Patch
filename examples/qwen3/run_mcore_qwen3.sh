@@ -499,7 +499,6 @@ megatron_options="  \
         --external-cuda-graph \
         --cuda-graph-scope attn \
         --recompute-granularity selective \
-        --recompute-modules moe
 
         "
 
