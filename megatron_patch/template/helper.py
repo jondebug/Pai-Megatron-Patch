@@ -144,8 +144,8 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
     # NOTE: for each seq, sum(loss_mask) == 1 if num_seqs is not None, 
     # otherwise sum(loss_mask) == n_tokens
     loss = torch.stack([torch.sum(losses.view(-1) * loss_mask), loss_mask.sum()])
-    # if args.context_parallel_size > 1:
-    #     torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+    if args.context_parallel_size > 1:
+        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     if args.check_for_nan_in_loss_and_grad:
@@ -216,8 +216,8 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     # NOTE: for each seq, sum(loss_mask) == 1 if num_seqs is not None, 
     # otherwise sum(loss_mask) == n_tokens
     loss = torch.stack([torch.sum(losses.view(-1) * loss_mask), loss_mask.sum()])
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+    # if args.context_parallel_size > 1:
+    #     torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     if args.check_for_nan_in_loss_and_grad:
@@ -289,13 +289,13 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     from megatron.core import parallel_state as mpu
 
     # Context parallel average (match LM which reduces across CP before DP)
-    if getattr(args, "context_parallel_size", 1) > 1:
-        torch.distributed.all_reduce(rl_loss, group=mpu.get_context_parallel_group())
-        # Optionally divide by CP size if you want strict average:
-        rl_loss = rl_loss / mpu.get_context_parallel_world_size()
+    # if getattr(args, "context_parallel_size", 1) > 1:
+    #     torch.distributed.all_reduce(rl_loss, group=mpu.get_context_parallel_group())
+    #     # Optionally divide by CP size if you want strict average:
+    #     rl_loss = rl_loss / mpu.get_context_parallel_world_size()
 
     # Data parallel average (LM uses average_losses_across_data_parallel_group)
-    torch.distributed.all_reduce(rl_loss, group=mpu.get_data_parallel_group())
+    # torch.distributed.all_reduce(rl_loss, group=mpu.get_data_parallel_group())
     rl_loss = rl_loss / mpu.get_data_parallel_world_size()
     
     # ---------- RL DEBUG (prints + optional wandb) ----------
