@@ -274,7 +274,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker = get_trajectory_tracker()
     rl_loss = torch.tensor(0.0, device=averaged_loss.device)
 
-    print_rank_0(f"[RL DEBUG] Computing RL loss from {len(trajectory_tracker.layer_decisions)} layers")
+    # print_rank_0(f"[RL DEBUG] Computing RL loss from {len(trajectory_tracker.layer_decisions)} layers")
     
     # Get RL loss coefficient
     rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
@@ -294,11 +294,11 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     
     # ---------- RL DEBUG (prints + optional wandb) ----------
     rl_debug = True
-    print_rank_0(f"[RL DEBUG] rl_debug={rl_debug}")
+    # print_rank_0(f"[RL DEBUG] rl_debug={rl_debug}")
     from megatron.core import parallel_state as mpu
     is_main_rank = (mpu.get_data_parallel_rank() == 0)
     is_main_rank = True
-    print_rank_0(f"[RL DEBUG] is_main_rank={is_main_rank}")
+    # print_rank_0(f"[RL DEBUG] is_main_rank={is_main_rank}")
 
     # Predefine summary vars for potential zero-loss print below
     total_tokens_selected = None
@@ -309,7 +309,6 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
 
     if rl_debug and is_main_rank:
         # Recompute per-layer debug stats (logprob, reward, state_value, layer_loss)
-        print_rank_0(trajectory_tracker.layer_decisions)
         sorted_layers = sorted(trajectory_tracker.layer_decisions.keys())
         layer_rewards = {}
         for layer_num in sorted_layers:
@@ -329,7 +328,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
             "debug/rl/use_per_layer": float(1.0 if use_per_layer_loss else 0.0),
         }
 
-        print_rank_0(f"[RL DEBUG] layers={len(sorted_layers)}, coeff={rl_loss_coeff}, per_layer={use_per_layer_loss}")
+        # print_rank_0(f"[RL DEBUG] layers={len(sorted_layers)}, coeff={rl_loss_coeff}, per_layer={use_per_layer_loss}")
         total_tokens_selected = 0.0
         total_logprob = 0.0
         total_layer_loss_mag = 0.0
@@ -345,9 +344,9 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
             layer_loss_dbg = -(layer_log_prob * (state_value if not use_per_layer_loss else reward))
             tokens_selected = float(routing_map.sum().item())
 
-            print_rank_0(
-                f"[RL DEBUG] L{layer_num}: tokens={int(tokens_selected)}, reward={reward.item():.6e}, logprob={layer_log_prob.item():.6e}, state_value={state_value.item():.6e}, layer_loss={layer_loss_dbg.item():.6e}"
-            )
+            # print_rank_0(
+            #     f"[RL DEBUG] L{layer_num}: tokens={int(tokens_selected)}, reward={reward.item():.6e}, logprob={layer_log_prob.item():.6e}, state_value={state_value.item():.6e}, layer_loss={layer_loss_dbg.item():.6e}"
+            # )
 
             # Accumulate summaries
             total_tokens_selected += tokens_selected
