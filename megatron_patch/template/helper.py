@@ -281,16 +281,22 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     use_per_layer_loss = getattr(args, 'use_per_layer_loss', False)
     
     # Compute REINFORCE loss from the complete trajectory
-    if use_per_layer_loss:
-        rl_loss = trajectory_tracker.compute_reinforce_loss_per_layer(
-            trajectory_tracker.layer_decisions,
-            discount_factor=0.9
-        )
-    else:
-        rl_loss = trajectory_tracker.compute_reinforce_loss(
-            trajectory_tracker.layer_decisions,
-            discount_factor=0.9
-        )
+
+    rl_loss = trajectory_tracker.compute_reinforce_loss(
+        trajectory_tracker.layer_decisions,
+        discount_factor=0.9
+    )
+    from megatron.core import parallel_state as mpu
+
+    # Context parallel average (match LM which reduces across CP before DP)
+    if getattr(args, "context_parallel_size", 1) > 1:
+        torch.distributed.all_reduce(rl_loss, group=mpu.get_context_parallel_group())
+        # Optionally divide by CP size if you want strict average:
+        rl_loss = rl_loss / mpu.get_context_parallel_world_size()
+
+    # Data parallel average (LM uses average_losses_across_data_parallel_group)
+    torch.distributed.all_reduce(rl_loss, group=mpu.get_data_parallel_group())
+    rl_loss = rl_loss / mpu.get_data_parallel_world_size()
     
     # ---------- RL DEBUG (prints + optional wandb) ----------
     rl_debug = True
@@ -399,8 +405,9 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
 
     if num_seqs is None:
         # average on token-level
-        return loss[0] / loss[1] * args.context_parallel_size, loss_dict
-    return loss[0] * args.context_parallel_size, num_seqs.sum(), loss_dict
+        #TODO: jonathanp: revert rl_loss to loss[0] + rl_loss
+        return rl_loss / loss[1] * args.context_parallel_size, loss_dict
+    return rl_loss * args.context_parallel_size, num_seqs.sum(), loss_dict
 
 def forward_step(data_iterator, model):
     """Forward training step.
