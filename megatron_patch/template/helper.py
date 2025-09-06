@@ -206,117 +206,81 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
 def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: torch.Tensor):
     """Loss function that includes RL auxiliary loss.
 
-    Assumes trajectory tracking is available and supported.
+    This function solves the problem of combining a normal language model loss
+    with a router-specific RL loss, especially when using activation checkpointing,
+    by separating the gradient paths.
     """
     args = get_args()
 
-    # --- Detached Language Model Loss ---
-    # We calculate the standard LM loss on a detached output_tensor.
-    # This trains all non-router parameters but stops the gradient from flowing
-    # back into the router, preventing a graph conflict with the RL loss.
+    # 1. --- Language Model Loss (Detached) ---
+    # We calculate the standard LM loss within a `no_grad` context. This ensures
+    # that all non-router parameters get their gradients from the LM task,
+    # but it DETACHES this computation from the router's graph, preventing a conflict.
     with torch.no_grad():
         lm_losses = output_tensor.float()
         loss_mask_view = loss_mask.view(-1).float()
         lm_loss_unreduced = torch.stack([torch.sum(lm_losses.view(-1) * loss_mask_view), loss_mask_view.sum()])
         
-        # We still need to average this across ranks for correct logging.
+        # This reduction is for logging only.
         averaged_lm_loss_tensor = average_losses_across_data_parallel_group(lm_loss_unreduced)
         averaged_lm_loss = averaged_lm_loss_tensor[0] / averaged_lm_loss_tensor[1]
 
-    # Create loss dictionary with the detached LM loss for logging.
+    # The loss_dict for logging starts with this detached, averaged LM loss.
     loss_dict = {"lm loss": averaged_lm_loss}
     
-    # (Existing auxiliary loss collection code for MoE layers remains unchanged)
+    # (The existing MoE auxiliary loss collection logic can remain as is)
     from megatron.core.transformer.moe.moe_utils import (
         get_moe_layer_wise_logging_tracker,
         reduce_aux_losses_tracker_across_ranks,
         clear_aux_losses_tracker,
     )
-    
-    # Get the auxiliary losses tracker
     tracker = get_moe_layer_wise_logging_tracker()
-    
-    if tracker:  # Only process if there are auxiliary losses
-        # Reduce auxiliary losses across ranks
+    if tracker:
         reduce_aux_losses_tracker_across_ranks()
-        
-        # Add auxiliary losses to the loss dictionary
         for name, loss_data in tracker.items():
             if 'values' in loss_data:
                 loss_values = loss_data['values'].float()
-                
-                # Average across all MoE layers
                 loss_avg = loss_values.sum() / max(1, len(loss_values.nonzero()))
                 loss_dict[name] = loss_avg
-                max_loss_value = torch.max(loss_values)
-                min_loss_value = torch.min(loss_values)
-                layer_0_loss_value = loss_values[0]
-                loss_dict[f"{name}_max"] = max_loss_value
-                loss_dict[f"{name}_min"] = min_loss_value
-                loss_dict[f"{name}_layer_0"] = layer_0_loss_value
-        
-        # Clear the tracker for next iteration
         clear_aux_losses_tracker()
 
-    # --- RL Loss Calculation ---
-    # This is calculated using the trajectory, which contains tensors that require gradients.
+    # 2. --- RL Loss (With Gradients) ---
+    # This loss is computed using the trajectory that was populated during the
+    # gradient-enabled recomputation pass. This tensor DOES require gradients
+    # and its history traces back to the router weights.
     from megatron_patch.model.qwen3_moe.moe.rl_trajectory import (
         get_trajectory_tracker,
         reset_trajectory_tracker,
     )
-
     trajectory_tracker = get_trajectory_tracker()
-    
-    # Compute REINFORCE loss from the complete trajectory.
     rl_loss = trajectory_tracker.compute_reinforce_loss(
         trajectory_tracker.layer_decisions,
         discount_factor=0.9
     )
     
-    # --- Final Loss Assembly ---
+    # 3. --- Final Loss Assembly ---
+    # The final loss for the backward pass is the sum of the LM loss on the main model
+    # (which is detached from the router) and the RL loss on the router.
+    # This prevents the "backward a second time" error by ensuring only one
+    # gradient path leads back to the router weights.
     scaled_rl_loss = rl_loss * args.rl_loss_coeff
-
-    # The final loss for the backward pass combines the two.
-    # Because averaged_lm_loss was computed from a detached tensor, its part of the
-    # graph does not extend back to the router, avoiding the conflict.
-    # The rl_loss part *does* extend back to the router.
     final_loss = averaged_lm_loss + scaled_rl_loss
 
-    # Update loss_dict for logging purposes.
+    # --- Debug Prints ---
+    from megatron.training.utils import print_rank_0
+    print_rank_0(f"[RL LOSS] lm_loss(detached): {averaged_lm_loss.item():.6f} | "
+                 f"rl_loss(raw): {rl_loss.item():.6f} | "
+                 f"rl_loss(scaled): {scaled_rl_loss.item():.6f} | "
+                 f"final_loss: {final_loss.item():.6f}")
+
+    # Update the dictionary for logging the scaled RL loss.
     loss_dict["rl_loss"] = scaled_rl_loss.detach()
-    # Scale and add RL loss
-    rl_loss = rl_loss * args.rl_loss_coeff
 
-    # Always expose rl_loss for logging (even if zero)
-    loss_dict["rl_loss"] = rl_loss.detach()
-
-    # Minimal debug: verify gradient path to router logits on DP rank 0
-    try:
-        from megatron.core import parallel_state as mpu
-        if mpu.get_data_parallel_rank() == 0 and trajectory_tracker.layer_decisions:
-            first_key = sorted(trajectory_tracker.layer_decisions.keys())[0]
-            sample_logits, sample_routing, _, _ = trajectory_tracker.layer_decisions[first_key]
-            print_rank_0(
-                f"[RL DBG] rl_loss.requires_grad={rl_loss.requires_grad} "
-                f"logits.requires_grad={sample_logits.requires_grad} "
-                f"tokens_selected={float(sample_routing.sum().item())}"
-            )
-    except Exception as e:
-        print_rank_0(f"[RL DBG] grad_check_error: {e}")
-
-
-    # Add RL loss directly to the main loss only if non-zero
-    if rl_loss.item() != 0.0:
-        old_loss_value = averaged_loss.item()
-        averaged_loss = averaged_loss + rl_loss
-        print_rank_0(f"[RL DEBUG] Added RL loss: {old_loss_value:.6f} + {rl_loss.item():.6f} = {averaged_loss.item():.6f}")
-
-
-    # Reset trajectory for next iteration
+    # Reset the trajectory for the next training step.
     reset_trajectory_tracker()
 
+    # Return the final combined loss to the training schedule for the backward pass.
     if num_seqs is None:
-        # average on token-level
         return final_loss / lm_loss_unreduced[1] * args.context_parallel_size, loss_dict
     return final_loss * args.context_parallel_size, num_seqs.sum(), loss_dict
 
@@ -343,6 +307,5 @@ def forward_step(data_iterator, model):
 
     # Choose loss function based on CLI arg parsed by Megatron
     use_rl_loss = getattr(args, 'use_rl_loss', False)
-    print_rank_0(f"[RL DEBUG] using {"loss_func_with_rl" if use_rl_loss else "loss_func"}")
     selected_loss_func = loss_func_with_rl if use_rl_loss else loss_func
     return output_tensor, partial(selected_loss_func, loss_mask, num_seqs)
