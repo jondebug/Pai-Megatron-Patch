@@ -388,23 +388,30 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     loss_dict["rl_loss"] = rl_loss.detach()
 
     # Minimal debug: verify gradient path to router logits on DP rank 0
-    if trajectory_tracker.layer_decisions:
-        first_key = sorted(trajectory_tracker.layer_decisions.keys())[0]
-        sample_logits, sample_routing, _, _ = trajectory_tracker.layer_decisions[first_key]
-        print_rank_0(
-            f"[RL DBG] rl_loss.requires_grad={rl_loss.requires_grad} "
-            f"logits.requires_grad={sample_logits.requires_grad} "
-            f"tokens_selected={float(sample_routing.sum().item())}"
-        )
-        grad_list = torch.autograd.grad(
-            rl_loss, sample_logits, retain_graph=True, allow_unused=True
-        )
-        grad_norm = float('nan')
-        if isinstance(grad_list, (list, tuple)) and len(grad_list) > 0 and grad_list[0] is not None:
-            grad_norm = grad_list[0].norm().item()
-        print_rank_0(
-            f"[RL DBG] d(rl_loss)/d(logits[L{first_key}]) norm={grad_norm:.6e}"
-        )
+    try:
+        from megatron.core import parallel_state as mpu
+        if mpu.get_data_parallel_rank() == 0 and trajectory_tracker.layer_decisions:
+            first_key = sorted(trajectory_tracker.layer_decisions.keys())[0]
+            sample_logits, sample_routing, _, _ = trajectory_tracker.layer_decisions[first_key]
+            print_rank_0(
+                f"[RL DBG] rl_loss.requires_grad={rl_loss.requires_grad} "
+                f"logits.requires_grad={sample_logits.requires_grad} "
+                f"tokens_selected={float(sample_routing.sum().item())}"
+            )
+            if rl_loss.requires_grad and sample_logits.requires_grad:
+                grad_list = torch.autograd.grad(
+                    rl_loss, sample_logits, retain_graph=True, allow_unused=True
+                )
+                grad_norm = float('nan')
+                if isinstance(grad_list, (list, tuple)) and len(grad_list) > 0 and grad_list[0] is not None:
+                    grad_norm = grad_list[0].norm().item()
+                print_rank_0(
+                    f"[RL DBG] d(rl_loss)/d(logits[L{first_key}]) norm={grad_norm:.6e}"
+                )
+            else:
+                print_rank_0("[RL DBG] Skipping grad() check: tensors do not require grad")
+    except Exception as e:
+        print_rank_0(f"[RL DBG] grad_check_error: {e}")
 
 
     # Add RL loss directly to the main loss only if non-zero
