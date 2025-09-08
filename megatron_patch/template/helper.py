@@ -300,14 +300,14 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     is_main_rank = True
     # print_rank_0(f"[RL DEBUG] is_main_rank={is_main_rank}")
 
-    # Predefine summary vars for potential zero-loss print below
-    total_tokens_selected = None
-    total_logprob = None
-    total_layer_loss_mag = None
-    reward_mean = None
-    state_mean = None
 
     if rl_debug and is_main_rank:
+        # Predefine summary vars for potential zero-loss print below
+        total_tokens_selected = None
+        total_logprob = None
+        total_layer_loss_mag = None
+        reward_mean = None
+        state_mean = None
         # Recompute per-layer debug stats (logprob, reward, state_value, layer_loss)
         sorted_layers = sorted(trajectory_tracker.layer_decisions.keys())
         layer_rewards = {}
@@ -397,7 +397,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     # Reset trajectory for next iteration
     reset_trajectory_tracker()
 
-    if num_seqs is None:
+    if num_seqs is None:pip install wa
         # average on token-level
         return loss[0] / loss[1] * args.context_parallel_size, loss_dict
     return loss[0] * args.context_parallel_size, num_seqs.sum(), loss_dict
