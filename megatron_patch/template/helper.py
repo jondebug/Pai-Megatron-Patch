@@ -397,7 +397,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     # Reset trajectory for next iteration
     reset_trajectory_tracker()
 
-    if num_seqs is None:pip install wa
+    if num_seqs is None:
         # average on token-level
         return loss[0] / loss[1] * args.context_parallel_size, loss_dict
     return loss[0] * args.context_parallel_size, num_seqs.sum(), loss_dict
