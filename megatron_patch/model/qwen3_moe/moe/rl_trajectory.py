@@ -89,10 +89,18 @@ class RouterTrajectoryTracker:
         # Get stored data
         logits, routing_map, _, entropy_reward = self.layer_decisions[layer_num]
         
-        # Compute simple RL loss
+        # Debug prints for layer 1
+        if layer_num == 1:
+            from megatron.training.utils import print_rank_0
+            print_rank_0(f"[RL DEBUG] apply_rl_loss - logits req_grad: {logits.requires_grad}, entropy: {entropy_reward.item():.4f}")
+        
+        # Compute simple RL loss - try larger coefficient
         log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
         chosen_log_probs = log_probs * routing_map.float()
-        rl_loss = -chosen_log_probs.mean() * entropy_reward.detach() * 0.1
+        rl_loss = -chosen_log_probs.mean() * entropy_reward.detach() * 1.0  # Increased from 0.1
+        
+        if layer_num == 1:
+            print_rank_0(f"[RL DEBUG] rl_loss: {rl_loss.item():.6f}, req_grad: {rl_loss.requires_grad}")
         
         # Apply using MoEAuxLossAutoScaler
         from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
