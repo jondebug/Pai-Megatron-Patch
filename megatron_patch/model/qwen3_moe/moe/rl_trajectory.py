@@ -81,6 +81,23 @@ class RouterTrajectoryTracker:
         token_entropies = -(probs_from_logits * log_probs).sum(dim=-1)
         return token_entropies.mean()
     
+    def apply_rl_loss_to_scores(self, layer_num: int, scores: torch.Tensor) -> torch.Tensor:
+        """Apply RL loss to scores using MoEAuxLossAutoScaler - MINIMAL POC."""
+        if layer_num not in self.layer_decisions:
+            return scores
+        
+        # Get stored data
+        logits, routing_map, _, entropy_reward = self.layer_decisions[layer_num]
+        
+        # Compute simple RL loss
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        chosen_log_probs = log_probs * routing_map.float()
+        rl_loss = -chosen_log_probs.mean() * entropy_reward.detach() * 0.1
+        
+        # Apply using MoEAuxLossAutoScaler
+        from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
+        return MoEAuxLossAutoScaler.apply(scores, rl_loss)
+    
     def compute_reinforce_loss(self, trajectory_data: Dict, discount_factor: float = 0.9) -> torch.Tensor:
         """Compute trajectory loss using entropy rewards with layer-wise discounting.
       
