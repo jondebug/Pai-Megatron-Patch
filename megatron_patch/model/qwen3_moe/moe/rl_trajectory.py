@@ -2,6 +2,7 @@
 
 import torch
 from typing import Dict, Optional, Callable
+from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
 
 
 class RouterRLLossScaler(torch.autograd.Function):
@@ -67,6 +68,7 @@ class RouterTrajectoryTracker:
         # Store detached copies to avoid keeping gradients
         logits = logits
         entropy_reward = self.compute_entropy_reward(logits)
+        print_rank_0(f"[RL DEBUG] add_layer_decision - logits req_grad: {logits.requires_grad}, entropy: {entropy_reward.item():.4f}")
         self.layer_decisions[layer_num] = (
             logits,
             routing_map,
@@ -94,16 +96,16 @@ class RouterTrajectoryTracker:
             from megatron.training.utils import print_rank_0
             print_rank_0(f"[RL DEBUG] apply_rl_loss - logits req_grad: {logits.requires_grad}, entropy: {entropy_reward.item():.4f}")
         
-        # Compute simple RL loss - try larger coefficient
+        # Compute simple RL loss
         log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
         chosen_log_probs = log_probs * routing_map.float()
-        rl_loss = -chosen_log_probs.mean() * entropy_reward.detach() * 1.0  # Increased from 0.1
+        # Simple average reward - detach to treat as constant
+        rl_loss = -chosen_log_probs.mean() * 4.0  # Use constant reward for now
         
         if layer_num == 1:
             print_rank_0(f"[RL DEBUG] rl_loss: {rl_loss.item():.6f}, req_grad: {rl_loss.requires_grad}")
         
         # Apply using MoEAuxLossAutoScaler
-        from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
         return MoEAuxLossAutoScaler.apply(scores, rl_loss)
     
     def compute_reinforce_loss(self, trajectory_data: Dict, discount_factor: float = 0.9) -> torch.Tensor:
