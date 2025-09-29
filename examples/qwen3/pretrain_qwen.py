@@ -347,24 +347,108 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
                 if args.use_rl_loss:
                     tags.append(f"rl-{args.rl_algorithm}")
                 
+                # Primary hyperparameters
+                primary_config = {
+                    "hidden_size": getattr(args, 'hidden_size', 'unknown'),
+                    "num_layers": getattr(args, 'num_layers', 'unknown'),
+                    "learning_rate": args.lr,
+                    "min_lr": args.min_lr,
+                    "moe_aux_loss_coeff": args.moe_aux_loss_coeff,
+                    "global_batch_size": args.global_batch_size,
+                    "micro_batch_size": args.micro_batch_size,
+                    "seq_length": args.seq_length,
+                    "router_only": args.router_only_training,
+                    "use_rl_loss": args.use_rl_loss,
+                }
+                
+                # Add RL-specific parameters only if RL loss is enabled
+                if args.use_rl_loss:
+                    primary_config["rl_algorithm"] = args.rl_algorithm
+                    primary_config["rl_loss_coeff"] = args.rl_loss_coeff
+                
+                # Secondary/advanced hyperparameters - only include non-None values
+                secondary_config = {}
+                
+                # MoE specific parameters
+                moe_params = {
+                    "moe_router_load_balancing_type": getattr(args, 'moe_router_load_balancing_type', None),
+                    "moe_router_topk": getattr(args, 'moe_router_topk', None),
+                    "moe_router_pre_softmax": getattr(args, 'moe_router_pre_softmax', None),
+                    "moe_router_score_function": getattr(args, 'moe_router_score_function', None),
+                    "moe_token_drop_policy": getattr(args, 'moe_token_drop_policy', None),
+                    "moe_pad_expert_input_to_capacity": getattr(args, 'moe_pad_expert_input_to_capacity', None),
+                    "moe_router_enable_expert_bias": getattr(args, 'moe_router_enable_expert_bias', None),
+                    "moe_grouped_gemm": getattr(args, 'moe_grouped_gemm', None),
+                }
+                
+                # Training parameters
+                training_params = {
+                    "weight_decay": getattr(args, 'weight_decay', None),
+                    "adam_beta1": getattr(args, 'adam_beta1', None),
+                    "adam_beta2": getattr(args, 'adam_beta2', None),
+                    "adam_eps": getattr(args, 'adam_eps', None),
+                    "lr_decay_style": getattr(args, 'lr_decay_style', None),
+                    "lr_warmup_iters": getattr(args, 'lr_warmup_iters', None),
+                    "lr_decay_iters": getattr(args, 'lr_decay_iters', None),
+                    "optimizer": getattr(args, 'optimizer', None),
+                    "use_distributed_optimizer": getattr(args, 'use_distributed_optimizer', None),
+                }
+                
+                # Model architecture
+                model_params = {
+                    "num_attention_heads": getattr(args, 'num_attention_heads', None),
+                    "num_query_groups": getattr(args, 'num_query_groups', None),
+                    "ffn_hidden_size": getattr(args, 'ffn_hidden_size', None),
+                }
+                
+                # Parallelism
+                parallel_params = {
+                    "tensor_model_parallel_size": getattr(args, 'tensor_model_parallel_size', None),
+                    "pipeline_model_parallel_size": getattr(args, 'pipeline_model_parallel_size', None),
+                    "expert_model_parallel_size": getattr(args, 'expert_model_parallel_size', None),
+                    "sequence_parallel": getattr(args, 'sequence_parallel', None),
+                    "context_parallel_size": getattr(args, 'context_parallel_size', None),
+                    "overlap_p2p_comm": getattr(args, 'overlap_p2p_comm', None),
+                }
+                
+                # Memory and performance
+                perf_params = {
+                    "external_cuda_graph": getattr(args, 'external_cuda_graph', None),
+                    "cuda_graph_scope": getattr(args, 'cuda_graph_scope', None),
+                    "recompute_granularity": getattr(args, 'recompute_granularity', None),
+                    "recompute_modules": getattr(args, 'recompute_modules', None),
+                }
+                
+                # Other training configs
+                other_params = {
+                    "seed": getattr(args, 'seed', None),
+                    "bf16": getattr(args, 'bf16', None),
+                    "fp16": getattr(args, 'fp16', None),
+                    "gradient_clipping": getattr(args, 'clip_grad', None),
+                    "log_interval": getattr(args, 'log_interval', None),
+                    "eval_interval": getattr(args, 'eval_interval', None),
+                    "eval_iters": getattr(args, 'eval_iters', None),
+                    "timing_log_level": getattr(args, 'timing_log_level', None),
+                    "deterministic_mode": getattr(args, 'deterministic_mode', None),
+                    "calculate_per_token_loss": getattr(args, 'calculate_per_token_loss', None),
+                }
+                
+                # Combine all parameters, filtering out None values
+                for params in [moe_params, training_params, model_params, parallel_params, perf_params, other_params]:
+                    secondary_config.update({k: v for k, v in params.items() if v is not None})
+                
+                # Combine configs - wandb will organize them nicely
+                full_config = {
+                    **primary_config,
+                    "advanced": secondary_config  # Group secondary params under "advanced"
+                }
+                
                 wandb.init(
                     project=args.wandb_project_name,
                     name=run_name,
                     tags=tags,
                     dir=wandb_base_dir,  # Explicit directory setting
-                    config={
-                        "model_size": getattr(args, 'hidden_size', 'unknown'),
-                        "num_layers": getattr(args, 'num_layers', 'unknown'),
-                        "learning_rate": args.lr,
-                        "min_lr": args.min_lr,
-                        "global_batch_size": args.global_batch_size,
-                        "micro_batch_size": args.micro_batch_size,
-                        "seq_length": args.seq_length,
-                        "router_only": args.router_only_training,
-                        "use_rl_loss": args.use_rl_loss,
-                        "rl_algorithm": args.rl_algorithm if args.use_rl_loss else None,
-                        "rl_loss_coeff": args.rl_loss_coeff if args.use_rl_loss else None,
-                    }
+                    config=full_config
                 )
                 print_rank_0(f"WANDB INITIALIZED: project={args.wandb_project_name}, name={run_name}")
                 
