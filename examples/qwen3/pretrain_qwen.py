@@ -162,25 +162,38 @@ def setup_wandb_logging():
             raise e
 
 
-def freeze_router_parameters(model):
-    """Freeze all parameters except MoE router weights."""
-    router_params = 0
-    frozen_params = 0
+def configure_router_only_training(model):
+    """Configure model for router-only training.
     
-    for name, param in model.named_parameters():
-        # Check if this is a router/gate parameter - be more flexible with naming
-        is_router = any(keyword in name.lower() for keyword in ['router', 'gate']) and 'weight' in name
+    """
+    args = get_args()
+    if args.router_only_training:
+        print_rank_0("\n" + "="*80)
+        print_rank_0("CONFIGURING ROUTER-ONLY TRAINING (in model_provider)")
+        print_rank_0("Setting requires_grad=False for non-router parameters")
+        print_rank_0("This ensures only router params are in gradient buffers and optimizer")
+        print_rank_0("="*80 + "\n")
         
-        if is_router:
-            param.requires_grad = True
-            router_params += param.numel()
-            print_rank_0(f"[TRAINABLE] {name}")
-        else:
-            param.requires_grad = False
-            frozen_params += param.numel()
+        router_param_count = 0
+        non_router_param_count = 0
+        
+        for name, param in model.named_parameters():
+            if any(keyword in name.lower() for keyword in ['router', 'gate']) and 'weight' in name:
+                param.requires_grad = True
+                router_param_count += 1
+                print_rank_0(f"[ROUTER-ONLY] Router param: {name}, shape={list(param.shape)}")
+            else:
+                param.requires_grad = False
+                non_router_param_count += 1
+        
+        print_rank_0(f"\n[ROUTER-ONLY] Configuration complete:")
+        print_rank_0(f"  - Router parameters (requires_grad=True): {router_param_count}")
+        print_rank_0(f"  - Non-router parameters (requires_grad=False): {non_router_param_count}")
+        print_rank_0("="*80 + "\n")
+    else:
+        print_rank_0("Router-only training not enabled")
     
-    total_params = router_params + frozen_params
-    print_rank_0(f"Router-only training: {router_params:,} trainable / {total_params:,} total parameters ({router_params/total_params:.1%})")
+    return model
 
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
@@ -280,8 +293,8 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
 
     # Apply router-only training if enabled
     if args.router_only_training:
-        print_rank_0("ROUTER-ONLY TRAINING: Freezing all parameters except router weights")
-        freeze_router_parameters(model)
+        print_rank_0("ROUTER-ONLY TRAINING: Configuring model for router-only parameter updates")
+        configure_router_only_training(model)
 
     # Initialize RL loss if enabled
     print_rank_0(f"[RL DEBUG] Initializing training with use_rl_loss={args.use_rl_loss}")

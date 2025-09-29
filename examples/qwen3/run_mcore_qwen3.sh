@@ -496,12 +496,19 @@ megatron_options="  \
         --qk-layernorm \
         --kv-channels 128 \
         --te-rng-tracker \
-        --external-cuda-graph \
-        --cuda-graph-scope attn \
+
         --recompute-granularity selective \
         --recompute-modules moe
+        --external-cuda-graph \
+        --cuda-graph-scope attn \
 
         "
+        #TODO: Jonathanp: return this to args above after debugging:
+            # --recompute-granularity selective \
+            # --recompute-modules moe
+            # --external-cuda-graph \
+            # --cuda-graph-scope attn \
+
 
 #        --add-qkv-bias \ # no qkv bias
 #        --no-rope-fusion \

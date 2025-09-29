@@ -143,7 +143,11 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
 
     # NOTE: for each seq, sum(loss_mask) == 1 if num_seqs is not None, 
     # otherwise sum(loss_mask) == n_tokens
+    
     loss = torch.stack([torch.sum(losses.view(-1) * loss_mask), loss_mask.sum()])
+    
+    # Create a zero loss tensor with the same shape and device as expected
+    # loss = torch.stack([torch.tensor(0.0, device=losses.device), loss_mask.sum()])
     if args.context_parallel_size > 1:
         torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
