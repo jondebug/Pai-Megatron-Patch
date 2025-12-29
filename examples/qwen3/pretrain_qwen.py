@@ -181,7 +181,6 @@ def configure_router_only_training(model):
             if any(keyword in name.lower() for keyword in ['router', 'gate']) and 'weight' in name:
                 param.requires_grad = True
                 router_param_count += 1
-                print_rank_0(f"[ROUTER-ONLY] Router param: {name}, shape={list(param.shape)}")
             else:
                 param.requires_grad = False
                 non_router_param_count += 1

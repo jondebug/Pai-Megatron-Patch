@@ -297,8 +297,8 @@ if [ $AC = full ]; then
     fi
     activation_checkpoint_options=" \
 		    --recompute-method uniform \
-            --recompute-num-layers ${MP_AC_LAYERS} \
-		    --recompute-granularity full"
+            --recompute-num-layers ${MP_AC_LAYERS} "
+            # --recompute-granularity full
 elif [ $AC = sel ]; then
     activation_checkpoint_options=" \
         --recompute-activations"
@@ -495,15 +495,11 @@ megatron_options="  \
         --cross-entropy-loss-fusion \
         --qk-layernorm \
         --kv-channels 128 \
-        --te-rng-tracker \
+        --te-rng-tracker 
 
-        --recompute-granularity selective \
-        --recompute-modules moe
-        --external-cuda-graph \
-        --cuda-graph-scope attn \
 
         "
-        #TODO: Jonathanp: return this to args above after debugging:
+        #TODO: Jonathanp: removed these from args to get rl loss to work:
             # --recompute-granularity selective \
             # --recompute-modules moe
             # --external-cuda-graph \

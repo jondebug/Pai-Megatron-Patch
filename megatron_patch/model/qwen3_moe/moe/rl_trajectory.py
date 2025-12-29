@@ -3,6 +3,13 @@
 import torch
 from typing import Dict, Optional, Callable
 from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
+# from megatron.training.utils import print_rank_0
+ 
+debug_mode = False
+
+def wrap_print_rank_0(str):
+    if debug_mode:
+        print(f"{str}")
 
 
 class RouterRLLossScaler(torch.autograd.Function):
@@ -53,60 +60,105 @@ class RouterTrajectoryTracker:
         """Reset the trajectory for a new forward pass."""
         # Store old trajectory for PPO importance sampling
         self.old_layer_decisions = getattr(self, 'layer_decisions', {}).copy()
-        self.layer_decisions = {}  # layer_number -> (logits, routing_map, probs, entropy_reward)
+        self.layer_decisions = {}  # layer_number -> (latent_token_representations, routing_map, probs, entropy_reward)
         
-    def add_layer_decision(self, layer_num: int, logits: torch.Tensor, routing_map: torch.Tensor, 
-                          scores: Optional[torch.Tensor] = None):
+    def add_layer_decision(self, layer_num: int, latent_token_representations: torch.Tensor, routing_map: torch.Tensor, routing_logits: torch.Tensor):
         """Add routing decision from a MoE layer.
         
         Args:
             layer_num (int): Layer number (1-indexed)
-            logits (torch.Tensor): Router logits for this layer - state space
+            latent_token_representations (torch.Tensor) - state space
             routing_map (torch.Tensor): Token routing assignments - action space
-            scores (torch.Tensor): Router probabilities (optional)
         """
         # Store detached copies to avoid keeping gradients
-        logits = logits
-        entropy_reward = self.compute_entropy_reward(logits)
-        print_rank_0(f"[RL DEBUG] add_layer_decision - logits req_grad: {logits.requires_grad}, entropy: {entropy_reward.item():.4f}")
+        latent_token_representations = latent_token_representations.detach()
+
+        use_entropy_reward = False
+        if use_entropy_reward:  
+            reward = self.compute_expert_load_entropy(routing_map)
+        else:
+            reward = self.focus_tokens_on_expert_0_reward(routing_map)
+        
+        if layer_num == 1:
+            wrap_print_rank_0(f"[RL DEBUG] layer {layer_num} add_layer_decision - latent_token_representations req_grad: {latent_token_representations.requires_grad}, use_entropy_reward: {use_entropy_reward} (alternatince is focus_tokens_on_expert_0_reward), reward: {reward.item():.4f}")
         self.layer_decisions[layer_num] = (
-            logits,
+            latent_token_representations,
             routing_map,
-            scores if scores is not None else None,
-            entropy_reward
+            routing_logits,
+            reward
         )
+
+    def focus_tokens_on_expert_0_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
+        """Reward to focus token routing on expert 0.
+        
+        Args:
+            routing_map: Tensor of shape [seq_length, batch_size, num_experts]
+                        containing routing probabilities or binary assignments
+        
+        Returns:
+            reward: Scalar tensor representing the reward to focus token routing on expert 0
+        """
+        return routing_map[:, :, 0].sum()
+
     
-    def compute_entropy_reward(self, logits: torch.Tensor) -> torch.Tensor:
-        """Compute entropy reward for a given layer's logits."""
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-        probs_from_logits = torch.nn.functional.softmax(logits, dim=-1)
-        token_entropies = -(probs_from_logits * log_probs).sum(dim=-1)
-        return token_entropies.mean()
+    def compute_expert_load_entropy(self, routing_map: torch.Tensor) -> torch.Tensor:
+        """Compute entropy of expert load distribution.
+        
+        Args:
+            routing_map: Tensor of shape [seq_length, batch_size, num_experts]
+                        containing routing probabilities or binary assignments
+        
+        Returns:
+            entropy: Scalar tensor representing the entropy of expert load distribution
+        """
+        # Reshape to [total_tokens, num_experts]
+        seq_length, batch_size, num_experts = routing_map.shape
+        routing_map_flat = routing_map.view(-1, num_experts)
+        
+        # Compute expert loads (how many tokens each expert gets)
+        # Sum across all tokens to get load per expert
+        expert_loads = routing_map_flat.sum(dim=0)  # [num_experts]
+        
+        # Normalize to get probability distribution
+        total_load = expert_loads.sum()
+        if total_load > 0:
+            expert_probs = expert_loads / total_load
+        else:
+            raise ValueError(f"Total load is 0 for routing map: {routing_map}")
+        
+        epsilon = 1e-10
+        expert_probs = expert_probs + epsilon
+        entropy = -(expert_probs * torch.log(expert_probs)).sum()
+        
+        # Normalize by log(num_experts) to get value in [0, 1]
+        normalized_entropy = entropy / torch.log(torch.tensor(num_experts, dtype=entropy.dtype, device=entropy.device))
+        
+        return normalized_entropy
     
-    def apply_rl_loss_to_scores(self, layer_num: int, scores: torch.Tensor) -> torch.Tensor:
-        """Apply RL loss to scores using MoEAuxLossAutoScaler - MINIMAL POC."""
-        if layer_num not in self.layer_decisions:
-            return scores
+    # def apply_rl_loss_to_scores(self, layer_num: int, scores: torch.Tensor) -> torch.Tensor:
+    #     """Apply RL loss to scores using MoEAuxLossAutoScaler - MINIMAL POC."""
+    #     if layer_num not in self.layer_decisions:
+    #         return scores
         
-        # Get stored data
-        logits, routing_map, _, entropy_reward = self.layer_decisions[layer_num]
+    #     # Get stored data
+    #     logits, routing_map, entropy_reward = self.layer_decisions[layer_num]
         
-        # Debug prints for layer 1
-        if layer_num == 1:
-            from megatron.training.utils import print_rank_0
-            print_rank_0(f"[RL DEBUG] apply_rl_loss - logits req_grad: {logits.requires_grad}, entropy: {entropy_reward.item():.4f}")
+    #     # Debug prints for layer 1
+    #     if layer_num == 1:
+    #         from megatron.training.utils import wrap_print_rank_0
+    #         wrap_print_rank_0(f"[RL DEBUG] apply_rl_loss - logits req_grad: {logits.requires_grad}, entropy: {entropy_reward.item():.4f}")
         
-        # Compute simple RL loss
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-        chosen_log_probs = log_probs * routing_map.float()
-        # Simple average reward - detach to treat as constant
-        rl_loss = -chosen_log_probs.mean() * 4.0  # Use constant reward for now
+    #     # Compute simple RL loss
+    #     log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    #     chosen_log_probs = log_probs * routing_map.float()
+    #     # Simple average reward - detach to treat as constant
+    #     rl_loss = -chosen_log_probs.mean() * 4.0  # Use constant reward for now
         
-        if layer_num == 1:
-            print_rank_0(f"[RL DEBUG] rl_loss: {rl_loss.item():.6f}, req_grad: {rl_loss.requires_grad}")
+    #     if layer_num == 1:
+    #         wrap_print_rank_0(f"[RL DEBUG] rl_loss: {rl_loss.item():.6f}, req_grad: {rl_loss.requires_grad}")
         
-        # Apply using MoEAuxLossAutoScaler
-        return MoEAuxLossAutoScaler.apply(scores, rl_loss)
+    #     # Apply using MoEAuxLossAutoScaler
+    #     return MoEAuxLossAutoScaler.apply(scores, rl_loss)
     
     def compute_reinforce_loss(self, trajectory_data: Dict, discount_factor: float = 0.9) -> torch.Tensor:
         """Compute trajectory loss using entropy rewards with layer-wise discounting.
@@ -122,7 +174,7 @@ class RouterTrajectoryTracker:
             return torch.tensor(0.0)
             
         first_layer = next(iter(trajectory_data.values()))
-        device = first_layer[0].device  # logits device
+        device = first_layer[0].device  # latent_token_representations device
         
         layer_rewards = {}
         sorted_layers = sorted(trajectory_data.keys())
@@ -130,6 +182,11 @@ class RouterTrajectoryTracker:
         for layer_num in sorted_layers:
             _, _, _, reward = trajectory_data[layer_num]
             layer_rewards[layer_num] = reward
+        
+        # Debug: Show reward information
+        reward_tensors = list(layer_rewards.values())
+        wrap_print_rank_0(f"REINFORCE DEBUG: num_layers={len(layer_rewards)}, reward_shape={reward_tensors[0].shape if hasattr(reward_tensors[0], 'shape') else 'scalar'}")
+        wrap_print_rank_0(f"REINFORCE DEBUG: reward_values={[r.item() if hasattr(r, 'item') else r for r in reward_tensors]}")
         
         #Calculate discounted state values using future rewards in reverse
         layer_values = {}
@@ -140,26 +197,37 @@ class RouterTrajectoryTracker:
             accumulated_value = layer_rewards[layer_num] + discount_factor * accumulated_value
             layer_values[layer_num] = accumulated_value
         
-        # Step 3: Apply REINFORCE loss using state values
+        # Debug: Show computed state values
+        value_tensors = list(layer_values.values())
+        wrap_print_rank_0(f"REINFORCE DEBUG: state_values={[v.item() if hasattr(v, 'item') else v for v in value_tensors]}")
+        
         total_loss = torch.tensor(0.0, device=device)
         
         for layer_num in sorted_layers:
-            logits, routing_map, scores, reward = trajectory_data[layer_num]
+            latent_token_representations, routing_map, routing_logits, reward = trajectory_data[layer_num]
             state_value = layer_values[layer_num].detach()
 
-            # Get log probabilities of chosen actions
-            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            # Get log probabilities of chosen actions from router logits
+            log_probs = torch.nn.functional.log_softmax(routing_logits, dim=-1)
             chosen_log_probs = log_probs * routing_map.float()
             # Average over routed assignments to keep scale comparable to LM loss
             num_tokens_routed = routing_map.sum().clamp_min(1).float()
             layer_log_prob = chosen_log_probs.sum() / num_tokens_routed
+            
+            # Debug: Show routing information for first layer
+            wrap_print_rank_0(f"REINFORCE DEBUG Layer {layer_num}: routing_logits.shape={routing_logits.shape}, routing_map.shape={routing_map.shape}")
+            wrap_print_rank_0(f"REINFORCE DEBUG Layer {layer_num}: num_experts_per_token={routing_map.sum(dim=-1).float().mean().item():.2f}")
+            wrap_print_rank_0(f"REINFORCE DEBUG Layer {layer_num}: layer_log_prob={layer_log_prob.item():.4f}, state_value={state_value.item():.4f}")
 
             # REINFORCE loss: -log_prob(action) * state_value
             layer_loss = -layer_log_prob * state_value
             total_loss += layer_loss
-
+        
+        # Debug: Show loss information
+        
         # Average across layers
         total_loss = total_loss / max(1, len(sorted_layers))
+        wrap_print_rank_0(f"REINFORCE DEBUG: total_loss={total_loss.item() if hasattr(total_loss, 'item') else total_loss}, shape={total_loss.shape if hasattr(total_loss, 'shape') else 'scalar'}")
         return total_loss
 
 
