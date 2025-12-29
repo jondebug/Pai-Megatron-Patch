@@ -1,0 +1,67 @@
+{
+    "_comment": "Sweep configuration for qwen3 MoE RL router training. Lists will be swept over.",
+    
+    "sweep_name": "rl_router_sweep_v1_expert0_focus",
+    
+    "env": "dsw",
+    "model_size": "A3B",
+    "batch_size": 1,
+    "global_batch_size": 8,
+    "lr": "1e-4",
+    "min_lr": "1e-6",
+    "seq_len": 128,
+    "pad_len": 128,
+    "precision": "bf16",
+    
+    "tp": 1,
+    "pp": 1,
+    "cp": 1,
+    "etp": 1,
+    "ep": 4,
+    "sp": true,
+    "do": true,
+    "fl": true,
+    "sft": false,
+    
+    "ac": "sel",
+    "optimizer_offload": false,
+    "save_interval": 900,
+    "train_iters": 1000,
+    "dataset_path": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-datasets/mmap_qwen3_datasets_text_document",
+    "valid_dataset_path": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-datasets/mmap_qwen3_datasets_text_document",
+    "pretrain_checkpoint_path": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-ckpts/Qwen3-30B-A3B-to-mcore",
+    "train_tokens": 1024000,
+    "warmup_tokens": 10240,
+    "output_basepath": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/output_router_finetuning",
+    
+    "router_only_training": true,
+    "enable_wandb_logging": true,
+    "wandb_project_name": "qwen3-router-training",
+    "wandb_run_name_base": "router-rl-sweep",
+    "wandb_run_tags": ["router-only", "moe-training", "sweep"],
+    
+    "use_rl_loss": true,
+    "moe_aux_loss_coeff": 0,
+    
+    "_sweep_comment": "The following parameters are lists - all combinations will be run",
+    
+    "rl_algorithm": ["ppo", "reinforce"],
+    "rl_per_token_rewards": [true, false],
+    "rl_ppo_entropy_coeff": [0, 0.01, 0.05],
+    "rl_loss_coeff": [0, 0.1, 1],
+
+    "_filters_comment": "Filters to skip invalid combinations",
+    "filters": [
+        {
+            "_comment": "ppo_entropy_coeff only matters for PPO, collapse for reinforce",
+            "if": {"rl_algorithm": "reinforce"},
+            "collapse": ["rl_ppo_entropy_coeff"]
+        },
+        {
+            "_comment": "if rl_loss_coeff is 0 rl is dissabled. we only need to run this once",
+            "if": {"rl_loss_coeff": 0},
+            "collapse": ["rl_ppo_entropy_coeff", "rl_per_token_rewards", "rl_algorithm"]
+        }
+    ]
+}
+

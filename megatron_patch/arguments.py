@@ -525,6 +525,12 @@ def get_patch_args(parser):
                       help='Coefficient for RL loss (default: 0.1)')
     group.add_argument('--use-per-layer-loss', action='store_true', default=False,
                       help='Use per-layer discounted RL loss instead of independent layer losses')
+    group.add_argument('--rl-per-token-rewards', action='store_true', default=False,
+                      help='Use per-token rewards instead of scalar rewards for RL training. effectively this means the state is a single token instead of a sequence of tokens not a batch')
+    group.add_argument('--rl-ppo-entropy-coeff', type=float, default=0.01,
+                      help='Entropy coefficient for PPO loss (default: 0.01)')
+    group.add_argument('--rl-use-entropy-reward', action='store_true', default=False,
+                      help='Use entropy-based reward instead of expert-0 focusing reward. will be deprecated in the future')
     group.add_argument('--enable-wandb-logging', action='store_true', default=False,
                       help='Enable wandb logging for training metrics')
     group.add_argument('--wandb-project-name', type=str, default='qwen3-moe-training',

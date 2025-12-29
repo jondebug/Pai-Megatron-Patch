@@ -56,6 +56,9 @@ class RouterTrajectoryTracker:
     def __init__(self):
         self.reset()
         self.per_token_rewards = True
+        self.ppo_entropy_coeff = 0.01
+        self.use_entropy_reward = False
+
     
     def reset(self):
         """Reset the trajectory for a new forward pass."""
@@ -74,15 +77,14 @@ class RouterTrajectoryTracker:
         # Store detached copies to avoid keeping gradients
         latent_token_representations = latent_token_representations.detach()
 
-        use_entropy_reward = False
-        if use_entropy_reward:  
+        if self.use_entropy_reward:  
             reward = self.compute_expert_load_entropy(routing_map)
         else:
             reward = self.focus_tokens_on_expert_0_reward(routing_map)
         
         if layer_num == 1:
             reward_summary = reward.mean().item() if reward.dim() > 0 else reward.item()
-            wrap_print_rank_0(f"[RL DEBUG] layer {layer_num} add_layer_decision - latent_token_representations req_grad: {latent_token_representations.requires_grad}, use_entropy_reward: {use_entropy_reward}, reward_shape: {reward.shape}, reward_mean: {reward_summary:.4f}")
+            wrap_print_rank_0(f"[RL DEBUG] layer {layer_num} add_layer_decision - latent_token_representations req_grad: {latent_token_representations.requires_grad}, use_entropy_reward: {self.use_entropy_reward}, reward_shape: {reward.shape}, reward_mean: {reward_summary:.4f}")
         self.layer_decisions[layer_num] = (
             latent_token_representations,
             routing_map,
@@ -378,7 +380,7 @@ class RouterTrajectoryTracker:
             advantages[layer_num] = (returns[layer_num] - baseline).detach()
         
         total_loss = torch.tensor(0.0, device=device)
-        entropy_coeff = 0.01
+        entropy_coeff = self.ppo_entropy_coeff
         
         for layer_num in sorted_layers:
             _, routing_map, routing_logits, reward = trajectory_data[layer_num]
@@ -463,7 +465,7 @@ class RouterTrajectoryTracker:
         
         total_loss = torch.tensor(0.0, device=device)
         total_tokens = 0
-        entropy_coeff = 0.0  # Disable entropy to let policy focus on expert 0
+        entropy_coeff = self.ppo_entropy_coeff
         
         for layer_num in sorted_layers:
             _, routing_map, routing_logits, reward = trajectory_data[layer_num]
@@ -524,6 +526,16 @@ def get_trajectory_tracker() -> RouterTrajectoryTracker:
     global _global_trajectory_tracker
     if _global_trajectory_tracker is None:
         _global_trajectory_tracker = RouterTrajectoryTracker()
+        # Configure from command line args if available
+        try:
+            from megatron import get_args
+            args = get_args()
+            _global_trajectory_tracker.per_token_rewards = getattr(args, 'rl_per_token_rewards', True)
+            _global_trajectory_tracker.ppo_entropy_coeff = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
+            _global_trajectory_tracker.use_entropy_reward = getattr(args, 'rl_use_entropy_reward', False)
+        except (ImportError, AssertionError):
+            # Args not available yet, use defaults
+            pass
     return _global_trajectory_tracker
 
 
