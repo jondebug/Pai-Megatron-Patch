@@ -55,6 +55,7 @@ class RouterTrajectoryTracker:
     
     def __init__(self):
         self.reset()
+        self.per_token_rewards = True
     
     def reset(self):
         """Reset the trajectory for a new forward pass."""
@@ -80,7 +81,8 @@ class RouterTrajectoryTracker:
             reward = self.focus_tokens_on_expert_0_reward(routing_map)
         
         if layer_num == 1:
-            wrap_print_rank_0(f"[RL DEBUG] layer {layer_num} add_layer_decision - latent_token_representations req_grad: {latent_token_representations.requires_grad}, use_entropy_reward: {use_entropy_reward} (alternatince is focus_tokens_on_expert_0_reward), reward: {reward.item():.4f}")
+            reward_summary = reward.mean().item() if reward.dim() > 0 else reward.item()
+            wrap_print_rank_0(f"[RL DEBUG] layer {layer_num} add_layer_decision - latent_token_representations req_grad: {latent_token_representations.requires_grad}, use_entropy_reward: {use_entropy_reward}, reward_shape: {reward.shape}, reward_mean: {reward_summary:.4f}")
         self.layer_decisions[layer_num] = (
             latent_token_representations,
             routing_map,
@@ -91,14 +93,43 @@ class RouterTrajectoryTracker:
     def focus_tokens_on_expert_0_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
         """Reward to focus token routing on expert 0.
         
+        Uses self.per_token_rewards flag to decide between per-token or scalar reward.
+        
         Args:
             routing_map: Tensor of shape [seq_length, batch_size, num_experts]
                         containing routing probabilities or binary assignments
         
         Returns:
-            reward: Scalar tensor representing the reward to focus token routing on expert 0
+            reward: Either per-token [seq_length, batch_size] or scalar tensor
         """
-        return routing_map[:, :, 0].sum()
+        if self.per_token_rewards:
+            return self._per_token_expert_0_reward(routing_map)
+        else:
+            return self._scalar_expert_0_reward(routing_map)
+    
+    def _per_token_expert_0_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
+        """Per-token reward: 1.0 if token went to expert 0, else 0.0.
+        
+        Args:
+            routing_map: Tensor of shape [seq_length, batch_size, num_experts]
+        
+        Returns:
+            reward: Tensor of shape [seq_length, batch_size]
+        """
+        return routing_map[:, :, 0].float()
+    
+    def _scalar_expert_0_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
+        """Scalar reward: fraction of tokens routed to expert 0.
+        
+        Args:
+            routing_map: Tensor of shape [seq_length, batch_size, num_experts]
+        
+        Returns:
+            reward: Scalar tensor in [0, 1]
+        """
+        total_tokens = routing_map.sum()
+        tokens_to_expert_0 = routing_map[:, :, 0].sum()
+        return tokens_to_expert_0 / total_tokens.clamp_min(1.0)
 
     
     def compute_expert_load_entropy(self, routing_map: torch.Tensor) -> torch.Tensor:
@@ -161,50 +192,49 @@ class RouterTrajectoryTracker:
     #     return MoEAuxLossAutoScaler.apply(scores, rl_loss)
     
     def compute_reinforce_loss(self, trajectory_data: Dict, discount_factor: float = 0.9) -> torch.Tensor:
-        """Compute trajectory loss using entropy rewards with layer-wise discounting.
+        """Compute REINFORCE loss.
+        
+        Automatically uses per-token or scalar rewards based on self.per_token_rewards flag.
       
         Args:
             trajectory_data: Dictionary of layer decisions  
             discount_factor: Discount factor γ for future rewards
             
         Returns:
-            torch.Tensor: trajectory loss with discounted values
+            torch.Tensor: trajectory loss
         """
+        if self.per_token_rewards:
+            return self._compute_reinforce_loss_per_token(trajectory_data, discount_factor)
+        else:
+            return self._compute_reinforce_loss_scalar(trajectory_data, discount_factor)
+    
+    def _compute_reinforce_loss_scalar(self, trajectory_data: Dict, discount_factor: float = 0.9) -> torch.Tensor:
+        """Compute REINFORCE loss with scalar rewards (original implementation)."""
         if len(trajectory_data) == 0:
             return torch.tensor(0.0)
             
         first_layer = next(iter(trajectory_data.values()))
-        device = first_layer[0].device  # latent_token_representations device
+        device = first_layer[0].device
         
         layer_rewards = {}
         sorted_layers = sorted(trajectory_data.keys())
         
         for layer_num in sorted_layers:
             _, _, _, reward = trajectory_data[layer_num]
-            layer_rewards[layer_num] = reward
+            layer_rewards[layer_num] = reward  # scalar
         
-        # Debug: Show reward information
-        reward_tensors = list(layer_rewards.values())
-        wrap_print_rank_0(f"REINFORCE DEBUG: num_layers={len(layer_rewards)}, reward_shape={reward_tensors[0].shape if hasattr(reward_tensors[0], 'shape') else 'scalar'}")
-        wrap_print_rank_0(f"REINFORCE DEBUG: reward_values={[r.item() if hasattr(r, 'item') else r for r in reward_tensors]}")
-        
-        #Calculate discounted state values using future rewards in reverse
+        # Calculate discounted state values using future rewards in reverse
         layer_values = {}
         accumulated_value = torch.tensor(0.0, device=device)
         
- 
         for layer_num in reversed(sorted_layers):
             accumulated_value = layer_rewards[layer_num] + discount_factor * accumulated_value
             layer_values[layer_num] = accumulated_value
         
-        # Debug: Show computed state values
-        value_tensors = list(layer_values.values())
-        wrap_print_rank_0(f"REINFORCE DEBUG: state_values={[v.item() if hasattr(v, 'item') else v for v in value_tensors]}")
-        
         total_loss = torch.tensor(0.0, device=device)
         
         for layer_num in sorted_layers:
-            latent_token_representations, routing_map, routing_logits, reward = trajectory_data[layer_num]
+            _, routing_map, routing_logits, reward = trajectory_data[layer_num]
             state_value = layer_values[layer_num].detach()
 
             # Get log probabilities of chosen actions from router logits
@@ -213,21 +243,78 @@ class RouterTrajectoryTracker:
             # Average over routed assignments to keep scale comparable to LM loss
             num_tokens_routed = routing_map.sum().clamp_min(1).float()
             layer_log_prob = chosen_log_probs.sum() / num_tokens_routed
-            
-            # Debug: Show routing information for first layer
-            wrap_print_rank_0(f"REINFORCE DEBUG Layer {layer_num}: routing_logits.shape={routing_logits.shape}, routing_map.shape={routing_map.shape}")
-            wrap_print_rank_0(f"REINFORCE DEBUG Layer {layer_num}: num_experts_per_token={routing_map.sum(dim=-1).float().mean().item():.2f}")
-            wrap_print_rank_0(f"REINFORCE DEBUG Layer {layer_num}: layer_log_prob={layer_log_prob.item():.4f}, state_value={state_value.item():.4f}")
 
             # REINFORCE loss: -log_prob(action) * state_value
             layer_loss = -layer_log_prob * state_value
             total_loss += layer_loss
         
-        # Debug: Show loss information
-        
         # Average across layers
         total_loss = total_loss / max(1, len(sorted_layers))
-        wrap_print_rank_0(f"REINFORCE DEBUG: total_loss={total_loss.item() if hasattr(total_loss, 'item') else total_loss}, shape={total_loss.shape if hasattr(total_loss, 'shape') else 'scalar'}")
+        wrap_print_rank_0(f"REINFORCE (scalar) DEBUG: total_loss={total_loss.item():.6f}")
+        return total_loss
+    
+    def _compute_reinforce_loss_per_token(self, trajectory_data: Dict, discount_factor: float = 0.9) -> torch.Tensor:
+        """Compute REINFORCE loss with per-token rewards."""
+        if len(trajectory_data) == 0:
+            return torch.tensor(0.0)
+            
+        first_layer = next(iter(trajectory_data.values()))
+        device = first_layer[0].device
+        
+        sorted_layers = sorted(trajectory_data.keys())
+        
+        # Get per-token rewards for each layer: shape [seq_length, batch_size]
+        layer_rewards = {}
+        for layer_num in sorted_layers:
+            _, _, _, reward = trajectory_data[layer_num]
+            layer_rewards[layer_num] = reward  # [seq_length, batch_size]
+        
+        first_reward = layer_rewards[sorted_layers[0]]
+        wrap_print_rank_0(f"REINFORCE (per-token) DEBUG: num_layers={len(layer_rewards)}, reward_shape={first_reward.shape}, reward_mean={first_reward.mean().item():.4f}")
+        
+        # Calculate per-token discounted returns (reward-to-go) in reverse layer order
+        layer_returns = {}
+        reward_to_go = torch.zeros_like(first_reward)  # [seq_length, batch_size]
+        
+        for layer_num in reversed(sorted_layers):
+            reward_to_go = layer_rewards[layer_num] + discount_factor * reward_to_go
+            layer_returns[layer_num] = reward_to_go.clone()
+        
+        # Compute baseline per layer (mean return across tokens) for variance reduction
+        layer_baselines = {}
+        for layer_num in sorted_layers:
+            layer_baselines[layer_num] = layer_returns[layer_num].mean()
+        
+        # Compute per-token advantages
+        layer_advantages = {}
+        for layer_num in sorted_layers:
+            layer_advantages[layer_num] = (layer_returns[layer_num] - layer_baselines[layer_num]).detach()
+        
+        total_loss = torch.tensor(0.0, device=device)
+        total_tokens = 0
+        
+        for layer_num in sorted_layers:
+            _, routing_map, routing_logits, reward = trajectory_data[layer_num]
+            advantages = layer_advantages[layer_num]  # [seq_length, batch_size]
+            
+            # Get log probabilities of chosen actions from router logits
+            log_probs = torch.nn.functional.log_softmax(routing_logits, dim=-1)
+            chosen_log_probs = log_probs * routing_map.float()
+            per_token_log_prob = chosen_log_probs.sum(dim=-1)  # [seq_length, batch_size]
+            
+            # REINFORCE loss: -log_prob(action) * advantage, per token
+            per_token_loss = -per_token_log_prob * advantages
+            
+            layer_loss = per_token_loss.sum()
+            total_loss += layer_loss
+            total_tokens += per_token_loss.numel()
+            
+            if layer_num == sorted_layers[0]:
+                wrap_print_rank_0(f"REINFORCE (per-token) Layer {layer_num}: advantages_mean={advantages.mean().item():.4f}")
+        
+        # Average over all tokens across all layers
+        total_loss = total_loss / max(1, total_tokens)
+        wrap_print_rank_0(f"REINFORCE (per-token) DEBUG: total_loss={total_loss.item():.6f}, total_tokens={total_tokens}")
         return total_loss
 
 
@@ -235,7 +322,9 @@ class RouterTrajectoryTracker:
     def compute_ppo_loss(self, trajectory_data: Dict, old_trajectory_data: Dict = None, 
                         discount_factor: float = 0.99, clip_ratio: float = 0.2, 
                         value_coeff: float = 0.5) -> torch.Tensor:
-        """Compute PPO loss with clipped policy gradient and value function loss.
+        """Compute PPO loss with clipped policy gradient.
+        
+        Automatically uses per-token or scalar rewards based on self.per_token_rewards flag.
         
         Args:
             trajectory_data: Current trajectory decisions  
@@ -243,89 +332,58 @@ class RouterTrajectoryTracker:
             discount_factor: Discount factor γ for future rewards (0.99 = value future highly)
             clip_ratio: PPO clipping parameter (0.2 is standard)
             value_coeff: Coefficient for value function loss
-            entropy_coeff: Coefficient for entropy regularization
             
         Returns:
             torch.Tensor: PPO loss combining policy gradient, value loss, and entropy
         """
+        if self.per_token_rewards:
+            return self._compute_ppo_loss_per_token(trajectory_data, old_trajectory_data, 
+                                                     discount_factor, clip_ratio, value_coeff)
+        else:
+            return self._compute_ppo_loss_scalar(trajectory_data, old_trajectory_data,
+                                                  discount_factor, clip_ratio, value_coeff)
+    
+    def _compute_ppo_loss_scalar(self, trajectory_data: Dict, old_trajectory_data: Dict = None, 
+                                  discount_factor: float = 0.99, clip_ratio: float = 0.2, 
+                                  value_coeff: float = 0.5) -> torch.Tensor:
+        """Compute PPO loss with scalar rewards (original implementation)."""
         if len(trajectory_data) == 0:
             return torch.tensor(0.0)
             
         first_layer = next(iter(trajectory_data.values()))
         device = first_layer[0].device
         
-        # Extract immediate rewards for each layer
         layer_rewards = {}
         sorted_layers = sorted(trajectory_data.keys())
         
         for layer_num in sorted_layers:
             _, _, _, reward = trajectory_data[layer_num]
-            layer_rewards[layer_num] = reward
+            layer_rewards[layer_num] = reward  # scalar
         
-        # Calculate returns and values first
+        # Calculate returns
         returns = {}
-        values = {}
-        
-        # Initialize final value (no future rewards beyond last layer)
         reward_to_go = torch.tensor(0.0, device=device)
         
-        # Calculate reward-to-go (returns) following reference pattern
         for layer_num in reversed(sorted_layers):
-            immediate_reward = layer_rewards[layer_num]
-            reward_to_go = immediate_reward + discount_factor * reward_to_go
+            reward_to_go = layer_rewards[layer_num] + discount_factor * reward_to_go
             returns[layer_num] = reward_to_go
         
-        # Simple baseline (value function approximation)
-        # NOTE: This is a static baseline (mean of returns). For better PPO performance,
-        # you would typically train a separate value network that takes latent_token_representations
-        # as input to provide state-dependent value estimates. The latent_token_representations
-        # are stored in the trajectory for this purpose but currently unused.
+        # Simple baseline
         all_returns = torch.stack(list(returns.values()))
         baseline = all_returns.mean()
         
-        # Initialize values - using baseline as simple value function
-        for layer_num in sorted_layers:
-            values[layer_num] = baseline
-        
-        # Add final value for GAE calculation (value after last layer = 0)
-        final_layer = max(sorted_layers)
-        values[final_layer + 1] = torch.tensor(0.0, device=device)
-        
-        # Calculate advantages using GAE following reference implementation
+        # Calculate advantages
         advantages = {}
-        gae_tau = 0.95  # GAE parameter (lambda in the paper)
-        adv = torch.tensor(0.0, device=device)
-        
-        # Calculate GAE advantages in reverse order
-        for layer_num in reversed(sorted_layers):
-            immediate_reward = layer_rewards[layer_num]
-            current_value = values[layer_num]
-            next_value = values.get(layer_num + 1, torch.tensor(0.0, device=device))
-            
-            # TD error calculation following reference:
-            # td_error = reward[i] + discount * mask[i] * value[i + 1] - value[i]
-            td_error = immediate_reward + discount_factor * next_value - current_value
-            
-            # GAE calculation following reference:
-            # adv = td_error + adv * gae_tau * discount * mask[i]
-            adv = td_error + adv * gae_tau * discount_factor
-            advantages[layer_num] = adv
-        
-        # # Normalize advantages for stability (following PPO best practices)
-        # advantage_values = torch.stack(list(advantages.values()))
-        # if advantage_values.std() > 1e-8:
-        #     advantage_mean = advantage_values.mean()
-        #     advantage_std = advantage_values.std()
-        #     normalized_advantages = (advantage_values - advantage_mean) / (advantage_std + 1e-8)
-        #     advantages = {layer_num: normalized_advantages[i] for i, layer_num in enumerate(sorted_layers)}
+        for layer_num in sorted_layers:
+            advantages[layer_num] = (returns[layer_num] - baseline).detach()
         
         total_loss = torch.tensor(0.0, device=device)
+        entropy_coeff = 0.01
         
         for layer_num in sorted_layers:
-            latent_token_representations, routing_map, routing_logits, reward = trajectory_data[layer_num]
-            advantage = advantages[layer_num].detach()
+            _, routing_map, routing_logits, reward = trajectory_data[layer_num]
+            advantage = advantages[layer_num]
             return_value = returns[layer_num].detach()
-            baseline_value = values[layer_num]
             
             # Current policy log probabilities (normalized by routed tokens)
             log_probs = torch.nn.functional.log_softmax(routing_logits, dim=-1)
@@ -333,46 +391,127 @@ class RouterTrajectoryTracker:
             num_tokens_routed = routing_map.sum().clamp_min(1).float()
             current_log_prob = chosen_log_probs.sum() / num_tokens_routed
             
-            # Old policy log probabilities (for importance sampling)
+            # Old policy log probabilities
             if old_trajectory_data is not None and layer_num in old_trajectory_data:
-                old_latent_token_representations, old_routing_map, old_routing_logits, _ = old_trajectory_data[layer_num]
-                # Detach old logits to prevent backprop through freed graph
+                _, old_routing_map, old_routing_logits, _ = old_trajectory_data[layer_num]
                 old_routing_logits = old_routing_logits.detach()
                 old_log_probs = torch.nn.functional.log_softmax(old_routing_logits, dim=-1)
                 old_chosen_log_probs = old_log_probs * old_routing_map.float()
                 old_num_tokens_routed = old_routing_map.sum().clamp_min(1).float()
                 old_log_prob = old_chosen_log_probs.sum() / old_num_tokens_routed
                 
-                # Importance sampling ratio (clamped for numerical stability)
                 log_ratio = torch.clamp(current_log_prob - old_log_prob, min=-10.0, max=10.0)
                 ratio = torch.exp(log_ratio)
             else:
-                # No old trajectory available, use ratio = 1 (equivalent to REINFORCE)
                 ratio = torch.tensor(1.0, device=device)
             
-            # PPO clipped objective following reference implementation
-            # pg_obj1 = ratio * sampled_advantages
-            # pg_obj2 = ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * sampled_advantages
-            # pg_loss = torch.min(pg_obj1, pg_obj2).mean()
+            # PPO clipped objective
             pg_obj1 = ratio * advantage
             pg_obj2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantage
-            policy_loss = -torch.min(pg_obj1, pg_obj2)  # Negative because we want to maximize
+            policy_loss = -torch.min(pg_obj1, pg_obj2)
             
-            # Value function loss following reference: v_loss = 0.5 * torch.square(returns - v).mean()
-            value_loss = 0.5 * torch.square(return_value - baseline_value)
+            # Value function loss
+            value_loss = 0.5 * torch.square(return_value - baseline)
             
-            # Entropy bonus for exploration
+            # Entropy bonus
             probs = torch.nn.functional.softmax(routing_logits, dim=-1)
             entropy = -(probs * log_probs).sum()
             
-            # Combined loss following reference: loss = -pg_loss - entropy_coeff * entropy + baseline_coeff * v_loss
-            # Note: entropy_coeff can be tuned (e.g., 0.01) to encourage exploration
-            entropy_coeff = 0.01
             layer_loss = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
             total_loss += layer_loss
             
-        # Average across layers to keep scale comparable to LM loss
         total_loss = total_loss / max(1, len(sorted_layers))
+        wrap_print_rank_0(f"PPO (scalar) DEBUG: total_loss={total_loss.item():.6f}")
+        return total_loss
+    
+    def _compute_ppo_loss_per_token(self, trajectory_data: Dict, old_trajectory_data: Dict = None, 
+                                     discount_factor: float = 0.99, clip_ratio: float = 0.2, 
+                                     value_coeff: float = 0.5) -> torch.Tensor:
+        """Compute PPO loss with per-token rewards."""
+        if len(trajectory_data) == 0:
+            return torch.tensor(0.0)
+            
+        first_layer = next(iter(trajectory_data.values()))
+        device = first_layer[0].device
+        
+        sorted_layers = sorted(trajectory_data.keys())
+        
+        # Get per-token rewards for each layer: shape [seq_length, batch_size]
+        layer_rewards = {}
+        for layer_num in sorted_layers:
+            _, _, _, reward = trajectory_data[layer_num]
+            layer_rewards[layer_num] = reward  # [seq_length, batch_size]
+        
+        first_reward = layer_rewards[sorted_layers[0]]
+        
+        # Calculate per-token discounted returns
+        layer_returns = {}
+        reward_to_go = torch.zeros_like(first_reward)
+        
+        for layer_num in reversed(sorted_layers):
+            reward_to_go = layer_rewards[layer_num] + discount_factor * reward_to_go
+            layer_returns[layer_num] = reward_to_go.clone()
+        
+        # Compute per-token baseline
+        all_returns = torch.cat([layer_returns[ln].flatten() for ln in sorted_layers])
+        baseline = all_returns.mean()
+        
+        # Compute per-token advantages
+        layer_advantages = {}
+        for layer_num in sorted_layers:
+            layer_advantages[layer_num] = (layer_returns[layer_num] - baseline).detach()
+        
+        total_loss = torch.tensor(0.0, device=device)
+        total_tokens = 0
+        entropy_coeff = 0.0  # Disable entropy to let policy focus on expert 0
+        
+        for layer_num in sorted_layers:
+            _, routing_map, routing_logits, reward = trajectory_data[layer_num]
+            advantages = layer_advantages[layer_num]  # [seq_length, batch_size]
+            returns = layer_returns[layer_num].detach()
+            
+            # Current policy log probabilities per token
+            log_probs = torch.nn.functional.log_softmax(routing_logits, dim=-1)
+            chosen_log_probs = log_probs * routing_map.float()
+            current_per_token_log_prob = chosen_log_probs.sum(dim=-1)
+            
+            # Old policy log probabilities
+            if old_trajectory_data is not None and layer_num in old_trajectory_data:
+                _, old_routing_map, old_routing_logits, _ = old_trajectory_data[layer_num]
+                old_routing_logits = old_routing_logits.detach()
+                old_log_probs = torch.nn.functional.log_softmax(old_routing_logits, dim=-1)
+                old_chosen_log_probs = old_log_probs * old_routing_map.float()
+                old_per_token_log_prob = old_chosen_log_probs.sum(dim=-1)
+                
+                log_ratio = torch.clamp(current_per_token_log_prob - old_per_token_log_prob, min=-10.0, max=10.0)
+                ratio = torch.exp(log_ratio)
+            else:
+                ratio = torch.ones_like(current_per_token_log_prob)
+            
+            # PPO clipped objective per token
+            pg_obj1 = ratio * advantages
+            pg_obj2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages
+            per_token_policy_loss = -torch.min(pg_obj1, pg_obj2)
+            
+            # Value function loss per token
+            per_token_value_loss = 0.5 * torch.square(returns - baseline)
+            
+            # Entropy bonus per token
+            probs = torch.nn.functional.softmax(routing_logits, dim=-1)
+            per_token_entropy = -(probs * log_probs).sum(dim=-1)
+            
+            # Combined per-token loss
+            per_token_loss = per_token_policy_loss + value_coeff * per_token_value_loss - entropy_coeff * per_token_entropy
+            
+            layer_loss = per_token_loss.sum()
+            total_loss += layer_loss
+            total_tokens += per_token_loss.numel()
+            
+            if layer_num == sorted_layers[0]:
+                wrap_print_rank_0(f"PPO (per-token) Layer {layer_num}: advantages_mean={advantages.mean().item():.4f}, ratio_mean={ratio.mean().item():.4f}")
+        
+        total_loss = total_loss / max(1, total_tokens)
+        wrap_print_rank_0(f"PPO (per-token) DEBUG: total_loss={total_loss.item():.6f}, total_tokens={total_tokens}")
         return total_loss
 
 
