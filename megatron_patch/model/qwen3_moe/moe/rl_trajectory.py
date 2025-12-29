@@ -327,20 +327,25 @@ class RouterTrajectoryTracker:
             return_value = returns[layer_num].detach()
             baseline_value = values[layer_num]
             
-            # Current policy log probabilities
+            # Current policy log probabilities (normalized by routed tokens)
             log_probs = torch.nn.functional.log_softmax(routing_logits, dim=-1)
             chosen_log_probs = log_probs * routing_map.float()
-            current_log_prob = chosen_log_probs.sum()
+            num_tokens_routed = routing_map.sum().clamp_min(1).float()
+            current_log_prob = chosen_log_probs.sum() / num_tokens_routed
             
             # Old policy log probabilities (for importance sampling)
             if old_trajectory_data is not None and layer_num in old_trajectory_data:
                 old_latent_token_representations, old_routing_map, old_routing_logits, _ = old_trajectory_data[layer_num]
+                # Detach old logits to prevent backprop through freed graph
+                old_routing_logits = old_routing_logits.detach()
                 old_log_probs = torch.nn.functional.log_softmax(old_routing_logits, dim=-1)
                 old_chosen_log_probs = old_log_probs * old_routing_map.float()
-                old_log_prob = old_chosen_log_probs.sum()
+                old_num_tokens_routed = old_routing_map.sum().clamp_min(1).float()
+                old_log_prob = old_chosen_log_probs.sum() / old_num_tokens_routed
                 
-                # Importance sampling ratio
-                ratio = torch.exp(current_log_prob - old_log_prob)
+                # Importance sampling ratio (clamped for numerical stability)
+                log_ratio = torch.clamp(current_log_prob - old_log_prob, min=-10.0, max=10.0)
+                ratio = torch.exp(log_ratio)
             else:
                 # No old trajectory available, use ratio = 1 (equivalent to REINFORCE)
                 ratio = torch.tensor(1.0, device=device)
@@ -366,6 +371,8 @@ class RouterTrajectoryTracker:
             layer_loss = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
             total_loss += layer_loss
             
+        # Average across layers to keep scale comparable to LM loss
+        total_loss = total_loss / max(1, len(sorted_layers))
         return total_loss
 
 

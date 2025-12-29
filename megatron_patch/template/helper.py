@@ -270,24 +270,42 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
 
     trajectory_tracker = get_trajectory_tracker()
     rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
+    rl_algorithm = getattr(args, 'rl_algorithm', 'reinforce').lower()
     
-    # Compute REINFORCE loss from the complete trajectory
-    rl_loss = trajectory_tracker.compute_reinforce_loss(
-        trajectory_tracker.layer_decisions,
-        discount_factor=0.9
-    )
+    # Compute RL loss based on selected algorithm
+    if rl_algorithm == 'ppo':
+        rl_loss = trajectory_tracker.compute_ppo_loss(
+            trajectory_tracker.layer_decisions,
+            trajectory_tracker.old_layer_decisions,
+            discount_factor=0.99,
+            clip_ratio=0.2,
+            value_coeff=0.5
+        )
+    else:  # reinforce
+        rl_loss = trajectory_tracker.compute_reinforce_loss(
+            trajectory_tracker.layer_decisions,
+            discount_factor=0.9
+        )
     
     # Scale and add RL loss
     rl_loss = rl_loss * rl_loss_coeff
     loss_dict["rl_loss"] = rl_loss.detach()
-    
+
+    # Optional lightweight debug: report RL vs LM magnitudes on main rank
+    try:
+        from megatron.core import parallel_state as mpu
+        if mpu.get_data_parallel_rank() == 0:
+            print_rank_0(f"[RL DEBUG] rl_loss={rl_loss.item():.4e}, lm_loss={averaged_loss.item():.4e}", override_debug_mode=False)
+    except Exception:
+        pass
+
     # Reset trajectory for next iteration
     reset_trajectory_tracker()
     # Scale RL loss to match the LM loss scale (RL loss is averaged, LM loss is summed)
     use_only_rl_loss = False
     if use_only_rl_loss:
         loss = torch.stack([rl_loss * loss[1], loss[1]])
-    else:
+    else:        
         loss = torch.stack([loss[0] + rl_loss * loss[1], loss[1]])
     if num_seqs is None:
         # average on token-level
