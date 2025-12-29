@@ -276,7 +276,10 @@ class RouterTrajectoryTracker:
             returns[layer_num] = reward_to_go
         
         # Simple baseline (value function approximation)
-        # In practice, this could be a learned value network
+        # NOTE: This is a static baseline (mean of returns). For better PPO performance,
+        # you would typically train a separate value network that takes latent_token_representations
+        # as input to provide state-dependent value estimates. The latent_token_representations
+        # are stored in the trajectory for this purpose but currently unused.
         all_returns = torch.stack(list(returns.values()))
         baseline = all_returns.mean()
         
@@ -319,20 +322,20 @@ class RouterTrajectoryTracker:
         total_loss = torch.tensor(0.0, device=device)
         
         for layer_num in sorted_layers:
-            logits, routing_map, scores, reward = trajectory_data[layer_num]
+            latent_token_representations, routing_map, routing_logits, reward = trajectory_data[layer_num]
             advantage = advantages[layer_num].detach()
             return_value = returns[layer_num].detach()
             baseline_value = values[layer_num]
             
             # Current policy log probabilities
-            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            log_probs = torch.nn.functional.log_softmax(routing_logits, dim=-1)
             chosen_log_probs = log_probs * routing_map.float()
             current_log_prob = chosen_log_probs.sum()
             
             # Old policy log probabilities (for importance sampling)
             if old_trajectory_data is not None and layer_num in old_trajectory_data:
-                old_logits, old_routing_map, _, _ = old_trajectory_data[layer_num]
-                old_log_probs = torch.nn.functional.log_softmax(old_logits, dim=-1)
+                old_latent_token_representations, old_routing_map, old_routing_logits, _ = old_trajectory_data[layer_num]
+                old_log_probs = torch.nn.functional.log_softmax(old_routing_logits, dim=-1)
                 old_chosen_log_probs = old_log_probs * old_routing_map.float()
                 old_log_prob = old_chosen_log_probs.sum()
                 
@@ -354,11 +357,13 @@ class RouterTrajectoryTracker:
             value_loss = 0.5 * torch.square(return_value - baseline_value)
             
             # Entropy bonus for exploration
-            probs = torch.nn.functional.softmax(logits, dim=-1)
-            # entropy = -(probs * log_probs).sum()
+            probs = torch.nn.functional.softmax(routing_logits, dim=-1)
+            entropy = -(probs * log_probs).sum()
             
             # Combined loss following reference: loss = -pg_loss - entropy_coeff * entropy + baseline_coeff * v_loss
-            layer_loss = policy_loss + value_coeff * value_loss #- entropy_coeff * entropy
+            # Note: entropy_coeff can be tuned (e.g., 0.01) to encourage exploration
+            entropy_coeff = 0.01
+            layer_loss = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
             total_loss += layer_loss
             
         return total_loss
