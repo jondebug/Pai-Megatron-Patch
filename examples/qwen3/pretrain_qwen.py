@@ -110,14 +110,15 @@ def setup_wandb_logging():
                 def enhanced_evaluate_and_print_results(prefix, forward_step_func, 
                                                        data_iterator, model, 
                                                        process_non_loss_data_func, config, 
-                                                       verbose=False, write_to_tensorboard=True, 
-                                                       iteration=0):
+                                                       **kwargs):
                     """Enhanced evaluate function with Wandb integration"""
                     
                     # Call original function first
                     result = original_evaluate(prefix, forward_step_func, data_iterator, model, 
-                                             process_non_loss_data_func, config, verbose, 
-                                             write_to_tensorboard, iteration)
+                                             process_non_loss_data_func, config, **kwargs)
+                    
+                    # Extract iteration for wandb logging
+                    iteration = kwargs.get('iteration', 0)
                     
                     # Add Wandb logging for evaluation metrics
                     try:
