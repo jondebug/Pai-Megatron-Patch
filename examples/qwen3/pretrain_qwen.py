@@ -109,13 +109,13 @@ def setup_wandb_logging():
                 
                 def enhanced_evaluate_and_print_results(prefix, forward_step_func, 
                                                        data_iterator, model, 
-                                                       process_non_loss_data_func, config, 
-                                                       **kwargs):
+                                                       process_non_loss_data_func, config,
+                                                       *args, **kwargs):
                     """Enhanced evaluate function with Wandb integration"""
                     
-                    # Call original function first
+                    # Call original function first (pass all args to handle signature changes)
                     result = original_evaluate(prefix, forward_step_func, data_iterator, model, 
-                                             process_non_loss_data_func, config, **kwargs)
+                                             process_non_loss_data_func, config, *args, **kwargs)
                     
                     # Extract iteration for wandb logging
                     iteration = kwargs.get('iteration', 0)

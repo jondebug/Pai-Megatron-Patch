@@ -74,7 +74,7 @@ def build_wandb_sweep_config(config: Dict[str, Any]) -> Dict[str, Any]:
             '${interpreter}',
             '${program}',
             '--config', str(Path(__file__).parent / 'sweep_config.json'),
-            '${args_no_hyphens}'
+            '${args}'
         ]
     }
     
@@ -161,7 +161,7 @@ def generate_filtered_sweep_config(config: Dict[str, Any]) -> Dict[str, Any]:
             '${interpreter}',
             '${program}',
             '--config', 'sweep_config.json',
-            '${args_no_hyphens}'
+            '${args}'
         ]
     }
     
@@ -218,9 +218,9 @@ def main():
     parser = argparse.ArgumentParser(description='Generate and initialize wandb sweep')
     parser.add_argument('--config', type=str, default='sweep_config.json', 
                         help='Path to sweep config JSON')
-    parser.add_argument('--create', action='store_true',
+    parser.add_argument('--create', action='store_true', default=True,
                         help='Create the sweep on wandb (requires wandb login)')
-    parser.add_argument('--entity', type=str, default=None,
+    parser.add_argument('--entity', type=str, default="nvr-israel",
                         help='Wandb entity (team/username)')
     args = parser.parse_args()
     
@@ -239,12 +239,13 @@ def main():
     wandb_config, valid_combos, fixed_params = generate_filtered_sweep_config(config)
     
     # Update wandb config to use correct paths
+    # Use ${args} to get --key value format instead of ${args_no_hyphens} which gives key=value
     wandb_config['command'] = [
         '${env}',
         '${interpreter}',
         '${program}',
         '--sweep-dir', str(sweep_dir),
-        '${args_no_hyphens}'
+        '${args}'
     ]
     
     # Save artifacts to sweep directory

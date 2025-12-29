@@ -170,6 +170,23 @@ def main():
     sweep_params = combinations[args.run_index]
     run_name = build_run_name(sweep_params, args.run_index)
     
+    # Log sweep parameters to wandb (wandb agent already initialized a run)
+    try:
+        import wandb
+        if wandb.run is not None:
+            # Update the wandb run config with our sweep parameters
+            wandb.config.update({
+                'rl_algorithm': sweep_params.get('rl_algorithm'),
+                'rl_per_token_rewards': sweep_params.get('rl_per_token_rewards'),
+                'rl_ppo_entropy_coeff': sweep_params.get('rl_ppo_entropy_coeff'),
+                'rl_loss_coeff': sweep_params.get('rl_loss_coeff'),
+                'run_index': args.run_index,
+                'run_name': run_name,
+            })
+            print(f"Logged sweep params to wandb run: {wandb.run.name}")
+    except Exception as e:
+        print(f"Note: Could not log to wandb: {e}")
+    
     # Setup log file
     log_file = None
     if sweep_dir:
