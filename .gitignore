@@ -3,3 +3,9 @@
 .vscode
 *.DS_Store
 .ipynb_checkpoints
+
+# Sweep auto-generated files
+examples/qwen3/sweep_combinations.json
+examples/qwen3/sweep_logs/
+examples/qwen3/wandb_sweep.yaml
+examples/qwen3/wandb/
