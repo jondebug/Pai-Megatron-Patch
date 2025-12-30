@@ -124,6 +124,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('rl_ppo_entropy_coeff', '--rl-ppo-entropy-coeff'),
         ('rl_ppo_baseline_type', '--rl-ppo-baseline-type'),
         ('moe_aux_loss_coeff', '--moe-aux-loss-coeff'),
+        ('train_iters', '--train-iters'),
     ]
     
     for config_key, flag in value_args:

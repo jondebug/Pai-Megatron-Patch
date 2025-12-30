@@ -387,6 +387,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
                 
                 # Training parameters
                 training_params = {
+                    "train_iters": getattr(args, 'train_iters', None),
                     "weight_decay": getattr(args, 'weight_decay', None),
                     "adam_beta1": getattr(args, 'adam_beta1', None),
                     "adam_beta2": getattr(args, 'adam_beta2', None),

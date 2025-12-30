@@ -397,9 +397,26 @@ if [ $SFT = true ]; then
          --calculate-per-token-loss \
          --train-mode finetune"
 else
-    TRAIN_ITERS=$(( ${TRAIN_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LEN} ))
+    # Check if --train-iters is passed in EXTRA_ARGS to override calculation
+    TRAIN_ITERS_OVERRIDE=""
+    for arg in ${EXTRA_ARGS}; do
+        if [ "$prev_arg" = "--train-iters" ]; then
+            TRAIN_ITERS_OVERRIDE=$arg
+            break
+        fi
+        prev_arg=$arg
+    done
+    
+    if [ -n "$TRAIN_ITERS_OVERRIDE" ]; then
+        TRAIN_ITERS=$TRAIN_ITERS_OVERRIDE
+        echo "Using --train-iters override: ${TRAIN_ITERS}"
+        # Remove --train-iters from EXTRA_ARGS since we handle it explicitly
+        EXTRA_ARGS=$(echo "$EXTRA_ARGS" | sed 's/--train-iters [0-9]*//g')
+    else
+        TRAIN_ITERS=$(( ${TRAIN_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LEN} ))
+    fi
     LR_WARMUP_ITERS=$(( ${WARMUP_TOKENS}  / ${GLOBAL_BATCH_SIZE} / ${SEQ_LEN} ))
-    LR_DECAY_ITERS=$(( ${TRAIN_TOKENS} /  ${GLOBAL_BATCH_SIZE} / ${SEQ_LEN} ))
+    LR_DECAY_ITERS=$(( ${TRAIN_ITERS} ))
     PREFIX="pretrain-mcore-qwen3-moe-megatron-${MODEL_SIZE}-lr-${LR}-minlr-${MIN_LR}-bs-${BATCH_SIZE}-gbs-${GLOBAL_BATCH_SIZE}-seqlen-${SEQ_LEN}"
     sft_options=" \
         --train-mode pretrain"

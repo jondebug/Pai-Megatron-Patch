@@ -191,6 +191,12 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
                 loss_dict[f"{name}_min"] = min_loss_value
                 loss_dict[f"{name}_layer_0"] = layer_0_loss_value
         
+        # Compute num_tokens_on_critical_path: sum of max tokens per expert over all layers
+        # This represents the compute critical path (slowest expert per layer, summed)
+        if 'max_tokens_per_expert' in tracker and 'values' in tracker['max_tokens_per_expert']:
+            max_tokens_values = tracker['max_tokens_per_expert']['values'].float()
+            loss_dict['num_tokens_on_critical_path'] = max_tokens_values.sum()
+        
         # Clear the tracker for next iteration
         clear_aux_losses_tracker()
     
@@ -258,6 +264,12 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
                 loss_dict[f"{name}_max"] = max_loss_value
                 loss_dict[f"{name}_min"] = min_loss_value
                 loss_dict[f"{name}_layer_0"] = layer_0_loss_value
+        
+        # Compute num_tokens_on_critical_path: sum of max tokens per expert over all layers
+        # This represents the compute critical path (slowest expert per layer, summed)
+        if 'max_tokens_per_expert' in tracker and 'values' in tracker['max_tokens_per_expert']:
+            max_tokens_values = tracker['max_tokens_per_expert']['values'].float()
+            loss_dict['num_tokens_on_critical_path'] = max_tokens_values.sum()
         
         # Clear the tracker for next iteration
         clear_aux_losses_tracker()

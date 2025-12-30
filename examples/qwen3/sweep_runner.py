@@ -216,6 +216,7 @@ def build_command(config: Dict[str, Any]) -> List[str]:
         ('rl_loss_coeff', '--rl-loss-coeff'),
         ('rl_ppo_entropy_coeff', '--rl-ppo-entropy-coeff'),
         ('moe_aux_loss_coeff', '--moe-aux-loss-coeff'),
+        ('train_iters', '--train-iters'),
     ]
     
     for config_key, flag in value_args:

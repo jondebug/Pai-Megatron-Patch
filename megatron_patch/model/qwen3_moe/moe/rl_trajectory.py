@@ -221,7 +221,11 @@ class RouterTrajectoryTracker:
         # Store detached copies to avoid keeping gradients
         latent_token_representations = latent_token_representations.detach()
 
-        if self.use_entropy_reward:  
+        if self.use_entropy_reward:
+            # Note: entropy reward is always scalar - incompatible with per_token_rewards=True
+            if self.per_token_rewards:
+                raise ValueError("use_entropy_reward=True is incompatible with per_token_rewards=True. "
+                                "Entropy reward is computed over the entire batch, not per-token.")
             reward = self.compute_expert_load_entropy(routing_map)
         else:
             reward = self.focus_tokens_on_expert_0_reward(routing_map)
@@ -357,7 +361,8 @@ class RouterTrajectoryTracker:
     def _compute_reinforce_loss_scalar(self, trajectory_data: Dict, discount_factor: float = 0.9) -> torch.Tensor:
         """Compute REINFORCE loss with scalar rewards (original implementation)."""
         if len(trajectory_data) == 0:
-            return torch.tensor(0.0)
+            # Get device from first available tensor or default to cuda if available
+            return torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
             
         first_layer = next(iter(trajectory_data.values()))
         device = first_layer[0].device
@@ -402,7 +407,7 @@ class RouterTrajectoryTracker:
     def _compute_reinforce_loss_per_token(self, trajectory_data: Dict, discount_factor: float = 0.9) -> torch.Tensor:
         """Compute REINFORCE loss with per-token rewards."""
         if len(trajectory_data) == 0:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
             
         first_layer = next(iter(trajectory_data.values()))
         device = first_layer[0].device
@@ -494,7 +499,7 @@ class RouterTrajectoryTracker:
                                   value_coeff: float = 0.5) -> torch.Tensor:
         """Compute PPO loss with scalar rewards (original implementation)."""
         if len(trajectory_data) == 0:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
             
         first_layer = next(iter(trajectory_data.values()))
         device = first_layer[0].device
@@ -572,13 +577,14 @@ class RouterTrajectoryTracker:
             pg_obj2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantage
             policy_loss = -torch.min(pg_obj1, pg_obj2)
             
-            # Value function loss
+            # Value function loss (only meaningful for critic baseline)
             if self.baseline_type == "critic":
                 # Train critic to predict returns
                 value_pred = baseline_values[layer_num]
                 value_loss = 0.5 * torch.square(return_value - value_pred)
             else:
-                value_loss = 0.5 * torch.square(return_value - baseline_values[layer_num])
+                # Mean baseline has no learnable value function, set to 0
+                value_loss = torch.tensor(0.0, device=device)
             
             # Entropy bonus
             probs = torch.nn.functional.softmax(routing_logits, dim=-1)
@@ -594,6 +600,14 @@ class RouterTrajectoryTracker:
         
         num_layers = max(1, len(sorted_layers))
         total_loss = total_loss / num_layers
+        
+        # Update critic network if using critic baseline
+        if self.baseline_type == "critic":
+            if total_value_loss.requires_grad:
+                self.update_critic(total_value_loss / num_layers)
+            else:
+                wrap_print_rank_0(f"[RL WARNING] Critic baseline enabled but value_loss has no gradients! Critic not being trained.")
+                raise ValueError("Critic baseline enabled but value_loss has no gradients! Critic not being trained.")
         
         # Store component losses for logging
         self.last_loss_components = {
@@ -611,7 +625,7 @@ class RouterTrajectoryTracker:
                                      value_coeff: float = 0.5) -> torch.Tensor:
         """Compute PPO loss with per-token rewards."""
         if len(trajectory_data) == 0:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
             
         first_layer = next(iter(trajectory_data.values()))
         device = first_layer[0].device
@@ -690,9 +704,13 @@ class RouterTrajectoryTracker:
             pg_obj2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages
             per_token_policy_loss = -torch.min(pg_obj1, pg_obj2)
             
-            # Value function loss per token
+            # Value function loss per token (only meaningful for critic baseline)
             baseline_for_layer = layer_baselines[layer_num]
-            per_token_value_loss = 0.5 * torch.square(returns - baseline_for_layer)
+            if self.baseline_type == "critic":
+                per_token_value_loss = 0.5 * torch.square(returns - baseline_for_layer)
+            else:
+                # Mean baseline has no learnable value function, set to 0
+                per_token_value_loss = torch.zeros_like(returns)
             
             # Entropy bonus per token
             probs = torch.nn.functional.softmax(routing_logits, dim=-1)
@@ -715,6 +733,15 @@ class RouterTrajectoryTracker:
         
         # Normalize and store component losses for logging
         total_loss = total_loss / max(1, total_tokens)
+        
+        # Update critic network if using critic baseline
+        if self.baseline_type == "critic":
+            if total_value_loss.requires_grad:
+                self.update_critic(total_value_loss / max(1, total_tokens))
+            else:
+                wrap_print_rank_0(f"[RL WARNING] Critic baseline enabled but value_loss has no gradients! Critic not being trained.")
+                raise ValueError("Critic baseline enabled but value_loss has no gradients! Critic not being trained.")
+        
         self.last_loss_components = {
             'policy_loss': (total_policy_loss / max(1, total_tokens)).item(),
             'value_loss': (total_value_loss / max(1, total_tokens)).item(),
@@ -728,14 +755,18 @@ class RouterTrajectoryTracker:
 
 # Global trajectory tracker instance
 _global_trajectory_tracker = None
+_tracker_configured = False  # Track if we've successfully configured from args
 
 # singleton behavior
 def get_trajectory_tracker() -> RouterTrajectoryTracker:
     """Get the global trajectory tracker instance."""
-    global _global_trajectory_tracker
+    global _global_trajectory_tracker, _tracker_configured
     if _global_trajectory_tracker is None:
         _global_trajectory_tracker = RouterTrajectoryTracker()
-        # Configure from command line args if available
+    
+    # Always try to configure from args if not yet configured
+    # This handles the case where tracker is created before args are parsed
+    if not _tracker_configured:
         try:
             from megatron import get_args
             args = get_args()
@@ -744,8 +775,16 @@ def get_trajectory_tracker() -> RouterTrajectoryTracker:
             _global_trajectory_tracker.use_entropy_reward = getattr(args, 'rl_use_entropy_reward', False)
             _global_trajectory_tracker.baseline_type = getattr(args, 'rl_ppo_baseline_type', 'mean')
             _global_trajectory_tracker.critic_hidden_dims = getattr(args, 'rl_critic_hidden_dims', [256])
+            _global_trajectory_tracker.critic_lr = getattr(args, 'rl_critic_lr', 1e-3)
+            _tracker_configured = True
+            # Always print configuration for verification (not gated by debug_mode)
+            print(f"[RL CONFIG] Tracker configured: baseline_type={_global_trajectory_tracker.baseline_type}, "
+                  f"per_token_rewards={_global_trajectory_tracker.per_token_rewards}, "
+                  f"ppo_entropy_coeff={_global_trajectory_tracker.ppo_entropy_coeff}, "
+                  f"critic_hidden_dims={_global_trajectory_tracker.critic_hidden_dims}, "
+                  f"critic_lr={_global_trajectory_tracker.critic_lr}")
         except (ImportError, AssertionError):
-            # Args not available yet, use defaults
+            # Args not available yet, will retry on next call
             pass
     return _global_trajectory_tracker
 
