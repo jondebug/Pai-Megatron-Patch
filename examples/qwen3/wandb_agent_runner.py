@@ -40,6 +40,18 @@ def build_run_name(sweep_params: dict, run_index: int) -> str:
     if alg == 'ppo':
         ent = sweep_params.get('rl_ppo_entropy_coeff', 0)
         parts.append(f'ent{ent}')
+        
+        # Add baseline type info
+        baseline = sweep_params.get('rl_ppo_baseline_type', 'mean')
+        if baseline == 'critic':
+            dims = sweep_params.get('rl_critic_hidden_dims', [256])
+            if isinstance(dims, list):
+                dims_str = 'x'.join(str(d) for d in dims)
+            else:
+                dims_str = str(dims)
+            parts.append(f'critic{dims_str}')
+        else:
+            parts.append('mean')
     
     rlc = sweep_params.get('rl_loss_coeff', 0)
     parts.append(f'rlc{rlc}')
@@ -110,12 +122,20 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('rl_algorithm', '--rl-algorithm'),
         ('rl_loss_coeff', '--rl-loss-coeff'),
         ('rl_ppo_entropy_coeff', '--rl-ppo-entropy-coeff'),
+        ('rl_ppo_baseline_type', '--rl-ppo-baseline-type'),
         ('moe_aux_loss_coeff', '--moe-aux-loss-coeff'),
     ]
     
     for config_key, flag in value_args:
         if config_key in config and config[config_key] is not None:
             extra_args.extend([flag, str(config[config_key])])
+    
+    # List arguments (like rl_critic_hidden_dims)
+    if 'rl_critic_hidden_dims' in config and config['rl_critic_hidden_dims'] is not None:
+        dims = config['rl_critic_hidden_dims']
+        if isinstance(dims, list):
+            extra_args.append('--rl-critic-hidden-dims')
+            extra_args.extend([str(d) for d in dims])
     
     # Wandb tags
     if 'wandb_run_tags' in config and config['wandb_run_tags']:
@@ -179,6 +199,8 @@ def main():
                 'rl_algorithm': sweep_params.get('rl_algorithm'),
                 'rl_per_token_rewards': sweep_params.get('rl_per_token_rewards'),
                 'rl_ppo_entropy_coeff': sweep_params.get('rl_ppo_entropy_coeff'),
+                'rl_ppo_baseline_type': sweep_params.get('rl_ppo_baseline_type'),
+                'rl_critic_hidden_dims': sweep_params.get('rl_critic_hidden_dims'),
                 'rl_loss_coeff': sweep_params.get('rl_loss_coeff'),
                 'run_index': args.run_index,
                 'run_name': run_name,

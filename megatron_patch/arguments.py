@@ -529,6 +529,10 @@ def get_patch_args(parser):
                       help='Use per-token rewards instead of scalar rewards for RL training. effectively this means the state is a single token instead of a sequence of tokens not a batch')
     group.add_argument('--rl-ppo-entropy-coeff', type=float, default=0.01,
                       help='Entropy coefficient for PPO loss (default: 0.01)')
+    group.add_argument('--rl-ppo-baseline-type', type=str, default='mean', choices=['mean', 'critic'],
+                      help='Type of baseline for PPO advantage calculation: mean (simple average) or critic (learned value function)')
+    group.add_argument('--rl-critic-hidden-dims', type=int, nargs='+', default=[256],
+                      help='Hidden dimensions for critic network layers (default: 256). Examples: "256" for 1 layer, "256 64 32" for 3 layers')
     group.add_argument('--rl-use-entropy-reward', action='store_true', default=False,
                       help='Use entropy-based reward instead of expert-0 focusing reward. will be deprecated in the future')
     group.add_argument('--enable-wandb-logging', action='store_true', default=False,

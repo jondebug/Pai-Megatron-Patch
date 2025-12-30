@@ -290,6 +290,15 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     # Scale and add RL loss
     rl_loss = rl_loss * rl_loss_coeff
     loss_dict["rl_loss"] = rl_loss.detach()
+    
+    # Add component losses for detailed wandb logging (must be tensors for Megatron)
+    if hasattr(trajectory_tracker, 'last_loss_components'):
+        components = trajectory_tracker.last_loss_components
+        loss_dict["rl_policy_loss"] = torch.tensor(components.get('policy_loss', 0.0))
+        loss_dict["rl_value_loss"] = torch.tensor(components.get('value_loss', 0.0))
+        loss_dict["rl_entropy_bonus"] = torch.tensor(components.get('entropy_bonus', 0.0))
+        loss_dict["rl_mean_advantage"] = torch.tensor(components.get('mean_advantage', 0.0))
+        loss_dict["rl_mean_reward"] = torch.tensor(components.get('mean_reward', 0.0))
 
     # Optional lightweight debug: report RL vs LM magnitudes on main rank
     try:

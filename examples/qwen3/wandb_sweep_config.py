@@ -135,7 +135,12 @@ def generate_filtered_sweep_config(config: Dict[str, Any]) -> Dict[str, Any]:
             continue
         
         # Create signature for deduplication
-        sig_cfg = {k: v for k, v in cfg.items() if k not in collapse_keys}
+        
+        def make_hashable(v):
+            if isinstance(v, list):
+                return tuple(make_hashable(x) for x in v)
+            return v
+        sig_cfg = {k: make_hashable(v) for k, v in cfg.items() if k not in collapse_keys}
         sig = tuple(sorted(sig_cfg.items()))
         
         if sig not in seen_signatures:

@@ -365,6 +365,10 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
                 if args.use_rl_loss:
                     primary_config["rl_algorithm"] = args.rl_algorithm
                     primary_config["rl_loss_coeff"] = args.rl_loss_coeff
+                    primary_config["rl_per_token_rewards"] = getattr(args, 'rl_per_token_rewards', False)
+                    primary_config["rl_ppo_entropy_coeff"] = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
+                    primary_config["rl_ppo_baseline_type"] = getattr(args, 'rl_ppo_baseline_type', 'mean')
+                    primary_config["rl_critic_hidden_dims"] = getattr(args, 'rl_critic_hidden_dims', [256])
                 
                 # Secondary/advanced hyperparameters - only include non-None values
                 secondary_config = {}

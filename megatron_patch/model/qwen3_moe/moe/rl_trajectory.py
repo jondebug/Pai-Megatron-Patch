@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import torch
+import torch.nn as nn
 from typing import Dict, Optional, Callable
 from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
 # from megatron.training.utils import print_rank_0
@@ -10,6 +11,66 @@ debug_mode = False
 def wrap_print_rank_0(str):
     if debug_mode:
         print(f"{str}")
+
+
+class CriticNetwork(nn.Module):
+    """MLP critic network for value function estimation.
+    
+    Takes latent token representations and outputs a scalar value estimate.
+    Supports configurable depth via hidden_dims list.
+    """
+    
+    def __init__(self, input_dim: int, hidden_dims: list = None):
+        """Initialize critic network.
+        
+        Args:
+            input_dim: Dimension of input features
+            hidden_dims: List of hidden layer dimensions. 
+                         E.g., [256] for 1 layer, [256, 64, 32] for 3 layers.
+                         Default: [256]
+        """
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [256]
+        
+        # Build layers dynamically
+        layers = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            prev_dim = hidden_dim
+        # Final output layer
+        layers.append(nn.Linear(prev_dim, 1))
+        
+        self.network = nn.Sequential(*layers)
+        self.hidden_dims = hidden_dims
+        
+        # Initialize with small weights for stable training
+        for m in self.network:
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=0.01)
+                nn.init.zeros_(m.bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+        
+        Args:
+            x: Latent representations of shape [seq_length, batch_size, hidden_dim]
+               or [num_tokens, hidden_dim]
+        
+        Returns:
+            Value estimates of shape [seq_length, batch_size] or [num_tokens]
+        """
+        original_shape = x.shape[:-1]
+        # Flatten to [num_tokens, hidden_dim]
+        x_flat = x.view(-1, x.shape[-1])
+        values = self.network(x_flat).squeeze(-1)
+        # Reshape back
+        return values.view(*original_shape)
+    
+    def __repr__(self):
+        return f"CriticNetwork(hidden_dims={self.hidden_dims})"
 
 
 class RouterRLLossScaler(torch.autograd.Function):
@@ -58,6 +119,20 @@ class RouterTrajectoryTracker:
         self.per_token_rewards = True
         self.ppo_entropy_coeff = 0.01
         self.use_entropy_reward = False
+        self.baseline_type = "mean"  # "mean" or "critic"
+        self.critic_hidden_dims = [256]  # List of hidden layer dimensions
+        self.critic_lr = 1e-3  # Critic learning rate
+        self._critic = None  # Lazy initialization
+        self._critic_optimizer = None
+        self._pending_critic_update = False  # Flag to trigger critic update
+        # Store last computed loss components for logging
+        self.last_loss_components = {
+            'policy_loss': 0.0,
+            'value_loss': 0.0,
+            'entropy_bonus': 0.0,
+            'mean_advantage': 0.0,
+            'mean_reward': 0.0,
+        }
 
     
     def reset(self):
@@ -65,6 +140,75 @@ class RouterTrajectoryTracker:
         # Store old trajectory for PPO importance sampling
         self.old_layer_decisions = getattr(self, 'layer_decisions', {}).copy()
         self.layer_decisions = {}  # layer_number -> (latent_token_representations, routing_map, probs, entropy_reward)
+    
+    def get_critic(self, input_dim: int, device: torch.device) -> CriticNetwork:
+        """Get or create the critic network.
+        
+        Args:
+            input_dim: Input dimension (hidden size of latent representations)
+            device: Device to place the critic on
+            
+        Returns:
+            CriticNetwork instance
+        """
+        if self._critic is None:
+            self._critic = CriticNetwork(input_dim, self.critic_hidden_dims).to(device)
+            self._critic_optimizer = torch.optim.Adam(self._critic.parameters(), lr=self.critic_lr)
+            wrap_print_rank_0(f"[RL DEBUG] Created critic network: {self._critic}, lr={self.critic_lr}")
+        return self._critic
+    
+    def update_critic(self, value_loss: torch.Tensor):
+        """Update critic network weights.
+        
+        Should be called after backward pass to update critic separately from main model.
+        
+        Args:
+            value_loss: The value function loss tensor (must have gradients)
+        """
+        if self._critic is None or self._critic_optimizer is None:
+            return
+        
+        # Backward pass for critic (value loss should already be part of total loss,
+        # but we need to ensure critic gradients are computed)
+        if value_loss.requires_grad:
+            self._critic_optimizer.zero_grad()
+            value_loss.backward(retain_graph=True)
+            self._critic_optimizer.step()
+            wrap_print_rank_0(f"[RL DEBUG] Critic updated, value_loss={value_loss.item():.6f}")
+    
+    def get_critic_state_dict(self) -> dict:
+        """Get critic state for checkpointing."""
+        if self._critic is None:
+            return {}
+        return {
+            'critic_state_dict': self._critic.state_dict(),
+            'critic_optimizer_state_dict': self._critic_optimizer.state_dict() if self._critic_optimizer else None,
+        }
+    
+    def load_critic_state_dict(self, state_dict: dict, device: torch.device):
+        """Load critic state from checkpoint."""
+        if 'critic_state_dict' not in state_dict:
+            return
+        # Ensure critic exists (need input_dim, so we defer if not created yet)
+        if self._critic is not None:
+            self._critic.load_state_dict(state_dict['critic_state_dict'])
+            if self._critic_optimizer and state_dict.get('critic_optimizer_state_dict'):
+                self._critic_optimizer.load_state_dict(state_dict['critic_optimizer_state_dict'])
+            wrap_print_rank_0(f"[RL DEBUG] Loaded critic state from checkpoint")
+    
+    def compute_critic_baseline(self, latent_representations: torch.Tensor) -> torch.Tensor:
+        """Compute baseline values using the critic network.
+        
+        Args:
+            latent_representations: Tensor of shape [seq_length, batch_size, hidden_dim]
+            
+        Returns:
+            Value estimates of shape [seq_length, batch_size]
+        """
+        device = latent_representations.device
+        input_dim = latent_representations.shape[-1]
+        critic = self.get_critic(input_dim, device)
+        return critic(latent_representations)
         
     def add_layer_decision(self, layer_num: int, latent_token_representations: torch.Tensor, routing_map: torch.Tensor, routing_logits: torch.Tensor):
         """Add routing decision from a MoE layer.
@@ -370,16 +514,32 @@ class RouterTrajectoryTracker:
             reward_to_go = layer_rewards[layer_num] + discount_factor * reward_to_go
             returns[layer_num] = reward_to_go
         
-        # Simple baseline
-        all_returns = torch.stack(list(returns.values()))
-        baseline = all_returns.mean()
+        # Compute baseline based on baseline_type
+        if self.baseline_type == "critic":
+            # Use critic network: average value across all layer representations
+            critic_values = {}
+            for layer_num in sorted_layers:
+                latent_repr, _, _, _ = trajectory_data[layer_num]
+                # For scalar mode, average the critic output across all tokens
+                critic_values[layer_num] = self.compute_critic_baseline(latent_repr).mean()
+            baseline_values = critic_values
+        else:
+            # Use simple mean baseline (original behavior)
+            all_returns = torch.stack(list(returns.values()))
+            mean_baseline = all_returns.mean()
+            baseline_values = {ln: mean_baseline for ln in sorted_layers}
         
         # Calculate advantages
         advantages = {}
         for layer_num in sorted_layers:
-            advantages[layer_num] = (returns[layer_num] - baseline).detach()
+            advantages[layer_num] = (returns[layer_num] - baseline_values[layer_num]).detach()
         
         total_loss = torch.tensor(0.0, device=device)
+        total_policy_loss = torch.tensor(0.0, device=device)
+        total_value_loss = torch.tensor(0.0, device=device)
+        total_entropy = torch.tensor(0.0, device=device)
+        total_advantage = torch.tensor(0.0, device=device)
+        total_reward = torch.tensor(0.0, device=device)
         entropy_coeff = self.ppo_entropy_coeff
         
         for layer_num in sorted_layers:
@@ -413,7 +573,12 @@ class RouterTrajectoryTracker:
             policy_loss = -torch.min(pg_obj1, pg_obj2)
             
             # Value function loss
-            value_loss = 0.5 * torch.square(return_value - baseline)
+            if self.baseline_type == "critic":
+                # Train critic to predict returns
+                value_pred = baseline_values[layer_num]
+                value_loss = 0.5 * torch.square(return_value - value_pred)
+            else:
+                value_loss = 0.5 * torch.square(return_value - baseline_values[layer_num])
             
             # Entropy bonus
             probs = torch.nn.functional.softmax(routing_logits, dim=-1)
@@ -421,9 +586,24 @@ class RouterTrajectoryTracker:
             
             layer_loss = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
             total_loss += layer_loss
-            
-        total_loss = total_loss / max(1, len(sorted_layers))
-        wrap_print_rank_0(f"PPO (scalar) DEBUG: total_loss={total_loss.item():.6f}")
+            total_policy_loss += policy_loss
+            total_value_loss += value_loss
+            total_entropy += entropy
+            total_advantage += advantage
+            total_reward += reward if isinstance(reward, torch.Tensor) else torch.tensor(reward, device=device)
+        
+        num_layers = max(1, len(sorted_layers))
+        total_loss = total_loss / num_layers
+        
+        # Store component losses for logging
+        self.last_loss_components = {
+            'policy_loss': (total_policy_loss / num_layers).item(),
+            'value_loss': (total_value_loss / num_layers).item(),
+            'entropy_bonus': (total_entropy / num_layers).item(),
+            'mean_advantage': (total_advantage / num_layers).item(),
+            'mean_reward': (total_reward / num_layers).item() if isinstance(total_reward, torch.Tensor) else total_reward / num_layers,
+        }
+        wrap_print_rank_0(f"PPO (scalar, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}")
         return total_loss
     
     def _compute_ppo_loss_per_token(self, trajectory_data: Dict, old_trajectory_data: Dict = None, 
@@ -454,16 +634,31 @@ class RouterTrajectoryTracker:
             reward_to_go = layer_rewards[layer_num] + discount_factor * reward_to_go
             layer_returns[layer_num] = reward_to_go.clone()
         
-        # Compute per-token baseline
-        all_returns = torch.cat([layer_returns[ln].flatten() for ln in sorted_layers])
-        baseline = all_returns.mean()
+        # Compute per-token baseline based on baseline_type
+        if self.baseline_type == "critic":
+            # Use critic network for per-token value estimates
+            layer_baselines = {}
+            for layer_num in sorted_layers:
+                latent_repr, _, _, _ = trajectory_data[layer_num]
+                # Critic outputs per-token values: [seq_length, batch_size]
+                layer_baselines[layer_num] = self.compute_critic_baseline(latent_repr)
+        else:
+            # Use simple mean baseline (original behavior)
+            all_returns = torch.cat([layer_returns[ln].flatten() for ln in sorted_layers])
+            mean_baseline = all_returns.mean()
+            layer_baselines = {ln: mean_baseline for ln in sorted_layers}
         
         # Compute per-token advantages
         layer_advantages = {}
         for layer_num in sorted_layers:
-            layer_advantages[layer_num] = (layer_returns[layer_num] - baseline).detach()
+            layer_advantages[layer_num] = (layer_returns[layer_num] - layer_baselines[layer_num]).detach()
         
         total_loss = torch.tensor(0.0, device=device)
+        total_policy_loss = torch.tensor(0.0, device=device)
+        total_value_loss = torch.tensor(0.0, device=device)
+        total_entropy = torch.tensor(0.0, device=device)
+        total_advantage = torch.tensor(0.0, device=device)
+        total_reward = torch.tensor(0.0, device=device)
         total_tokens = 0
         entropy_coeff = self.ppo_entropy_coeff
         
@@ -496,7 +691,8 @@ class RouterTrajectoryTracker:
             per_token_policy_loss = -torch.min(pg_obj1, pg_obj2)
             
             # Value function loss per token
-            per_token_value_loss = 0.5 * torch.square(returns - baseline)
+            baseline_for_layer = layer_baselines[layer_num]
+            per_token_value_loss = 0.5 * torch.square(returns - baseline_for_layer)
             
             # Entropy bonus per token
             probs = torch.nn.functional.softmax(routing_logits, dim=-1)
@@ -507,13 +703,26 @@ class RouterTrajectoryTracker:
             
             layer_loss = per_token_loss.sum()
             total_loss += layer_loss
+            total_policy_loss += per_token_policy_loss.sum()
+            total_value_loss += per_token_value_loss.sum()
+            total_entropy += per_token_entropy.sum()
+            total_advantage += advantages.sum()
+            total_reward += reward.sum()
             total_tokens += per_token_loss.numel()
             
             if layer_num == sorted_layers[0]:
-                wrap_print_rank_0(f"PPO (per-token) Layer {layer_num}: advantages_mean={advantages.mean().item():.4f}, ratio_mean={ratio.mean().item():.4f}")
+                wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) Layer {layer_num}: advantages_mean={advantages.mean().item():.4f}, ratio_mean={ratio.mean().item():.4f}")
         
+        # Normalize and store component losses for logging
         total_loss = total_loss / max(1, total_tokens)
-        wrap_print_rank_0(f"PPO (per-token) DEBUG: total_loss={total_loss.item():.6f}, total_tokens={total_tokens}")
+        self.last_loss_components = {
+            'policy_loss': (total_policy_loss / max(1, total_tokens)).item(),
+            'value_loss': (total_value_loss / max(1, total_tokens)).item(),
+            'entropy_bonus': (total_entropy / max(1, total_tokens)).item(),
+            'mean_advantage': (total_advantage / max(1, total_tokens)).item(),
+            'mean_reward': (total_reward / max(1, total_tokens)).item(),
+        }
+        wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}, total_tokens={total_tokens}")
         return total_loss
 
 
@@ -533,6 +742,8 @@ def get_trajectory_tracker() -> RouterTrajectoryTracker:
             _global_trajectory_tracker.per_token_rewards = getattr(args, 'rl_per_token_rewards', True)
             _global_trajectory_tracker.ppo_entropy_coeff = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
             _global_trajectory_tracker.use_entropy_reward = getattr(args, 'rl_use_entropy_reward', False)
+            _global_trajectory_tracker.baseline_type = getattr(args, 'rl_ppo_baseline_type', 'mean')
+            _global_trajectory_tracker.critic_hidden_dims = getattr(args, 'rl_critic_hidden_dims', [256])
         except (ImportError, AssertionError):
             # Args not available yet, use defaults
             pass
