@@ -9,3 +9,4 @@ examples/qwen3/sweep_combinations.json
 examples/qwen3/sweep_logs/
 examples/qwen3/wandb_sweep.yaml
 examples/qwen3/wandb/
+examples/qwen3/wandb_logs/

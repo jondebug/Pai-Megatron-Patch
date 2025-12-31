@@ -63,11 +63,14 @@ class CriticNetwork(nn.Module):
             Value estimates of shape [seq_length, batch_size] or [num_tokens]
         """
         original_shape = x.shape[:-1]
+        original_dtype = x.dtype
         # Flatten to [num_tokens, hidden_dim]
         x_flat = x.view(-1, x.shape[-1])
+        # Cast to float32 for critic computation (critic weights are float32)
+        x_flat = x_flat.float()
         values = self.network(x_flat).squeeze(-1)
-        # Reshape back
-        return values.view(*original_shape)
+        # Cast back to original dtype and reshape
+        return values.to(original_dtype).view(*original_shape)
     
     def __repr__(self):
         return f"CriticNetwork(hidden_dims={self.hidden_dims})"
@@ -521,23 +524,39 @@ class RouterTrajectoryTracker:
         
         # Compute baseline based on baseline_type
         if self.baseline_type == "critic":
-            # Use critic network: average value across all layer representations
-            critic_values = {}
+            # Compute critic values and train critic (decoupled from main loss)
+            baseline_values = {}
+            critic_loss = torch.tensor(0.0, device=device)
             for layer_num in sorted_layers:
                 latent_repr, _, _, _ = trajectory_data[layer_num]
-                # For scalar mode, average the critic output across all tokens
-                critic_values[layer_num] = self.compute_critic_baseline(latent_repr).mean()
-            baseline_values = critic_values
+                value = self.compute_critic_baseline(latent_repr).mean()
+                target = returns[layer_num].mean().detach() if returns[layer_num].numel() > 1 else returns[layer_num].detach()
+                critic_loss = critic_loss + 0.5 * torch.square(target - value)
+                baseline_values[layer_num] = value.detach()  # Detach for use in advantages
+            critic_loss = critic_loss / len(sorted_layers)
+            
+            if self._critic_optimizer is not None:
+                self._critic_optimizer.zero_grad()
+                critic_loss.backward()
+                self._critic_optimizer.step()
+            self._last_critic_loss = critic_loss.item()
         else:
-            # Use simple mean baseline (original behavior)
+            # Simple mean baseline
             all_returns = torch.stack(list(returns.values()))
-            mean_baseline = all_returns.mean()
-            baseline_values = {ln: mean_baseline for ln in sorted_layers}
+            baseline_values = {ln: all_returns.mean() for ln in sorted_layers}
+            self._last_critic_loss = 0.0
         
-        # Calculate advantages
+        # Calculate advantages - ensure scalars for scalar loss mode
         advantages = {}
         for layer_num in sorted_layers:
-            advantages[layer_num] = (returns[layer_num] - baseline_values[layer_num]).detach()
+            ret = returns[layer_num]
+            baseline = baseline_values[layer_num]
+            # Ensure both are scalars
+            if ret.numel() > 1:
+                ret = ret.mean()
+            if baseline.numel() > 1:
+                baseline = baseline.mean()
+            advantages[layer_num] = (ret - baseline).detach()
         
         total_loss = torch.tensor(0.0, device=device)
         total_policy_loss = torch.tensor(0.0, device=device)
@@ -577,13 +596,17 @@ class RouterTrajectoryTracker:
             pg_obj2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantage
             policy_loss = -torch.min(pg_obj1, pg_obj2)
             
-            # Value function loss (only meaningful for critic baseline)
+            # Value function loss for logging (critic already trained above)
             if self.baseline_type == "critic":
-                # Train critic to predict returns
                 value_pred = baseline_values[layer_num]
-                value_loss = 0.5 * torch.square(return_value - value_pred)
+                if return_value.numel() > 1:
+                    return_value_scalar = return_value.mean()
+                else:
+                    return_value_scalar = return_value
+                # Just for logging - critic already trained, so detach everything
+                value_loss = 0.5 * torch.square(return_value_scalar.detach() - value_pred.detach())
             else:
-                # Mean baseline has no learnable value function, set to 0
+                # Mean baseline has no learnable value function
                 value_loss = torch.tensor(0.0, device=device)
             
             # Entropy bonus
@@ -601,23 +624,17 @@ class RouterTrajectoryTracker:
         num_layers = max(1, len(sorted_layers))
         total_loss = total_loss / num_layers
         
-        # Update critic network if using critic baseline
-        if self.baseline_type == "critic":
-            if total_value_loss.requires_grad:
-                self.update_critic(total_value_loss / num_layers)
-            else:
-                wrap_print_rank_0(f"[RL WARNING] Critic baseline enabled but value_loss has no gradients! Critic not being trained.")
-                raise ValueError("Critic baseline enabled but value_loss has no gradients! Critic not being trained.")
-        
         # Store component losses for logging
+        # Use actual critic loss if critic was trained, otherwise use computed value_loss
+        logged_value_loss = self._last_critic_loss if hasattr(self, '_last_critic_loss') else (total_value_loss / num_layers).item()
         self.last_loss_components = {
             'policy_loss': (total_policy_loss / num_layers).item(),
-            'value_loss': (total_value_loss / num_layers).item(),
+            'value_loss': logged_value_loss,
             'entropy_bonus': (total_entropy / num_layers).item(),
             'mean_advantage': (total_advantage / num_layers).item(),
             'mean_reward': (total_reward / num_layers).item() if isinstance(total_reward, torch.Tensor) else total_reward / num_layers,
         }
-        wrap_print_rank_0(f"PPO (scalar, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}")
+        wrap_print_rank_0(f"PPO (scalar, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}, critic_loss={logged_value_loss:.6f}")
         return total_loss
     
     def _compute_ppo_loss_per_token(self, trajectory_data: Dict, old_trajectory_data: Dict = None, 
@@ -650,17 +667,29 @@ class RouterTrajectoryTracker:
         
         # Compute per-token baseline based on baseline_type
         if self.baseline_type == "critic":
-            # Use critic network for per-token value estimates
+            # Compute critic values and train critic (decoupled from main loss)
             layer_baselines = {}
+            critic_loss = torch.tensor(0.0, device=device)
+            total_critic_tokens = 0
             for layer_num in sorted_layers:
                 latent_repr, _, _, _ = trajectory_data[layer_num]
-                # Critic outputs per-token values: [seq_length, batch_size]
-                layer_baselines[layer_num] = self.compute_critic_baseline(latent_repr)
+                value = self.compute_critic_baseline(latent_repr)
+                target = layer_returns[layer_num].detach()
+                critic_loss = critic_loss + 0.5 * torch.square(target - value).sum()
+                total_critic_tokens += value.numel()
+                layer_baselines[layer_num] = value.detach()
+            critic_loss = critic_loss / max(1, total_critic_tokens)
+            
+            if self._critic_optimizer is not None:
+                self._critic_optimizer.zero_grad()
+                critic_loss.backward()
+                self._critic_optimizer.step()
+            self._last_critic_loss = critic_loss.item()
         else:
-            # Use simple mean baseline (original behavior)
+            # Simple mean baseline
             all_returns = torch.cat([layer_returns[ln].flatten() for ln in sorted_layers])
-            mean_baseline = all_returns.mean()
-            layer_baselines = {ln: mean_baseline for ln in sorted_layers}
+            layer_baselines = {ln: all_returns.mean() for ln in sorted_layers}
+            self._last_critic_loss = 0.0
         
         # Compute per-token advantages
         layer_advantages = {}
@@ -704,12 +733,13 @@ class RouterTrajectoryTracker:
             pg_obj2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages
             per_token_policy_loss = -torch.min(pg_obj1, pg_obj2)
             
-            # Value function loss per token (only meaningful for critic baseline)
+            # Value function loss per token for logging (critic already trained above)
             baseline_for_layer = layer_baselines[layer_num]
             if self.baseline_type == "critic":
-                per_token_value_loss = 0.5 * torch.square(returns - baseline_for_layer)
+                # Just for logging - critic already trained, so detach everything
+                per_token_value_loss = 0.5 * torch.square(returns.detach() - baseline_for_layer.detach())
             else:
-                # Mean baseline has no learnable value function, set to 0
+                # Mean baseline has no learnable value function
                 per_token_value_loss = torch.zeros_like(returns)
             
             # Entropy bonus per token
@@ -731,25 +761,19 @@ class RouterTrajectoryTracker:
             if layer_num == sorted_layers[0]:
                 wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) Layer {layer_num}: advantages_mean={advantages.mean().item():.4f}, ratio_mean={ratio.mean().item():.4f}")
         
-        # Normalize and store component losses for logging
+        # Normalize
         total_loss = total_loss / max(1, total_tokens)
         
-        # Update critic network if using critic baseline
-        if self.baseline_type == "critic":
-            if total_value_loss.requires_grad:
-                self.update_critic(total_value_loss / max(1, total_tokens))
-            else:
-                wrap_print_rank_0(f"[RL WARNING] Critic baseline enabled but value_loss has no gradients! Critic not being trained.")
-                raise ValueError("Critic baseline enabled but value_loss has no gradients! Critic not being trained.")
-        
+        # Use actual critic loss if critic was trained, otherwise use computed value_loss
+        logged_value_loss = self._last_critic_loss if hasattr(self, '_last_critic_loss') else (total_value_loss / max(1, total_tokens)).item()
         self.last_loss_components = {
             'policy_loss': (total_policy_loss / max(1, total_tokens)).item(),
-            'value_loss': (total_value_loss / max(1, total_tokens)).item(),
+            'value_loss': logged_value_loss,
             'entropy_bonus': (total_entropy / max(1, total_tokens)).item(),
             'mean_advantage': (total_advantage / max(1, total_tokens)).item(),
             'mean_reward': (total_reward / max(1, total_tokens)).item(),
         }
-        wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}, total_tokens={total_tokens}")
+        wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}, critic_loss={logged_value_loss:.6f}, total_tokens={total_tokens}")
         return total_loss
 
 
@@ -778,14 +802,21 @@ def get_trajectory_tracker() -> RouterTrajectoryTracker:
             _global_trajectory_tracker.critic_lr = getattr(args, 'rl_critic_lr', 1e-3)
             _tracker_configured = True
             # Always print configuration for verification (not gated by debug_mode)
+            import sys
             print(f"[RL CONFIG] Tracker configured: baseline_type={_global_trajectory_tracker.baseline_type}, "
                   f"per_token_rewards={_global_trajectory_tracker.per_token_rewards}, "
                   f"ppo_entropy_coeff={_global_trajectory_tracker.ppo_entropy_coeff}, "
                   f"critic_hidden_dims={_global_trajectory_tracker.critic_hidden_dims}, "
-                  f"critic_lr={_global_trajectory_tracker.critic_lr}")
-        except (ImportError, AssertionError):
+                  f"critic_lr={_global_trajectory_tracker.critic_lr}", flush=True)
+            sys.stdout.flush()
+        except (ImportError, AssertionError) as e:
             # Args not available yet, will retry on next call
             pass
+        except Exception as e:
+            # Catch any other exceptions and log them
+            import sys
+            print(f"[RL CONFIG ERROR] Failed to configure tracker: {type(e).__name__}: {e}", flush=True)
+            sys.stdout.flush()
     return _global_trajectory_tracker
 
 

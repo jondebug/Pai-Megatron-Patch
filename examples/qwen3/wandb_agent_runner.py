@@ -25,26 +25,32 @@ def load_combinations(combos_path: str):
     return data['combinations'], data['fixed_params'], data.get('sweep_dir', None)
 
 
-def build_run_name(sweep_params: dict, run_index: int) -> str:
+def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None) -> str:
     """Build a descriptive run name."""
+    # Merge fixed and sweep params (sweep overrides fixed)
+    all_params = {}
+    if fixed_params:
+        all_params.update(fixed_params)
+    all_params.update(sweep_params)
+    
     parts = []
     
-    alg = sweep_params.get('rl_algorithm', 'unknown')
+    alg = all_params.get('rl_algorithm', 'unknown').lower()
     parts.append(alg.upper())
     
-    if sweep_params.get('rl_per_token_rewards', False):
+    if all_params.get('rl_per_token_rewards', False):
         parts.append('token')
     else:
         parts.append('batch')
     
     if alg == 'ppo':
-        ent = sweep_params.get('rl_ppo_entropy_coeff', 0)
+        ent = all_params.get('rl_ppo_entropy_coeff', 0)
         parts.append(f'ent{ent}')
         
         # Add baseline type info
-        baseline = sweep_params.get('rl_ppo_baseline_type', 'mean')
+        baseline = all_params.get('rl_ppo_baseline_type', 'mean')
         if baseline == 'critic':
-            dims = sweep_params.get('rl_critic_hidden_dims', [256])
+            dims = all_params.get('rl_critic_hidden_dims', [256])
             if isinstance(dims, list):
                 dims_str = 'x'.join(str(d) for d in dims)
             else:
@@ -53,7 +59,7 @@ def build_run_name(sweep_params: dict, run_index: int) -> str:
         else:
             parts.append('mean')
     
-    rlc = sweep_params.get('rl_loss_coeff', 0)
+    rlc = all_params.get('rl_loss_coeff', 0)
     parts.append(f'rlc{rlc}')
     
     parts.append(f'r{run_index:02d}')
@@ -189,20 +195,22 @@ def main():
         return 1
     
     sweep_params = combinations[args.run_index]
-    run_name = build_run_name(sweep_params, args.run_index)
+    run_name = build_run_name(sweep_params, args.run_index, fixed_params)
     
     # Log sweep parameters to wandb (wandb agent already initialized a run)
     try:
         import wandb
         if wandb.run is not None:
             # Update the wandb run config with our sweep parameters
+            # Merge fixed and sweep params for logging
+            all_params = {**fixed_params, **sweep_params}
             wandb.config.update({
-                'rl_algorithm': sweep_params.get('rl_algorithm'),
-                'rl_per_token_rewards': sweep_params.get('rl_per_token_rewards'),
-                'rl_ppo_entropy_coeff': sweep_params.get('rl_ppo_entropy_coeff'),
-                'rl_ppo_baseline_type': sweep_params.get('rl_ppo_baseline_type'),
-                'rl_critic_hidden_dims': sweep_params.get('rl_critic_hidden_dims'),
-                'rl_loss_coeff': sweep_params.get('rl_loss_coeff'),
+                'rl_algorithm': all_params.get('rl_algorithm'),
+                'rl_per_token_rewards': all_params.get('rl_per_token_rewards'),
+                'rl_ppo_entropy_coeff': all_params.get('rl_ppo_entropy_coeff'),
+                'rl_ppo_baseline_type': all_params.get('rl_ppo_baseline_type'),
+                'rl_critic_hidden_dims': all_params.get('rl_critic_hidden_dims'),
+                'rl_loss_coeff': all_params.get('rl_loss_coeff'),
                 'run_index': args.run_index,
                 'run_name': run_name,
             })
@@ -217,27 +225,46 @@ def main():
         logs_dir.mkdir(parents=True, exist_ok=True)
         log_file = logs_dir / f"{run_name}.log"
     
+    cmd = build_command(fixed_params, sweep_params, run_name)
+    full_command = ' '.join(cmd)
+    
     print("=" * 60)
     print(f"WANDB SWEEP AGENT - Run {args.run_index}")
     print("=" * 60)
     print(f"Run name: {run_name}")
     print(f"Sweep params: {sweep_params}")
+    print(f"Fixed params: {fixed_params}")
     if sweep_dir:
         print(f"Sweep dir: {sweep_dir}")
         print(f"Log file: {log_file}")
     print("-" * 60)
-    
-    cmd = build_command(fixed_params, sweep_params, run_name)
-    print(f"Command: {' '.join(cmd[:5])} ... [truncated]")
+    print(f"FULL COMMAND:")
+    print(full_command)
     print("=" * 60)
+    
+    # Log full command to wandb
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb.config.update({
+                'full_command': full_command,
+            }, allow_val_change=True)
+            # Also log as a summary for easy access
+            wandb.run.summary['command'] = full_command
+    except Exception as e:
+        print(f"Note: Could not log command to wandb: {e}")
     
     # Run the training with logging
     if log_file:
         with open(log_file, 'w') as f:
             f.write(f"Run: {run_name}\n")
             f.write(f"Started: {datetime.now().isoformat()}\n")
-            f.write(f"Sweep params: {json.dumps(sweep_params, indent=2)}\n")
-            f.write(f"Command: {' '.join(cmd)}\n")
+            f.write(f"Run index: {args.run_index}\n")
+            f.write(f"\nSweep params:\n{json.dumps(sweep_params, indent=2)}\n")
+            f.write(f"\nFixed params:\n{json.dumps(fixed_params, indent=2)}\n")
+            f.write(f"\n{'=' * 60}\n")
+            f.write(f"FULL COMMAND (copy-paste to rerun):\n")
+            f.write(f"{full_command}\n")
             f.write("=" * 60 + "\n\n")
         
         # Run with output to both console and log file (tee-like behavior)

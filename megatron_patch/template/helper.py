@@ -281,6 +281,19 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     )
 
     trajectory_tracker = get_trajectory_tracker()
+    
+    # Force configuration from args if baseline_type is still default
+    # This ensures tracker is properly configured even if get_trajectory_tracker silently failed earlier
+    if trajectory_tracker.baseline_type == "mean" and hasattr(args, 'rl_ppo_baseline_type'):
+        if args.rl_ppo_baseline_type != "mean":
+            trajectory_tracker.baseline_type = args.rl_ppo_baseline_type
+            trajectory_tracker.per_token_rewards = getattr(args, 'rl_per_token_rewards', True)
+            trajectory_tracker.ppo_entropy_coeff = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
+            trajectory_tracker.critic_hidden_dims = getattr(args, 'rl_critic_hidden_dims', [256])
+            trajectory_tracker.critic_lr = getattr(args, 'rl_critic_lr', 1e-3)
+            print(f"[RL CONFIG FORCED] baseline_type={trajectory_tracker.baseline_type}, "
+                  f"critic_hidden_dims={trajectory_tracker.critic_hidden_dims}", flush=True)
+    
     rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
     rl_algorithm = getattr(args, 'rl_algorithm', 'reinforce').lower()
     
