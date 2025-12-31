@@ -619,7 +619,11 @@ class RouterTrajectoryTracker:
             total_value_loss += value_loss
             total_entropy += entropy
             total_advantage += advantage
-            total_reward += reward if isinstance(reward, torch.Tensor) else torch.tensor(reward, device=device)
+            # Reduce reward to scalar if needed (for scalar mode)
+            if isinstance(reward, torch.Tensor):
+                total_reward += reward.mean() if reward.numel() > 1 else reward
+            else:
+                total_reward += torch.tensor(reward, device=device)
         
         num_layers = max(1, len(sorted_layers))
         total_loss = total_loss / num_layers
