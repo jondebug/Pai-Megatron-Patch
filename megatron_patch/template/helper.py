@@ -236,6 +236,12 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     # Create loss dictionary starting with main loss
     loss_dict = {"lm loss": averaged_loss}
     
+    # Critical metrics dict (logged directly to wandb without train/ prefix)
+    critical_metrics = {"critical/lm_loss": averaged_loss.item() if hasattr(averaged_loss, 'item') else float(averaged_loss)}
+    
+    # Get reward_type for conditional metric logging
+    reward_type = getattr(args, 'rl_reward_type', 'expert0')
+    
     # Collect auxiliary losses from MoE layers (like load_balancing_loss)
     from megatron.core.transformer.moe.moe_utils import (
         get_moe_layer_wise_logging_tracker,
@@ -252,6 +258,10 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         
         # Add auxiliary losses to the loss dictionary
         for name, loss_data in tracker.items():
+            # Skip expert_0 metrics unless using expert0 reward
+            if 'expert_0' in name and reward_type != 'expert0':
+                continue
+                
             if 'values' in loss_data:
                 loss_values = loss_data['values'].float()
                 
@@ -269,7 +279,9 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         # This represents the compute critical path (slowest expert per layer, summed)
         if 'max_tokens_per_expert' in tracker and 'values' in tracker['max_tokens_per_expert']:
             max_tokens_values = tracker['max_tokens_per_expert']['values'].float()
-            loss_dict['num_tokens_on_critical_path'] = max_tokens_values.sum()
+            num_critical_path = max_tokens_values.sum()
+            loss_dict['num_tokens_on_critical_path'] = num_critical_path
+            critical_metrics['critical/num_tokens_on_critical_path'] = num_critical_path.item()
         
         # Clear the tracker for next iteration
         clear_aux_losses_tracker()
@@ -322,21 +334,40 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     # Add component losses for detailed wandb logging (must be tensors for Megatron)
     if hasattr(trajectory_tracker, 'last_loss_components'):
         components = trajectory_tracker.last_loss_components
-        loss_dict["rl_policy_loss"] = torch.tensor(components.get('policy_loss', 0.0))
-        loss_dict["rl_value_loss"] = torch.tensor(components.get('value_loss', 0.0))
+        policy_loss = torch.tensor(components.get('policy_loss', 0.0))
+        value_loss = torch.tensor(components.get('value_loss', 0.0))
+        
+        loss_dict["rl_policy_loss"] = policy_loss
+        loss_dict["rl_value_loss"] = value_loss
         loss_dict["rl_entropy_bonus"] = torch.tensor(components.get('entropy_bonus', 0.0))
         loss_dict["rl_mean_advantage"] = torch.tensor(components.get('mean_advantage', 0.0))
         loss_dict["rl_mean_reward"] = torch.tensor(components.get('mean_reward', 0.0))
+        
+        # Critical metrics for policy and value loss
+        critical_metrics['critical/policy_loss'] = policy_loss.item() if hasattr(policy_loss, 'item') else float(policy_loss)
+        critical_metrics['critical/value_loss'] = value_loss.item() if hasattr(value_loss, 'item') else float(value_loss)
+        
         # Only log avg_topn_load when using topn_load reward
         avg_topn = components.get('avg_topn_load', 0.0)
         if avg_topn > 0:
             loss_dict["rl_avg_topn_load"] = torch.tensor(avg_topn)
+            critical_metrics['critical/avg_topn_load'] = float(avg_topn)
 
     # Optional lightweight debug: report RL vs LM magnitudes on main rank
     try:
         from megatron.core import parallel_state as mpu
         if mpu.get_data_parallel_rank() == 0:
             print_rank_0(f"[RL DEBUG] rl_loss={rl_loss.item():.4e}, lm_loss={averaged_loss.item():.4e}", override_debug_mode=False)
+    except Exception:
+        pass
+
+    # Log critical metrics directly to wandb (without train/ prefix)
+    try:
+        from megatron.core import parallel_state as mpu
+        if mpu.get_data_parallel_rank() == 0:
+            import wandb
+            if wandb.run is not None:
+                wandb.log(critical_metrics, commit=False)
     except Exception:
         pass
 

@@ -62,6 +62,12 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
     rlc = all_params.get('rl_loss_coeff', 0)
     parts.append(f'rlc{rlc}')
     
+    # Add reward_topn if using topn_load reward
+    reward_type = all_params.get('rl_reward_type', 'expert0')
+    if reward_type == 'topn_load':
+        topn = all_params.get('rl_reward_topn', -1)
+        parts.append(f'n{topn}')
+    
     parts.append(f'r{run_index:02d}')
     
     return '_'.join(parts)
