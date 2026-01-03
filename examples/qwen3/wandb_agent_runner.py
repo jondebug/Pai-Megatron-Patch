@@ -74,6 +74,10 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
     config = {**fixed_params, **sweep_params}
     config['wandb_run_name'] = run_name
     
+    # Make output path unique per sweep run to avoid checkpoint collisions
+    base_output = config.get('output_basepath', '/tmp/output')
+    unique_output = f"{base_output}/{run_name}"
+    
     # Build positional arguments
     positional_args = [
         config.get('env', 'dsw'),
@@ -102,7 +106,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         config.get('pretrain_checkpoint_path'),
         str(config.get('train_tokens', 1024000)),
         str(config.get('warmup_tokens', 10240)),
-        config.get('output_basepath'),
+        unique_output,
     ]
     
     # Build extra args
@@ -114,7 +118,6 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('enable_wandb_logging', '--enable-wandb-logging'),
         ('use_rl_loss', '--use_rl_loss'),
         ('rl_per_token_rewards', '--rl-per-token-rewards'),
-        ('rl_use_entropy_reward', '--rl-use-entropy-reward'),
     ]
     
     for config_key, flag in bool_flags:
@@ -129,6 +132,8 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('rl_loss_coeff', '--rl-loss-coeff'),
         ('rl_ppo_entropy_coeff', '--rl-ppo-entropy-coeff'),
         ('rl_ppo_baseline_type', '--rl-ppo-baseline-type'),
+        ('rl_reward_type', '--rl-reward-type'),
+        ('rl_reward_topn', '--rl-reward-topn'),
         ('moe_aux_loss_coeff', '--moe-aux-loss-coeff'),
         ('train_iters', '--train-iters'),
     ]
@@ -211,6 +216,8 @@ def main():
                 'rl_ppo_baseline_type': all_params.get('rl_ppo_baseline_type'),
                 'rl_critic_hidden_dims': all_params.get('rl_critic_hidden_dims'),
                 'rl_loss_coeff': all_params.get('rl_loss_coeff'),
+                'rl_reward_type': all_params.get('rl_reward_type'),
+                'rl_reward_topn': all_params.get('rl_reward_topn'),
                 'run_index': args.run_index,
                 'run_name': run_name,
             })

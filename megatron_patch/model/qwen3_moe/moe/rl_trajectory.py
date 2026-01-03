@@ -121,7 +121,8 @@ class RouterTrajectoryTracker:
         self.reset()
         self.per_token_rewards = True
         self.ppo_entropy_coeff = 0.01
-        self.use_entropy_reward = False
+        self.reward_type = "expert0"  # "expert0", "entropy", or "topn_load"
+        self.reward_topn = 12  # Number of top experts for topn_load reward
         self.baseline_type = "mean"  # "mean" or "critic"
         self.critic_hidden_dims = [256]  # List of hidden layer dimensions
         self.critic_lr = 1e-3  # Critic learning rate
@@ -135,6 +136,7 @@ class RouterTrajectoryTracker:
             'entropy_bonus': 0.0,
             'mean_advantage': 0.0,
             'mean_reward': 0.0,
+            'avg_topn_load': 0.0,  # Average top-N load across layers (only for topn_load reward)
         }
 
     
@@ -224,18 +226,25 @@ class RouterTrajectoryTracker:
         # Store detached copies to avoid keeping gradients
         latent_token_representations = latent_token_representations.detach()
 
-        if self.use_entropy_reward:
+        # Select reward function based on reward_type
+        if self.reward_type == "entropy":
             # Note: entropy reward is always scalar - incompatible with per_token_rewards=True
             if self.per_token_rewards:
-                raise ValueError("use_entropy_reward=True is incompatible with per_token_rewards=True. "
+                raise ValueError("reward_type='entropy' is incompatible with per_token_rewards=True. "
                                 "Entropy reward is computed over the entire batch, not per-token.")
             reward = self.compute_expert_load_entropy(routing_map)
-        else:
+        elif self.reward_type == "topn_load":
+            # Note: topn_load is batch-wise only
+            if self.per_token_rewards:
+                raise ValueError("reward_type='topn_load' is incompatible with per_token_rewards=True. "
+                                "Top-N load reward is computed over the entire batch.")
+            reward = self.topn_load_reward(routing_map)
+        else:  # "expert0" (default)
             reward = self.focus_tokens_on_expert_0_reward(routing_map)
         
         if layer_num == 1:
             reward_summary = reward.mean().item() if reward.dim() > 0 else reward.item()
-            wrap_print_rank_0(f"[RL DEBUG] layer {layer_num} add_layer_decision - latent_token_representations req_grad: {latent_token_representations.requires_grad}, use_entropy_reward: {self.use_entropy_reward}, reward_shape: {reward.shape}, reward_mean: {reward_summary:.4f}")
+            wrap_print_rank_0(f"[RL DEBUG] layer {layer_num} add_layer_decision - reward_type: {self.reward_type}, reward_shape: {reward.shape}, reward_mean: {reward_summary:.4f}")
         self.layer_decisions[layer_num] = (
             latent_token_representations,
             routing_map,
@@ -283,6 +292,45 @@ class RouterTrajectoryTracker:
         total_tokens = routing_map.sum()
         tokens_to_expert_0 = routing_map[:, :, 0].sum()
         return tokens_to_expert_0 / total_tokens.clamp_min(1.0)
+
+    def topn_load_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
+        """Scalar reward: negative average load of top N experts.
+        
+        The reward is the negative of the average load of the N heaviest-loaded experts.
+        This encourages the router to balance load and reduce the burden on overloaded experts.
+        Less negative = better load balance.
+        
+        Args:
+            routing_map: Tensor of shape [seq_length, batch_size, num_experts]
+        
+        Returns:
+            reward: Scalar tensor (negative value, closer to 0 is better)
+        """
+        avg_topn = self.compute_topn_load(routing_map)
+        # Return negative (less negative = better balance)
+        return -avg_topn
+    
+    def compute_topn_load(self, routing_map: torch.Tensor) -> torch.Tensor:
+        """Compute average load of top N experts (for logging).
+        
+        Args:
+            routing_map: Tensor of shape [seq_length, batch_size, num_experts]
+        
+        Returns:
+            avg_load: Scalar tensor (positive value, lower = better balance)
+        """
+        num_experts = routing_map.shape[2]
+        
+        # Compute expert loads: sum over all tokens in batch
+        expert_loads = routing_map.sum(dim=(0, 1))  # [num_experts]
+        total_tokens = expert_loads.sum().clamp_min(1.0)
+        normalized_loads = expert_loads / total_tokens  # fraction of tokens per expert
+        
+        # Find top-N loaded experts
+        n = min(self.reward_topn, num_experts)
+        top_loads, _ = torch.topk(normalized_loads, n)
+        
+        return top_loads.mean()
 
     
     def compute_expert_load_entropy(self, routing_map: torch.Tensor) -> torch.Tensor:
@@ -375,7 +423,10 @@ class RouterTrajectoryTracker:
         
         for layer_num in sorted_layers:
             _, _, _, reward = trajectory_data[layer_num]
-            layer_rewards[layer_num] = reward  # scalar
+            # Ensure reward is scalar (reduce if per-token due to config timing)
+            if reward.dim() > 0:
+                reward = reward.mean()
+            layer_rewards[layer_num] = reward
         
         # Calculate discounted state values using future rewards in reverse
         layer_values = {}
@@ -404,6 +455,29 @@ class RouterTrajectoryTracker:
         
         # Average across layers
         total_loss = total_loss / max(1, len(sorted_layers))
+        
+        # Compute average top-N load across layers (only meaningful for topn_load reward)
+        avg_topn_load = 0.0
+        if self.reward_type == "topn_load":
+            topn_loads = []
+            for layer_num in sorted_layers:
+                _, routing_map, _, _ = trajectory_data[layer_num]
+                topn_loads.append(self.compute_topn_load(routing_map).item())
+            avg_topn_load = sum(topn_loads) / len(topn_loads) if topn_loads else 0.0
+        
+        # Compute mean reward for logging
+        mean_reward = sum(r.item() if hasattr(r, 'item') else r for r in layer_rewards.values()) / max(1, len(layer_rewards))
+        
+        # Store loss components for logging
+        self.last_loss_components = {
+            'policy_loss': total_loss.item(),
+            'value_loss': 0.0,  # REINFORCE doesn't have a critic
+            'entropy_bonus': 0.0,  # REINFORCE doesn't use entropy bonus
+            'mean_advantage': 0.0,  # REINFORCE uses returns directly
+            'mean_reward': mean_reward,
+            'avg_topn_load': avg_topn_load,
+        }
+        
         wrap_print_rank_0(f"REINFORCE (scalar) DEBUG: total_loss={total_loss.item():.6f}")
         return total_loss
     
@@ -468,9 +542,22 @@ class RouterTrajectoryTracker:
         
         # Average over all tokens across all layers
         total_loss = total_loss / max(1, total_tokens)
+        
+        # Compute mean reward for logging
+        mean_reward = sum(r.mean().item() for r in layer_rewards.values()) / max(1, len(layer_rewards))
+        
+        # Store loss components for logging (topn_load not applicable for per-token)
+        self.last_loss_components = {
+            'policy_loss': total_loss.item(),
+            'value_loss': 0.0,
+            'entropy_bonus': 0.0,
+            'mean_advantage': 0.0,
+            'mean_reward': mean_reward,
+            'avg_topn_load': 0.0,
+        }
+        
         wrap_print_rank_0(f"REINFORCE (per-token) DEBUG: total_loss={total_loss.item():.6f}, total_tokens={total_tokens}")
         return total_loss
-
 
 
     def compute_ppo_loss(self, trajectory_data: Dict, old_trajectory_data: Dict = None, 
@@ -628,6 +715,15 @@ class RouterTrajectoryTracker:
         num_layers = max(1, len(sorted_layers))
         total_loss = total_loss / num_layers
         
+        # Compute average top-N load across layers (only meaningful for topn_load reward)
+        avg_topn_load = 0.0
+        if self.reward_type == "topn_load":
+            topn_loads = []
+            for layer_num in sorted_layers:
+                _, routing_map, _, _ = trajectory_data[layer_num]
+                topn_loads.append(self.compute_topn_load(routing_map).item())
+            avg_topn_load = sum(topn_loads) / len(topn_loads) if topn_loads else 0.0
+        
         # Store component losses for logging
         # Use actual critic loss if critic was trained, otherwise use computed value_loss
         logged_value_loss = self._last_critic_loss if hasattr(self, '_last_critic_loss') else (total_value_loss / num_layers).item()
@@ -637,6 +733,7 @@ class RouterTrajectoryTracker:
             'entropy_bonus': (total_entropy / num_layers).item(),
             'mean_advantage': (total_advantage / num_layers).item(),
             'mean_reward': (total_reward / num_layers).item() if isinstance(total_reward, torch.Tensor) else total_reward / num_layers,
+            'avg_topn_load': avg_topn_load,
         }
         wrap_print_rank_0(f"PPO (scalar, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}, critic_loss={logged_value_loss:.6f}")
         return total_loss
@@ -776,6 +873,7 @@ class RouterTrajectoryTracker:
             'entropy_bonus': (total_entropy / max(1, total_tokens)).item(),
             'mean_advantage': (total_advantage / max(1, total_tokens)).item(),
             'mean_reward': (total_reward / max(1, total_tokens)).item(),
+            'avg_topn_load': 0.0,  # Not applicable for per-token mode
         }
         wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}, critic_loss={logged_value_loss:.6f}, total_tokens={total_tokens}")
         return total_loss
@@ -800,7 +898,8 @@ def get_trajectory_tracker() -> RouterTrajectoryTracker:
             args = get_args()
             _global_trajectory_tracker.per_token_rewards = getattr(args, 'rl_per_token_rewards', True)
             _global_trajectory_tracker.ppo_entropy_coeff = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
-            _global_trajectory_tracker.use_entropy_reward = getattr(args, 'rl_use_entropy_reward', False)
+            _global_trajectory_tracker.reward_type = getattr(args, 'rl_reward_type', 'expert0')
+            _global_trajectory_tracker.reward_topn = getattr(args, 'rl_reward_topn', 12)
             _global_trajectory_tracker.baseline_type = getattr(args, 'rl_ppo_baseline_type', 'mean')
             _global_trajectory_tracker.critic_hidden_dims = getattr(args, 'rl_critic_hidden_dims', [256])
             _global_trajectory_tracker.critic_lr = getattr(args, 'rl_critic_lr', 1e-3)
@@ -808,6 +907,8 @@ def get_trajectory_tracker() -> RouterTrajectoryTracker:
             # Always print configuration for verification (not gated by debug_mode)
             import sys
             print(f"[RL CONFIG] Tracker configured: baseline_type={_global_trajectory_tracker.baseline_type}, "
+                  f"reward_type={_global_trajectory_tracker.reward_type}, "
+                  f"reward_topn={_global_trajectory_tracker.reward_topn}, "
                   f"per_token_rewards={_global_trajectory_tracker.per_token_rewards}, "
                   f"ppo_entropy_coeff={_global_trajectory_tracker.ppo_entropy_coeff}, "
                   f"critic_hidden_dims={_global_trajectory_tracker.critic_hidden_dims}, "

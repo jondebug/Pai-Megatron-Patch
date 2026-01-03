@@ -287,11 +287,14 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     if trajectory_tracker.baseline_type == "mean" and hasattr(args, 'rl_ppo_baseline_type'):
         if args.rl_ppo_baseline_type != "mean":
             trajectory_tracker.baseline_type = args.rl_ppo_baseline_type
+            trajectory_tracker.reward_type = getattr(args, 'rl_reward_type', 'expert0')
+            trajectory_tracker.reward_topn = getattr(args, 'rl_reward_topn', 12)
             trajectory_tracker.per_token_rewards = getattr(args, 'rl_per_token_rewards', True)
             trajectory_tracker.ppo_entropy_coeff = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
             trajectory_tracker.critic_hidden_dims = getattr(args, 'rl_critic_hidden_dims', [256])
             trajectory_tracker.critic_lr = getattr(args, 'rl_critic_lr', 1e-3)
             print(f"[RL CONFIG FORCED] baseline_type={trajectory_tracker.baseline_type}, "
+                  f"reward_type={trajectory_tracker.reward_type}, reward_topn={trajectory_tracker.reward_topn}, "
                   f"critic_hidden_dims={trajectory_tracker.critic_hidden_dims}", flush=True)
     
     rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
@@ -324,6 +327,10 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         loss_dict["rl_entropy_bonus"] = torch.tensor(components.get('entropy_bonus', 0.0))
         loss_dict["rl_mean_advantage"] = torch.tensor(components.get('mean_advantage', 0.0))
         loss_dict["rl_mean_reward"] = torch.tensor(components.get('mean_reward', 0.0))
+        # Only log avg_topn_load when using topn_load reward
+        avg_topn = components.get('avg_topn_load', 0.0)
+        if avg_topn > 0:
+            loss_dict["rl_avg_topn_load"] = torch.tensor(avg_topn)
 
     # Optional lightweight debug: report RL vs LM magnitudes on main rank
     try:
