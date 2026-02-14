@@ -64,6 +64,20 @@ OUTPUT_BASEPATH=${27}
 shift 27  # Remove the first 27 positional arguments
 EXTRA_ARGS="$@"  # Capture all remaining arguments
 
+# Check if --moe-router-load-balancing-type is passed in EXTRA_ARGS to override default (aux_loss)
+# Must be parsed early since moe_options uses ${MOE_LB_TYPE} during model size config
+MOE_LB_TYPE="aux_loss"
+prev_arg=""
+for arg in ${EXTRA_ARGS}; do
+    if [ "$prev_arg" = "--moe-router-load-balancing-type" ]; then
+        MOE_LB_TYPE=$arg
+        echo "Using --moe-router-load-balancing-type override: ${MOE_LB_TYPE}"
+        EXTRA_ARGS=$(echo "$EXTRA_ARGS" | sed 's/--moe-router-load-balancing-type [a-z_]*//g')
+        break
+    fi
+    prev_arg=$arg
+done
+
 ### OTHERS ###
 
 
@@ -205,7 +219,7 @@ elif [ $MODEL_SIZE = A3B ]; then
         --expert-tensor-parallel-size ${ETP} \
         --expert-model-parallel-size ${EP} \
         --moe-ffn-hidden-size ${MOE_INTERMEDIATE_SIZE} \
-        --moe-router-load-balancing-type aux_loss \
+        --moe-router-load-balancing-type ${MOE_LB_TYPE} \
         --moe-aux-loss-coeff 0.001 \
         --moe-layer-freq '([1]*48)' \
         "
@@ -240,7 +254,7 @@ elif [ $MODEL_SIZE = A22B ]; then
         --expert-tensor-parallel-size ${ETP} \
         --expert-model-parallel-size ${EP} \
         --moe-ffn-hidden-size ${MOE_INTERMEDIATE_SIZE} \
-        --moe-router-load-balancing-type aux_loss \
+        --moe-router-load-balancing-type ${MOE_LB_TYPE} \
         --moe-aux-loss-coeff 0.001 \
         --moe-layer-freq '([1]*94)' \
         --moe-router-pre-softmax

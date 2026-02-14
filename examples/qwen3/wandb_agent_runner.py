@@ -96,6 +96,21 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
         dims_str = 'x'.join(str(d) for d in dims) if isinstance(dims, list) else str(dims)
         parts.append(f'c{dims_str}')
     
+    # ALF-LB (aux-loss-free load balancing via dynamic expert bias)
+    if sweep_params.get('moe_router_enable_expert_bias', False):
+        rate = sweep_params.get('moe_router_bias_update_rate', all_params.get('moe_router_bias_update_rate', 0.001))
+        parts.append(f'alflb_a{rate}')
+    
+    # Load balancing type (only if it varies and isn't already covered by ALF-LB)
+    if 'moe_router_load_balancing_type' in sweep_params and not sweep_params.get('moe_router_enable_expert_bias', False):
+        parts.append(f'lb_{sweep_params["moe_router_load_balancing_type"]}')
+    
+    # KL loss coefficient
+    if 'kl_loss_coeff' in sweep_params:
+        v = sweep_params['kl_loss_coeff']
+        if v and float(v) > 0:
+            parts.append(f'kl{v}')
+    
     # Fallback: if no parts generated, use a generic label
     if not parts:
         parts.append('baseline')
@@ -157,6 +172,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('use_rl_loss', '--use_rl_loss'),
         ('rl_per_token_rewards', '--rl-per-token-rewards'),
         ('rl_normalize_rewards', '--rl-normalize-rewards'),
+        ('moe_router_enable_expert_bias', '--moe-router-enable-expert-bias'),
     ]
     
     for config_key, flag in bool_flags:
@@ -175,6 +191,10 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('rl_reward_topn', '--rl-reward-topn'),
         ('rl_discount_factor', '--rl-discount-factor'),
         ('moe_aux_loss_coeff', '--moe-aux-loss-coeff'),
+        ('moe_router_score_function', '--moe-router-score-function'),
+        ('moe_router_bias_update_rate', '--moe-router-bias-update-rate'),
+        ('moe_router_load_balancing_type', '--moe-router-load-balancing-type'),
+        ('kl_loss_coeff', '--kl-loss-coeff'),
         ('train_iters', '--train-iters'),
         ('eval_interval', '--eval-interval'),
         ('eval_iters', '--eval-iters'),
