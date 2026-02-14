@@ -173,6 +173,58 @@ def generate_filtered_sweep_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return wandb_config, valid_combos, fixed_params
 
 
+def build_sweep_summary(valid_combos: List[Dict], fixed_params: Dict) -> Dict[str, Any]:
+    """Build a human-readable summary of what the sweep is actually varying.
+    
+    Returns a dict with:
+      - 'swept_params': {param_name: sorted unique values} for params that vary
+      - 'fixed_params_subset': key fixed params relevant to the experiment
+      - 'grid_description': human-readable string like "3 gammas x 4 topn x ..."
+    """
+    if not valid_combos:
+        return {'swept_params': {}, 'fixed_params_subset': {}, 'grid_description': 'empty'}
+    
+    # Find which keys vary across combinations
+    all_keys = set()
+    for combo in valid_combos:
+        all_keys.update(combo.keys())
+    
+    swept_params = {}
+    for key in sorted(all_keys):
+        values = set()
+        for combo in valid_combos:
+            v = combo.get(key)
+            # Make hashable
+            if isinstance(v, list):
+                v = tuple(v)
+            values.add(v)
+        if len(values) > 1:
+            # Convert back for JSON serialization
+            sorted_vals = sorted(values, key=lambda x: (str(type(x)), str(x)))
+            swept_params[key] = [list(v) if isinstance(v, tuple) else v for v in sorted_vals]
+    
+    # Build grid description
+    grid_parts = []
+    for key, values in swept_params.items():
+        grid_parts.append(f"{len(values)} {key}")
+    grid_description = " x ".join(grid_parts) if grid_parts else "no variation"
+    
+    # Key fixed params worth showing
+    interesting_fixed_keys = [
+        'rl_algorithm', 'rl_reward_type', 'rl_per_token_rewards',
+        'rl_ppo_baseline_type', 'use_rl_loss', 'moe_aux_loss_coeff',
+        'train_iters', 'seq_len', 'global_batch_size',
+    ]
+    fixed_subset = {k: fixed_params[k] for k in interesting_fixed_keys if k in fixed_params}
+    
+    return {
+        'swept_params': swept_params,
+        'fixed_params_subset': fixed_subset,
+        'grid_description': grid_description,
+        'total_combinations': len(valid_combos),
+    }
+
+
 def save_sweep_artifacts(wandb_config: Dict, valid_combos: List[Dict], fixed_params: Dict, 
                          original_config: Dict, output_dir: Path, config_path: str):
     """Save sweep configuration files."""
@@ -191,13 +243,26 @@ def save_sweep_artifacts(wandb_config: Dict, valid_combos: List[Dict], fixed_par
     
     # Save valid combinations as JSON (for agent runner to use)
     combos_path = output_dir / 'sweep_combinations.json'
+    
+    # Build and include sweep summary
+    sweep_summary = build_sweep_summary(valid_combos, fixed_params)
+    
     with open(combos_path, 'w') as f:
         json.dump({
             'combinations': valid_combos,
             'fixed_params': fixed_params,
-            'sweep_dir': str(output_dir)
+            'sweep_dir': str(output_dir),
+            'sweep_summary': sweep_summary,
         }, f, indent=2)
     print(f"Saved sweep combinations: {combos_path}")
+    
+    # Print sweep summary
+    print(f"\n  Sweep grid: {sweep_summary['grid_description']}")
+    print(f"  Total combinations: {sweep_summary['total_combinations']}")
+    if sweep_summary['swept_params']:
+        print(f"  Swept parameters:")
+        for k, v in sweep_summary['swept_params'].items():
+            print(f"    {k}: {v}")
     
     # Create a symlink to the latest sweep for easy access
     base_dir = output_dir.parent
@@ -213,7 +278,8 @@ def save_sweep_artifacts(wandb_config: Dict, valid_combos: List[Dict], fixed_par
         json.dump({
             'combinations': valid_combos,
             'fixed_params': fixed_params,
-            'sweep_dir': str(output_dir)
+            'sweep_dir': str(output_dir),
+            'sweep_summary': sweep_summary,
         }, f, indent=2)
     
     return sweep_yaml_path, combos_path

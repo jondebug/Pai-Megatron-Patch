@@ -22,7 +22,7 @@ def load_combinations(combos_path: str):
     """Load sweep combinations from JSON."""
     with open(combos_path, 'r') as f:
         data = json.load(f)
-    return data['combinations'], data['fixed_params'], data.get('sweep_dir', None)
+    return data['combinations'], data['fixed_params'], data.get('sweep_dir', None), data.get('sweep_summary', None)
 
 
 def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None) -> str:
@@ -62,11 +62,29 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
     rlc = all_params.get('rl_loss_coeff', 0)
     parts.append(f'rlc{rlc}')
     
-    # Add reward_topn if using topn_load reward
+    # Add discount factor (gamma) if specified
+    gamma = all_params.get('rl_discount_factor', None)
+    if gamma is not None:
+        parts.append(f'g{gamma}')
+    
+    # Add reward type and topn
     reward_type = all_params.get('rl_reward_type', 'expert0')
     if reward_type == 'topn_load':
         topn = all_params.get('rl_reward_topn', -1)
-        parts.append(f'n{topn}')
+        parts.append(f'topn{topn}')
+    elif reward_type == 'critical_path':
+        parts.append('crit')
+    elif reward_type == 'entropy':
+        parts.append('entr')
+    
+    # Add reward normalization flag
+    if all_params.get('rl_normalize_rewards', False):
+        parts.append('norm')
+    
+    # Add aux loss coeff if non-zero
+    aux_coeff = all_params.get('moe_aux_loss_coeff', 0)
+    if aux_coeff and float(aux_coeff) > 0:
+        parts.append(f'aux{aux_coeff}')
     
     parts.append(f'r{run_index:02d}')
     
@@ -124,6 +142,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('enable_wandb_logging', '--enable-wandb-logging'),
         ('use_rl_loss', '--use_rl_loss'),
         ('rl_per_token_rewards', '--rl-per-token-rewards'),
+        ('rl_normalize_rewards', '--rl-normalize-rewards'),
     ]
     
     for config_key, flag in bool_flags:
@@ -140,8 +159,11 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('rl_ppo_baseline_type', '--rl-ppo-baseline-type'),
         ('rl_reward_type', '--rl-reward-type'),
         ('rl_reward_topn', '--rl-reward-topn'),
+        ('rl_discount_factor', '--rl-discount-factor'),
         ('moe_aux_loss_coeff', '--moe-aux-loss-coeff'),
         ('train_iters', '--train-iters'),
+        ('eval_interval', '--eval-interval'),
+        ('eval_iters', '--eval-iters'),
     ]
     
     for config_key, flag in value_args:
@@ -195,7 +217,7 @@ def main():
         print("Run 'python wandb_sweep_config.py --config sweep_config.json' first.")
         return 1
     
-    combinations, fixed_params, stored_sweep_dir = load_combinations(combos_path)
+    combinations, fixed_params, stored_sweep_dir, sweep_summary = load_combinations(combos_path)
     
     # Use stored sweep_dir if not provided
     if sweep_dir is None and stored_sweep_dir:
@@ -212,22 +234,58 @@ def main():
     try:
         import wandb
         if wandb.run is not None:
-            # Update the wandb run config with our sweep parameters
-            # Merge fixed and sweep params for logging
+            # Merge fixed and sweep params -- log ALL actual hyperparameters
             all_params = {**fixed_params, **sweep_params}
-            wandb.config.update({
-                'rl_algorithm': all_params.get('rl_algorithm'),
-                'rl_per_token_rewards': all_params.get('rl_per_token_rewards'),
-                'rl_ppo_entropy_coeff': all_params.get('rl_ppo_entropy_coeff'),
-                'rl_ppo_baseline_type': all_params.get('rl_ppo_baseline_type'),
-                'rl_critic_hidden_dims': all_params.get('rl_critic_hidden_dims'),
-                'rl_loss_coeff': all_params.get('rl_loss_coeff'),
-                'rl_reward_type': all_params.get('rl_reward_type'),
-                'rl_reward_topn': all_params.get('rl_reward_topn'),
+            
+            # Build a comprehensive config dict with all experiment hyperparameters
+            # Include every param that could matter for analysis
+            wandb_config = {
                 'run_index': args.run_index,
                 'run_name': run_name,
-            })
+            }
+            
+            # Log all sweep-varying params explicitly (these are the ones that matter most)
+            for key, value in sweep_params.items():
+                wandb_config[f'sweep/{key}'] = value
+            
+            # Log all fixed params that are experiment-relevant
+            experiment_keys = [
+                'rl_algorithm', 'rl_per_token_rewards', 'rl_ppo_entropy_coeff',
+                'rl_ppo_baseline_type', 'rl_critic_hidden_dims', 'rl_loss_coeff',
+                'rl_reward_type', 'rl_reward_topn', 'rl_discount_factor',
+                'use_rl_loss', 'moe_aux_loss_coeff', 'train_iters',
+                'global_batch_size', 'seq_len', 'lr', 'min_lr',
+            ]
+            for key in experiment_keys:
+                if key in all_params:
+                    wandb_config[key] = all_params[key]
+            
+            # Also log any remaining params from all_params that aren't infrastructure
+            infra_keys = {
+                'env', 'model_size', 'batch_size', 'precision', 'tp', 'pp', 'cp',
+                'etp', 'ep', 'sp', 'do', 'fl', 'sft', 'ac', 'optimizer_offload',
+                'save_interval', 'dataset_path', 'valid_dataset_path',
+                'pretrain_checkpoint_path', 'output_basepath', 'train_tokens',
+                'warmup_tokens', 'wandb_project_name', 'wandb_run_name',
+                'wandb_run_name_base', 'sweep_name', 'wandb_run_tags',
+                'router_only_training', 'enable_wandb_logging', 'pad_len',
+            }
+            for key, value in all_params.items():
+                if key not in infra_keys and key not in wandb_config:
+                    wandb_config[key] = value
+            
+            wandb.config.update(wandb_config, allow_val_change=True)
+            
+            # Log sweep summary as notes if available
+            if sweep_summary:
+                wandb.run.notes = (
+                    f"Grid: {sweep_summary.get('grid_description', 'N/A')}\n"
+                    f"Total combos: {sweep_summary.get('total_combinations', 'N/A')}\n"
+                    f"Swept: {list(sweep_summary.get('swept_params', {}).keys())}"
+                )
+            
             print(f"Logged sweep params to wandb run: {wandb.run.name}")
+            print(f"  Sweep params: {sweep_params}")
     except Exception as e:
         print(f"Note: Could not log to wandb: {e}")
     
