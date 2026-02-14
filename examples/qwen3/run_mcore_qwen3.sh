@@ -422,6 +422,32 @@ else
         --train-mode pretrain"
 fi
 
+# Check if --eval-interval is passed in EXTRA_ARGS to override default
+EVAL_INTERVAL=10000
+prev_arg=""
+for arg in ${EXTRA_ARGS}; do
+    if [ "$prev_arg" = "--eval-interval" ]; then
+        EVAL_INTERVAL=$arg
+        echo "Using --eval-interval override: ${EVAL_INTERVAL}"
+        EXTRA_ARGS=$(echo "$EXTRA_ARGS" | sed 's/--eval-interval [0-9]*//g')
+        break
+    fi
+    prev_arg=$arg
+done
+
+# Check if --eval-iters is passed in EXTRA_ARGS to override default
+EVAL_ITERS=10
+prev_arg=""
+for arg in ${EXTRA_ARGS}; do
+    if [ "$prev_arg" = "--eval-iters" ]; then
+        EVAL_ITERS=$arg
+        echo "Using --eval-iters override: ${EVAL_ITERS}"
+        EXTRA_ARGS=$(echo "$EXTRA_ARGS" | sed 's/--eval-iters [0-9]*//g')
+        break
+    fi
+    prev_arg=$arg
+done
+
 if [ ${MP_DATASET_TYPE} = "raw" ]; then
     dataset_options=" \
         --train-data-path ${DATASET_PATH} \
@@ -484,8 +510,8 @@ megatron_options="  \
         --max-padding-length ${PAD_LEN} \
         --log-interval 1 \
         --log-throughput \
-        --eval-interval 10000 \
-        --eval-iters 10 \
+        --eval-interval ${EVAL_INTERVAL} \
+        --eval-iters ${EVAL_ITERS} \
         --save-interval ${SAVE_INTERVAL} \
         --tensorboard-queue-size 1 \
         --tensorboard-dir ${TENSORBOARD_DIR} \
