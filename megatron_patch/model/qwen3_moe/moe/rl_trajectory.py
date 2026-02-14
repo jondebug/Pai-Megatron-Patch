@@ -76,6 +76,70 @@ class CriticNetwork(nn.Module):
         return f"CriticNetwork(hidden_dims={self.hidden_dims})"
 
 
+class RewardNormalizer:
+    """Running mean/std normalizer for reward signals.
+    
+    Tracks exponential moving average of reward mean and variance,
+    then normalizes rewards to have approximately zero mean and unit variance.
+    This expands compressed reward ranges (e.g., [0.15, 0.19]) into a useful [-1, +1] range.
+    """
+    
+    def __init__(self, momentum: float = 0.01, eps: float = 1e-8):
+        """
+        Args:
+            momentum: EMA update rate (higher = faster adaptation, more noise)
+            eps: Small constant to prevent division by zero
+        """
+        self.momentum = momentum
+        self.eps = eps
+        self.running_mean = None
+        self.running_var = None
+        self._count = 0
+    
+    def normalize(self, reward: torch.Tensor) -> torch.Tensor:
+        """Normalize a reward value using running statistics.
+        
+        Args:
+            reward: Scalar or per-token reward tensor
+            
+        Returns:
+            Normalized reward with approximately zero mean and unit variance
+        """
+        reward_val = reward.detach().mean().item() if reward.dim() > 0 else reward.detach().item()
+        reward_var = reward.detach().var().item() if reward.dim() > 0 and reward.numel() > 1 else 0.0
+        
+        if self.running_mean is None:
+            # Initialize from first observation
+            self.running_mean = reward_val
+            self.running_var = max(reward_var, self.eps)
+            self._count = 1
+            # Don't normalize the first observation (no statistics yet)
+            return reward
+        
+        # Update running statistics
+        self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * reward_val
+        self.running_var = (1 - self.momentum) * self.running_var + self.momentum * (reward_val - self.running_mean) ** 2
+        self._count += 1
+        
+        # Normalize: (reward - mean) / std
+        std = max(self.running_var ** 0.5, self.eps)
+        normalized = (reward - self.running_mean) / std
+        
+        return normalized
+    
+    def state_dict(self) -> dict:
+        return {
+            'running_mean': self.running_mean,
+            'running_var': self.running_var,
+            'count': self._count,
+        }
+    
+    def load_state_dict(self, state: dict):
+        self.running_mean = state.get('running_mean')
+        self.running_var = state.get('running_var')
+        self._count = state.get('count', 0)
+
+
 class RouterRLLossScaler(torch.autograd.Function):
     """An AutoScaler that adds RL loss gradients to router weights after trajectory completion."""
 
@@ -119,9 +183,9 @@ class RouterTrajectoryTracker:
     
     def __init__(self):
         self.reset()
-        self.per_token_rewards = True
+        self.per_token_rewards = False  # Default False; topn_load, critical_path, entropy are batch-level
         self.ppo_entropy_coeff = 0.01
-        self.reward_type = "expert0"  # "expert0", "entropy", or "topn_load"
+        self.reward_type = "topn_load"  # "expert0", "entropy", "topn_load", or "critical_path"
         self.reward_topn = 12  # Number of top experts for topn_load reward
         self.baseline_type = "mean"  # "mean" or "critic"
         self.critic_hidden_dims = [256]  # List of hidden layer dimensions
@@ -129,6 +193,8 @@ class RouterTrajectoryTracker:
         self._critic = None  # Lazy initialization
         self._critic_optimizer = None
         self._pending_critic_update = False  # Flag to trigger critic update
+        self.normalize_rewards = False  # Enable running-mean/std reward normalization
+        self._reward_normalizer = RewardNormalizer(momentum=0.01)
         # Store last computed loss components for logging
         self.last_loss_components = {
             'policy_loss': 0.0,
@@ -223,8 +289,22 @@ class RouterTrajectoryTracker:
             latent_token_representations (torch.Tensor) - state space
             routing_map (torch.Tensor): Token routing assignments - action space
         """
+        # CRITICAL: Check gradient flow - if routing_logits doesn't require grad, policy gradient will be zero!
+        if layer_num == 1 and not routing_logits.requires_grad:
+            import warnings
+            warnings.warn(
+                "[RL WARNING] routing_logits.requires_grad=False! "
+                "Policy gradients will be zero. Check activation checkpointing settings.",
+                RuntimeWarning
+            )
+        
         # Store detached copies to avoid keeping gradients
         latent_token_representations = latent_token_representations.detach()
+
+        # Auto-set per_token_rewards for reward types that are inherently per-token
+        _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "expert0"}
+        if self.reward_type in _PER_TOKEN_REWARD_TYPES:
+            self.per_token_rewards = True
 
         # Select reward function based on reward_type
         if self.reward_type == "entropy":
@@ -239,12 +319,29 @@ class RouterTrajectoryTracker:
                 raise ValueError("reward_type='topn_load' is incompatible with per_token_rewards=True. "
                                 "Top-N load reward is computed over the entire batch.")
             reward = self.topn_load_reward(routing_map)
+        elif self.reward_type == "critical_path":
+            # Directly targets max expert load (the critical-path bottleneck)
+            if self.per_token_rewards:
+                raise ValueError("reward_type='critical_path' is incompatible with per_token_rewards=True. "
+                                "Critical path reward is computed over the entire batch.")
+            reward = self.critical_path_reward(routing_map)
+        elif self.reward_type == "per_token_topn_binary":
+            reward = self.per_token_topn_binary_reward(routing_map)
+        elif self.reward_type == "per_token_load_weighted":
+            reward = self.per_token_load_weighted_reward(routing_map)
         else:  # "expert0" (default)
             reward = self.focus_tokens_on_expert_0_reward(routing_map)
         
+        # Apply reward normalization if enabled (expands compressed reward ranges)
+        raw_reward_summary = reward.mean().item() if reward.dim() > 0 else reward.item()
+        if self.normalize_rewards:
+            reward = self._reward_normalizer.normalize(reward)
+        
         if layer_num == 1:
-            reward_summary = reward.mean().item() if reward.dim() > 0 else reward.item()
-            wrap_print_rank_0(f"[RL DEBUG] layer {layer_num} add_layer_decision - reward_type: {self.reward_type}, reward_shape: {reward.shape}, reward_mean: {reward_summary:.4f}")
+            norm_reward_summary = reward.mean().item() if reward.dim() > 0 else reward.item()
+            wrap_print_rank_0(f"[RL DEBUG] layer {layer_num} add_layer_decision - reward_type: {self.reward_type}, "
+                            f"reward_shape: {reward.shape}, raw_reward: {raw_reward_summary:.4f}, "
+                            f"normalized_reward: {norm_reward_summary:.4f}, normalize={self.normalize_rewards}")
         self.layer_decisions[layer_num] = (
             latent_token_representations,
             routing_map,
@@ -294,22 +391,103 @@ class RouterTrajectoryTracker:
         return tokens_to_expert_0 / total_tokens.clamp_min(1.0)
 
     def topn_load_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
-        """Scalar reward: negative average load of top N experts.
+        """Reward = avg_load / max_load. In (0, 1], 1 = perfect balance."""
+        expert_loads = routing_map.sum(dim=(0, 1)).float()  # [num_experts]
+        avg_load = expert_loads.mean()
+        max_load = expert_loads.topk(self.reward_topn)[0].mean()
+        return avg_load / max_load.clamp(min=avg_load)
+    
+    def critical_path_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
+        """Reward that directly targets the critical-path bottleneck (max expert load).
         
-        The reward is the negative of the average load of the N heaviest-loaded experts.
-        This encourages the router to balance load and reduce the burden on overloaded experts.
-        Less negative = better load balance.
+        Unlike topn_load_reward which uses avg/topN_mean (compressed into a narrow band),
+        this reward uses -max_load directly, producing a wider dynamic range.
+        
+        The reward is: -(max_load - ideal_load) / ideal_load
+        
+        Where ideal_load = total_tokens / num_experts (perfect balance).
+        
+        Range: 0 (perfect balance) to large negative (severe imbalance).
+        A max_load that is 2x the ideal gives reward = -1.
+        A max_load that is 5x the ideal gives reward = -4.
+        
+        This linear formulation gives gradient signal proportional to the
+        degree of imbalance, unlike the ratio form which compresses everything.
         
         Args:
             routing_map: Tensor of shape [seq_length, batch_size, num_experts]
-        
+            
         Returns:
-            reward: Scalar tensor (negative value, closer to 0 is better)
+            reward: Scalar tensor (0 = perfect, more negative = worse)
         """
-        avg_topn = self.compute_topn_load(routing_map)
-        # Return negative (less negative = better balance)
-        return -avg_topn
-    
+        expert_loads = routing_map.sum(dim=(0, 1)).float()  # [num_experts]
+        max_load = expert_loads.max()
+        ideal_load = expert_loads.mean()  # = total_tokens / num_experts (constant for fixed batch)
+        
+        # Negative deviation from ideal, normalized by ideal load
+        # This gives reward = 0 at perfect balance, -1 when max is 2x ideal, etc.
+        return -(max_load - ideal_load) / ideal_load.clamp(min=1.0)
+
+    def per_token_topn_binary_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
+        """Per-token reward: -1 if token routes to a top-N loaded expert, +1 otherwise.
+        
+        Provides token-level credit assignment: tokens that contribute to
+        overloading get penalized, tokens that avoid hot experts get rewarded.
+        
+        Args:
+            routing_map: Tensor of shape [seq_length, batch_size, num_experts]
+            
+        Returns:
+            reward: Tensor of shape [seq_length, batch_size], values in {-1, +1}
+        """
+        expert_loads = routing_map.sum(dim=(0, 1)).float()  # [num_experts]
+        _, topn_idx = expert_loads.topk(self.reward_topn)
+        
+        # Build mask: is each expert in the top-N most loaded?
+        is_hot = torch.zeros(routing_map.shape[-1], device=routing_map.device, dtype=torch.bool)
+        is_hot[topn_idx] = True
+        
+        # For each token, check if ANY of its chosen experts is hot
+        # routing_map: [seq, batch, E], is_hot: [E] -> broadcast multiply -> sum over E
+        token_hits_hot = (routing_map.float() * is_hot.float()).sum(dim=-1) > 0  # [seq, batch]
+        
+        return torch.where(token_hits_hot,
+                           torch.tensor(-1.0, device=routing_map.device),
+                           torch.tensor(1.0, device=routing_map.device))
+
+    def per_token_load_weighted_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
+        """Per-token reward proportional to how overloaded the chosen experts are.
+        
+        For each token, computes the average load of its chosen experts relative
+        to the ideal (uniform) load. Tokens routed to overloaded experts get
+        negative reward; tokens at underloaded experts get positive reward.
+        
+        reward = -(avg_chosen_load - ideal_load) / ideal_load
+        
+        Examples (with ideal_load=8):
+            Token picks experts with loads [16, 4] -> avg=10, reward = -(10-8)/8 = -0.25
+            Token picks experts with loads [4, 4]  -> avg=4,  reward = -(4-8)/8  = +0.50
+            Token picks experts with loads [8, 8]  -> avg=8,  reward = 0.0
+        
+        Args:
+            routing_map: Tensor of shape [seq_length, batch_size, num_experts]
+            
+        Returns:
+            reward: Tensor of shape [seq_length, batch_size], continuously scaled
+        """
+        expert_loads = routing_map.sum(dim=(0, 1)).float()  # [num_experts]
+        ideal_load = expert_loads.mean()
+        
+        # For each token: sum of loads of chosen experts
+        # routing_map [seq, batch, E] * expert_loads [E] -> [seq, batch, E] -> sum over E
+        token_load = (routing_map.float() * expert_loads).sum(dim=-1)  # [seq, batch]
+        
+        # Number of experts each token is routed to (topk)
+        num_chosen = routing_map.float().sum(dim=-1).clamp(min=1.0)  # [seq, batch]
+        avg_chosen_load = token_load / num_chosen
+        
+        return -(avg_chosen_load - ideal_load) / ideal_load.clamp(min=1.0)
+
     def compute_topn_load(self, routing_map: torch.Tensor) -> torch.Tensor:
         """Compute average load of top N experts (for logging).
         
@@ -696,15 +874,16 @@ class RouterTrajectoryTracker:
                 # Mean baseline has no learnable value function
                 value_loss = torch.tensor(0.0, device=device)
             
-            # Entropy bonus
+            # Entropy bonus (normalized per token)
             probs = torch.nn.functional.softmax(routing_logits, dim=-1)
-            entropy = -(probs * log_probs).sum()
+            per_token_entropy = -(probs * log_probs).sum(dim=-1)  # [seq_len, batch]
+            entropy = per_token_entropy.mean()  # Average entropy per token
             
             layer_loss = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
             total_loss += layer_loss
             total_policy_loss += policy_loss
             total_value_loss += value_loss
-            total_entropy += entropy
+            total_entropy += entropy  # Now normalized per token
             total_advantage += advantage
             # Reduce reward to scalar if needed (for scalar mode)
             if isinstance(reward, torch.Tensor):
@@ -735,7 +914,16 @@ class RouterTrajectoryTracker:
             'mean_reward': (total_reward / num_layers).item() if isinstance(total_reward, torch.Tensor) else total_reward / num_layers,
             'avg_topn_load': avg_topn_load,
         }
-        wrap_print_rank_0(f"PPO (scalar, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}, critic_loss={logged_value_loss:.6f}")
+        # More detailed debug output
+        first_layer = sorted_layers[0]
+        _, _, routing_logits_first, _ = trajectory_data[first_layer]
+        wrap_print_rank_0(f"PPO (scalar, baseline={self.baseline_type}) DEBUG: "
+                          f"total_loss={total_loss.item():.6f}, "
+                          f"policy_loss={(total_policy_loss / num_layers).item():.6f}, "
+                          f"entropy={self.last_loss_components['entropy_bonus']:.4f}, "
+                          f"advantage={self.last_loss_components['mean_advantage']:.4f}, "
+                          f"mean_reward={self.last_loss_components['mean_reward']:.4f}, "
+                          f"routing_logits.requires_grad={routing_logits_first.requires_grad}")
         return total_loss
     
     def _compute_ppo_loss_per_token(self, trajectory_data: Dict, old_trajectory_data: Dict = None, 
@@ -896,13 +1084,14 @@ def get_trajectory_tracker() -> RouterTrajectoryTracker:
         try:
             from megatron import get_args
             args = get_args()
-            _global_trajectory_tracker.per_token_rewards = getattr(args, 'rl_per_token_rewards', True)
+            _global_trajectory_tracker.per_token_rewards = getattr(args, 'rl_per_token_rewards', False)
             _global_trajectory_tracker.ppo_entropy_coeff = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
             _global_trajectory_tracker.reward_type = getattr(args, 'rl_reward_type', 'expert0')
             _global_trajectory_tracker.reward_topn = getattr(args, 'rl_reward_topn', 12)
             _global_trajectory_tracker.baseline_type = getattr(args, 'rl_ppo_baseline_type', 'mean')
             _global_trajectory_tracker.critic_hidden_dims = getattr(args, 'rl_critic_hidden_dims', [256])
             _global_trajectory_tracker.critic_lr = getattr(args, 'rl_critic_lr', 1e-3)
+            _global_trajectory_tracker.normalize_rewards = getattr(args, 'rl_normalize_rewards', False)
             _tracker_configured = True
             # Always print configuration for verification (not gated by debug_mode)
             import sys
@@ -912,7 +1101,8 @@ def get_trajectory_tracker() -> RouterTrajectoryTracker:
                   f"per_token_rewards={_global_trajectory_tracker.per_token_rewards}, "
                   f"ppo_entropy_coeff={_global_trajectory_tracker.ppo_entropy_coeff}, "
                   f"critic_hidden_dims={_global_trajectory_tracker.critic_hidden_dims}, "
-                  f"critic_lr={_global_trajectory_tracker.critic_lr}", flush=True)
+                  f"critic_lr={_global_trajectory_tracker.critic_lr}, "
+                  f"normalize_rewards={_global_trajectory_tracker.normalize_rewards}", flush=True)
             sys.stdout.flush()
         except (ImportError, AssertionError) as e:
             # Args not available yet, will retry on next call

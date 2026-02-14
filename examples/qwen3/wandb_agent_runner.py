@@ -26,8 +26,10 @@ def load_combinations(combos_path: str):
 
 
 def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None) -> str:
-    """Build a descriptive run name."""
-    # Merge fixed and sweep params (sweep overrides fixed)
+    """Build a descriptive run name from ONLY the sweep-varying parameters.
+    
+    Fixed params shared across all runs are omitted — they belong in the sweep name.
+    """
     all_params = {}
     if fixed_params:
         all_params.update(fixed_params)
@@ -35,56 +37,68 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
     
     parts = []
     
-    alg = all_params.get('rl_algorithm', 'unknown').lower()
-    parts.append(alg.upper())
+    # Only include parameters that are in sweep_params (i.e., they vary across runs).
+    # Map each sweep param to a short, readable name fragment.
     
-    if all_params.get('rl_per_token_rewards', False):
-        parts.append('token')
-    else:
-        parts.append('batch')
+    # Reward type (short names)
+    if 'rl_reward_type' in sweep_params:
+        _REWARD_SHORT = {
+            'critical_path': 'crit',
+            'topn_load': 'topn',
+            'per_token_topn_binary': 'ptbin',
+            'per_token_load_weighted': 'ptload',
+            'entropy': 'entr',
+            'expert0': 'exp0',
+        }
+        rt = sweep_params['rl_reward_type']
+        parts.append(_REWARD_SHORT.get(rt, rt))
     
-    if alg == 'ppo':
-        ent = all_params.get('rl_ppo_entropy_coeff', 0)
-        parts.append(f'ent{ent}')
-        
-        # Add baseline type info
-        baseline = all_params.get('rl_ppo_baseline_type', 'mean')
-        if baseline == 'critic':
-            dims = all_params.get('rl_critic_hidden_dims', [256])
-            if isinstance(dims, list):
-                dims_str = 'x'.join(str(d) for d in dims)
-            else:
-                dims_str = str(dims)
-            parts.append(f'critic{dims_str}')
-        else:
-            parts.append('mean')
+    # Top-N (only meaningful for topn-based rewards)
+    if 'rl_reward_topn' in sweep_params:
+        parts.append(f'n{sweep_params["rl_reward_topn"]}')
     
-    rlc = all_params.get('rl_loss_coeff', 0)
-    parts.append(f'rlc{rlc}')
+    # RL loss coefficient
+    if 'rl_loss_coeff' in sweep_params:
+        parts.append(f'rlc{sweep_params["rl_loss_coeff"]}')
     
-    # Add discount factor (gamma) if specified
-    gamma = all_params.get('rl_discount_factor', None)
-    if gamma is not None:
-        parts.append(f'g{gamma}')
+    # Discount factor
+    if 'rl_discount_factor' in sweep_params:
+        parts.append(f'g{sweep_params["rl_discount_factor"]}')
     
-    # Add reward type and topn
-    reward_type = all_params.get('rl_reward_type', 'expert0')
-    if reward_type == 'topn_load':
-        topn = all_params.get('rl_reward_topn', -1)
-        parts.append(f'topn{topn}')
-    elif reward_type == 'critical_path':
-        parts.append('crit')
-    elif reward_type == 'entropy':
-        parts.append('entr')
+    # Aux loss coefficient
+    if 'moe_aux_loss_coeff' in sweep_params:
+        v = sweep_params['moe_aux_loss_coeff']
+        parts.append(f'aux{v}' if v and float(v) > 0 else 'noaux')
     
-    # Add reward normalization flag
-    if all_params.get('rl_normalize_rewards', False):
-        parts.append('norm')
+    # RL on/off (for baseline runs)
+    if 'use_rl_loss' in sweep_params and not sweep_params['use_rl_loss']:
+        parts.append('norl')
     
-    # Add aux loss coeff if non-zero
-    aux_coeff = all_params.get('moe_aux_loss_coeff', 0)
-    if aux_coeff and float(aux_coeff) > 0:
-        parts.append(f'aux{aux_coeff}')
+    # Normalize rewards
+    if 'rl_normalize_rewards' in sweep_params:
+        parts.append('norm' if sweep_params['rl_normalize_rewards'] else 'nonorm')
+    
+    # Algorithm (only if it varies)
+    if 'rl_algorithm' in sweep_params:
+        parts.append(sweep_params['rl_algorithm'].upper())
+    
+    # Baseline type (only if it varies)
+    if 'rl_ppo_baseline_type' in sweep_params:
+        parts.append(sweep_params['rl_ppo_baseline_type'])
+    
+    # Entropy coeff (only if it varies)
+    if 'rl_ppo_entropy_coeff' in sweep_params:
+        parts.append(f'ent{sweep_params["rl_ppo_entropy_coeff"]}')
+    
+    # Critic dims (only if it varies)
+    if 'rl_critic_hidden_dims' in sweep_params:
+        dims = sweep_params['rl_critic_hidden_dims']
+        dims_str = 'x'.join(str(d) for d in dims) if isinstance(dims, list) else str(dims)
+        parts.append(f'c{dims_str}')
+    
+    # Fallback: if no parts generated, use a generic label
+    if not parts:
+        parts.append('baseline')
     
     parts.append(f'r{run_index:02d}')
     

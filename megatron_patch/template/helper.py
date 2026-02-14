@@ -294,37 +294,44 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
 
     trajectory_tracker = get_trajectory_tracker()
     
-    # Force configuration from args if baseline_type is still default
-    # This ensures tracker is properly configured even if get_trajectory_tracker silently failed earlier
-    if trajectory_tracker.baseline_type == "mean" and hasattr(args, 'rl_ppo_baseline_type'):
-        if args.rl_ppo_baseline_type != "mean":
-            trajectory_tracker.baseline_type = args.rl_ppo_baseline_type
-            trajectory_tracker.reward_type = getattr(args, 'rl_reward_type', 'expert0')
-            trajectory_tracker.reward_topn = getattr(args, 'rl_reward_topn', 12)
-            trajectory_tracker.per_token_rewards = getattr(args, 'rl_per_token_rewards', True)
-            trajectory_tracker.ppo_entropy_coeff = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
-            trajectory_tracker.critic_hidden_dims = getattr(args, 'rl_critic_hidden_dims', [256])
-            trajectory_tracker.critic_lr = getattr(args, 'rl_critic_lr', 1e-3)
-            print(f"[RL CONFIG FORCED] baseline_type={trajectory_tracker.baseline_type}, "
-                  f"reward_type={trajectory_tracker.reward_type}, reward_topn={trajectory_tracker.reward_topn}, "
-                  f"critic_hidden_dims={trajectory_tracker.critic_hidden_dims}", flush=True)
+    # Always force configuration from args -- get_trajectory_tracker() may have
+    # silently failed to read args during early model construction.
+    trajectory_tracker.baseline_type = getattr(args, 'rl_ppo_baseline_type', 'mean')
+    trajectory_tracker.reward_type = getattr(args, 'rl_reward_type', 'expert0')
+    trajectory_tracker.reward_topn = getattr(args, 'rl_reward_topn', 12)
+    trajectory_tracker.per_token_rewards = getattr(args, 'rl_per_token_rewards', False)
+    # Auto-detect per_token_rewards for reward types that are inherently per-token
+    _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted"}
+    if trajectory_tracker.reward_type in _PER_TOKEN_REWARD_TYPES:
+        trajectory_tracker.per_token_rewards = True
+    trajectory_tracker.ppo_entropy_coeff = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
+    trajectory_tracker.critic_hidden_dims = getattr(args, 'rl_critic_hidden_dims', [256])
+    trajectory_tracker.critic_lr = getattr(args, 'rl_critic_lr', 1e-3)
+    trajectory_tracker.normalize_rewards = getattr(args, 'rl_normalize_rewards', False)
+    print(f"[RL CONFIG] reward_type={trajectory_tracker.reward_type}, "
+          f"baseline_type={trajectory_tracker.baseline_type}, "
+          f"per_token_rewards={trajectory_tracker.per_token_rewards}, "
+          f"reward_topn={trajectory_tracker.reward_topn}, "
+          f"normalize_rewards={trajectory_tracker.normalize_rewards}, "
+          f"critic_hidden_dims={trajectory_tracker.critic_hidden_dims}", flush=True)
     
     rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
     rl_algorithm = getattr(args, 'rl_algorithm', 'reinforce').lower()
+    rl_discount_factor = getattr(args, 'rl_discount_factor', 0.9)
     
     # Compute RL loss based on selected algorithm
     if rl_algorithm == 'ppo':
         rl_loss = trajectory_tracker.compute_ppo_loss(
             trajectory_tracker.layer_decisions,
             trajectory_tracker.old_layer_decisions,
-            discount_factor=0.99,
+            discount_factor=rl_discount_factor,
             clip_ratio=0.2,
             value_coeff=0.5
         )
     else:  # reinforce
         rl_loss = trajectory_tracker.compute_reinforce_loss(
             trajectory_tracker.layer_decisions,
-            discount_factor=0.9
+            discount_factor=rl_discount_factor
         )
     
     # Scale and add RL loss
@@ -353,11 +360,32 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
             loss_dict["rl_avg_topn_load"] = torch.tensor(avg_topn)
             critical_metrics['critical/avg_topn_load'] = float(avg_topn)
 
-    # Optional lightweight debug: report RL vs LM magnitudes on main rank
+    # Gradient magnitude diagnostic: compute RL gradient norms on routing logits
+    # Uses layer_decisions (current iteration) since rl_loss was computed from them.
+    # Previously this used old_layer_decisions which are from the previous iteration
+    # and have no computational connection to rl_loss, so gradients were always None.
     try:
         from megatron.core import parallel_state as mpu
         if mpu.get_data_parallel_rank() == 0:
             print_rank_0(f"[RL DEBUG] rl_loss={rl_loss.item():.4e}, lm_loss={averaged_loss.item():.4e}", override_debug_mode=False)
+            
+            # Compute gradient norms of RL loss w.r.t. routing logits (sample first layer)
+            if rl_loss.requires_grad and len(trajectory_tracker.layer_decisions) > 0:
+                sample_layer = min(trajectory_tracker.layer_decisions.keys())
+                _, _, routing_logits_sample, _ = trajectory_tracker.layer_decisions[sample_layer]
+                if routing_logits_sample.requires_grad and routing_logits_sample.grad_fn is not None:
+                    try:
+                        rl_grads = torch.autograd.grad(
+                            rl_loss, routing_logits_sample,
+                            retain_graph=True, allow_unused=True
+                        )
+                        if rl_grads[0] is not None:
+                            rl_grad_norm = rl_grads[0].norm().item()
+                            rl_grad_mean = rl_grads[0].abs().mean().item()
+                            loss_dict["rl_grad_norm_on_logits"] = torch.tensor(rl_grad_norm)
+                            loss_dict["rl_grad_mean_on_logits"] = torch.tensor(rl_grad_mean)
+                    except Exception:
+                        pass  # Don't crash training for diagnostic logging
     except Exception:
         pass
 
@@ -405,6 +433,7 @@ def forward_step(data_iterator, model):
         output_tensor = model(tokens, position_ids, attention_mask, labels=labels, packed_seq_params=packed_seq_params)
 
     # Choose loss function based on CLI arg parsed by Megatron
-    use_rl_loss = getattr(args, 'use_rl_loss', False)
+    # During eval (no grad), skip RL loss to avoid trajectory tracker issues and wasted compute
+    use_rl_loss = getattr(args, 'use_rl_loss', False) and torch.is_grad_enabled()
     selected_loss_func = loss_func_with_rl if use_rl_loss else loss_func
     return output_tensor, partial(selected_loss_func, loss_mask, num_seqs)

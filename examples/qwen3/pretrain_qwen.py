@@ -103,49 +103,124 @@ def setup_wandb_logging():
                 
                 return result
             
-            # Also enhance evaluate_and_print_results for evaluation metrics
+            # --- Deterministic eval: always evaluate on the same data ---
+            # Capture the validation dataloader so we can rebuild a fresh iterator
+            # before each eval, ensuring the same samples are used every time.
+            _eval_state = {"iteration": 0, "valid_dataloader": None}
+            
             try:
-                from megatron.training.training import evaluate_and_print_results as original_evaluate
+                from megatron.training.training import (
+                    evaluate as original_evaluate_fn,
+                    evaluate_and_print_results as original_eval_and_print,
+                    build_train_valid_test_data_loaders as original_build_loaders,
+                )
+                from megatron.core.rerun_state_machine import RerunDataIterator
                 
-                def enhanced_evaluate_and_print_results(prefix, forward_step_func, 
-                                                       data_iterator, model, 
-                                                       process_non_loss_data_func, config,
-                                                       *args, **kwargs):
-                    """Enhanced evaluate function with Wandb integration"""
+                def capturing_build_loaders(build_train_valid_test_datasets_provider):
+                    """Wrap build_train_valid_test_data_loaders to capture valid dataloader."""
+                    train_dl, valid_dl, test_dl = original_build_loaders(
+                        build_train_valid_test_datasets_provider
+                    )
+                    _eval_state["valid_dataloader"] = valid_dl
+                    if valid_dl is not None:
+                        print_rank_0(f"[EVAL] Captured validation dataloader "
+                                     f"(dataset size={len(valid_dl.dataset)})")
+                    return train_dl, valid_dl, test_dl
+                
+                training_module.build_train_valid_test_data_loaders = capturing_build_loaders
+                
+                def _make_fresh_valid_iterator():
+                    """Build a fresh validation data iterator starting from sample 0."""
+                    from megatron.legacy.data.data_samplers import build_pretraining_data_loader
+                    valid_dl = _eval_state.get("valid_dataloader")
+                    if valid_dl is None:
+                        return None
+                    # Rebuild the dataloader with consumed_samples=0
+                    fresh_dl = build_pretraining_data_loader(valid_dl.dataset, consumed_samples=0)
+                    return RerunDataIterator(iter(fresh_dl))
+                
+                def enhanced_evaluate(forward_step_func, data_iterator, model,
+                                      process_non_loss_data_func, config, 
+                                      verbose=False, non_loss_data_func=None):
+                    """Wrap evaluate() to use fresh data iterator and log metrics to WandB."""
+                    args = get_args()
                     
-                    # Call original function first (pass all args to handle signature changes)
-                    result = original_evaluate(prefix, forward_step_func, data_iterator, model, 
-                                             process_non_loss_data_func, config, *args, **kwargs)
+                    # Replace data_iterator with a fresh one starting from sample 0
+                    # so the same eval data is used every time
+                    fresh_iter = _make_fresh_valid_iterator()
+                    if fresh_iter is not None:
+                        data_iterator = fresh_iter
                     
-                    # Extract iteration for wandb logging
-                    iteration = kwargs.get('iteration', 0)
+                    # Save consumed_valid_samples so we always start from 0
+                    saved_consumed = args.consumed_valid_samples
+                    args.consumed_valid_samples = 0
                     
-                    # Add Wandb logging for evaluation metrics
+                    total_loss_dict, collected_non_loss_data, timelimit = original_evaluate_fn(
+                        forward_step_func, data_iterator, model,
+                        process_non_loss_data_func, config, verbose, non_loss_data_func,
+                    )
+                    
+                    # Restore consumed_valid_samples (don't let it accumulate)
+                    args.consumed_valid_samples = saved_consumed
+                    
+                    if timelimit or total_loss_dict is None:
+                        return total_loss_dict, collected_non_loss_data, timelimit
+                    
+                    # Log all eval metrics to WandB
                     try:
                         rank = mpu.get_data_parallel_rank()
-                        if rank == 0 and iteration > 0:
+                        if rank == 0:
                             eval_metrics = {}
+                            for key, value in total_loss_dict.items():
+                                try:
+                                    v = value.item() if hasattr(value, 'item') else float(value)
+                                    eval_metrics[f"eval/{key}"] = v
+                                except Exception:
+                                    pass
                             
-                            # Log evaluation results if available
-                            if hasattr(result, 'items'):
-                                for key, value in result.items():
-                                    try:
-                                        if hasattr(value, 'item'):
-                                            eval_metrics[f"eval/{prefix}_{key}"] = value.item()
-                                        else:
-                                            eval_metrics[f"eval/{prefix}_{key}"] = float(value)
-                                    except:
-                                        pass
+                            # Critical eval metrics: curated subset with clean names
+                            # for easy WandB dashboard viewing
+                            _CRITICAL_EVAL_MAP = {
+                                "lm loss": "critical_eval/lm_loss",
+                                "num_tokens_on_critical_path": "critical_eval/critical_path",
+                                "aux_loss": "critical_eval/aux_loss",
+                                "load_balancing_entropy": "critical_eval/lb_entropy",
+                                "max_tokens_per_expert": "critical_eval/max_tokens_per_expert",
+                                "rl_loss": "critical_eval/rl_loss",
+                                "rl_mean_reward": "critical_eval/rl_mean_reward",
+                                "rl_value_loss": "critical_eval/rl_value_loss",
+                                "rl_policy_loss": "critical_eval/rl_policy_loss",
+                                "rl_entropy_bonus": "critical_eval/rl_entropy_bonus",
+                                "rl_grad_norm_on_logits": "critical_eval/rl_grad_norm",
+                            }
+                            for raw_key, clean_key in _CRITICAL_EVAL_MAP.items():
+                                if f"eval/{raw_key}" in eval_metrics:
+                                    eval_metrics[clean_key] = eval_metrics[f"eval/{raw_key}"]
                             
                             if eval_metrics:
+                                iteration = _eval_state.get("iteration", 0)
                                 wandb.log(eval_metrics, step=iteration)
-                    
+                                print_rank_0(f"[EVAL] Logged {len(eval_metrics)} eval metrics "
+                                             f"to WandB at step {iteration}")
                     except Exception as e:
                         print_rank_0(f"ERROR: Failed to log eval metrics to wandb: {e}")
                     
-                    return result
+                    return total_loss_dict, collected_non_loss_data, timelimit
                 
-                # Now training_module is available
+                def enhanced_evaluate_and_print_results(prefix, forward_step_func,
+                                                       data_iterator, model, iteration,
+                                                       process_non_loss_data_func, config,
+                                                       verbose=False, write_to_tensorboard=True,
+                                                       non_loss_data_func=None):
+                    """Capture iteration for the evaluate wrapper, then call original."""
+                    _eval_state["iteration"] = iteration
+                    return original_eval_and_print(
+                        prefix, forward_step_func, data_iterator, model, iteration,
+                        process_non_loss_data_func, config, verbose, write_to_tensorboard,
+                        non_loss_data_func,
+                    )
+                
+                training_module.evaluate = enhanced_evaluate
                 training_module.evaluate_and_print_results = enhanced_evaluate_and_print_results
                 
             except Exception as e:
@@ -361,14 +436,18 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
                     "use_rl_loss": args.use_rl_loss,
                 }
                 
-                # Add RL-specific parameters only if RL loss is enabled
-                if args.use_rl_loss:
-                    primary_config["rl_algorithm"] = args.rl_algorithm
-                    primary_config["rl_loss_coeff"] = args.rl_loss_coeff
-                    primary_config["rl_per_token_rewards"] = getattr(args, 'rl_per_token_rewards', False)
-                    primary_config["rl_ppo_entropy_coeff"] = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
-                    primary_config["rl_ppo_baseline_type"] = getattr(args, 'rl_ppo_baseline_type', 'mean')
-                    primary_config["rl_critic_hidden_dims"] = getattr(args, 'rl_critic_hidden_dims', [256])
+                # Always log RL parameters so they're filterable/groupable in wandb
+                # (even when RL is off, knowing the RL config is useful for sweep analysis)
+                primary_config["rl_algorithm"] = getattr(args, 'rl_algorithm', None)
+                primary_config["rl_loss_coeff"] = getattr(args, 'rl_loss_coeff', 0)
+                primary_config["rl_per_token_rewards"] = getattr(args, 'rl_per_token_rewards', False)
+                primary_config["rl_ppo_entropy_coeff"] = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
+                primary_config["rl_ppo_baseline_type"] = getattr(args, 'rl_ppo_baseline_type', 'mean')
+                primary_config["rl_critic_hidden_dims"] = getattr(args, 'rl_critic_hidden_dims', [256])
+                primary_config["rl_reward_type"] = getattr(args, 'rl_reward_type', None)
+                primary_config["rl_reward_topn"] = getattr(args, 'rl_reward_topn', None)
+                primary_config["rl_discount_factor"] = getattr(args, 'rl_discount_factor', None)
+                primary_config["rl_normalize_rewards"] = getattr(args, 'rl_normalize_rewards', False)
                 
                 # Secondary/advanced hyperparameters - only include non-None values
                 secondary_config = {}

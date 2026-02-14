@@ -533,10 +533,19 @@ def get_patch_args(parser):
                       help='Type of baseline for PPO advantage calculation: mean (simple average) or critic (learned value function)')
     group.add_argument('--rl-critic-hidden-dims', type=int, nargs='+', default=[256],
                       help='Hidden dimensions for critic network layers (default: 256). Examples: "256" for 1 layer, "256 64 32" for 3 layers')
-    group.add_argument('--rl-reward-type', type=str, default='expert0', choices=['expert0', 'entropy', 'topn_load'],
-                      help='Reward function type: expert0 (focus on expert 0), entropy (load balance entropy), topn_load (negative avg load of top N experts)')
+    group.add_argument('--rl-reward-type', type=str, default='expert0',
+                      choices=['expert0', 'entropy', 'topn_load', 'critical_path',
+                               'per_token_topn_binary', 'per_token_load_weighted'],
+                      help='Reward function type: expert0 (focus on expert 0), entropy (load balance entropy), '
+                           'topn_load (avg/topN load ratio), critical_path (directly targets max expert load), '
+                           'per_token_topn_binary (per-token: -1 if hot expert, +1 otherwise), '
+                           'per_token_load_weighted (per-token: continuous reward based on chosen expert load)')
     group.add_argument('--rl-reward-topn', type=int, default=12,
                       help='Number of top experts to consider for topn_load reward (default: 12)')
+    group.add_argument('--rl-discount-factor', type=float, default=0.9,
+                      help='Discount factor (gamma) for RL returns calculation (default: 0.9). Lower values weight immediate rewards more.')
+    group.add_argument('--rl-normalize-rewards', action='store_true', default=False,
+                      help='Enable running-mean/std reward normalization. Expands compressed reward ranges to [-1, +1] for stronger RL gradients.')
     group.add_argument('--enable-wandb-logging', action='store_true', default=False,
                       help='Enable wandb logging for training metrics')
     group.add_argument('--wandb-project-name', type=str, default='qwen3-moe-training',
