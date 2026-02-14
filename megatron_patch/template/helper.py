@@ -36,6 +36,22 @@ from megatron_patch.data.utils import (
 )
 from megatron.training.utils import print_rank_0
 
+# --- KL divergence constraint state ---
+# Stores frozen reference router weights and captured logits for KL loss computation.
+# Initialized lazily on first forward_step call when kl_loss_coeff > 0.
+_kl_state = {
+    'ref_router_weights': None,   # dict: param_name -> frozen tensor
+    'current_logits': None,       # captured by output_layer hook (in grad graph)
+    'ref_logits': None,           # from reference forward (detached)
+    'initialized': False,
+}
+
+def _kl_capture_logits_hook(module, input, output):
+    """Forward hook on output_layer to capture logits from normal forward pass."""
+    # output is (logits, bias) tuple from ColumnParallelLinear
+    logits = output[0] if isinstance(output, tuple) else output
+    _kl_state['current_logits'] = logits
+
 def get_batch(data_iterator):
     """Generate a batch."""
     args = get_args()
@@ -399,6 +415,36 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     except Exception:
         pass
 
+    # --- KL divergence constraint ---
+    kl_loss_coeff = getattr(args, 'kl_loss_coeff', 0.0)
+    if kl_loss_coeff > 0 and _kl_state['current_logits'] is not None and _kl_state['ref_logits'] is not None:
+        try:
+            import torch.nn.functional as F
+            cur_logits = _kl_state['current_logits']  # [seq, batch, vocab] — in grad graph
+            ref_logits = _kl_state['ref_logits']       # [batch, seq, vocab] — detached
+
+            # Align shapes: ref_logits is [batch, seq, vocab] (transposed by _postprocess when labels=None)
+            # cur_logits is [seq, batch, vocab] (raw from output_layer)
+            ref_logits = ref_logits.transpose(0, 1)  # [seq, batch, vocab]
+
+            # Compute KL(current || reference) per token, then average
+            cur_log_probs = F.log_softmax(cur_logits.float(), dim=-1)
+            ref_probs = F.softmax(ref_logits.float(), dim=-1)
+            # F.kl_div expects log_probs as input, probs as target
+            kl_per_token = F.kl_div(cur_log_probs, ref_probs, reduction='none').sum(dim=-1)  # [seq, batch]
+            kl_loss = kl_per_token.mean()
+
+            # Scale and add to RL loss (will be combined with LM loss below)
+            scaled_kl = kl_loss_coeff * kl_loss
+            rl_loss = rl_loss + scaled_kl
+
+            loss_dict['kl_loss'] = kl_loss.detach()
+            critical_metrics['critical/kl_loss'] = kl_loss.item()
+            print_rank_0(f"[KL] kl_loss={kl_loss.item():.4e}, scaled={scaled_kl.item():.4e}",
+                        override_debug_mode=False)
+        except Exception as e:
+            print_rank_0(f"[KL] WARNING: KL computation failed: {e}")
+
     # Reset trajectory for next iteration
     reset_trajectory_tracker()
     # Scale RL loss to match the LM loss scale (RL loss is averaged, LM loss is summed)
@@ -412,6 +458,64 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         return loss[0] / loss[1] * args.context_parallel_size, loss_dict
     return loss[0] * args.context_parallel_size, num_seqs.sum(), loss_dict   
 
+def _init_kl_state(model):
+    """One-time initialization: snapshot router weights and register logit capture hook."""
+    if _kl_state['initialized']:
+        return
+    
+    # Snapshot all router weights (frozen reference)
+    ref_weights = {}
+    for name, param in model.named_parameters():
+        if 'router' in name and 'weight' in name:
+            ref_weights[name] = param.data.clone().detach()
+    _kl_state['ref_router_weights'] = ref_weights
+    
+    # Register forward hook on output_layer to capture logits
+    if hasattr(model, 'output_layer'):
+        model.output_layer.register_forward_hook(_kl_capture_logits_hook)
+        print_rank_0(f"[KL] Registered logit capture hook on output_layer, "
+                     f"snapshotted {len(ref_weights)} router weight tensors")
+    elif hasattr(model, 'module') and hasattr(model.module, 'output_layer'):
+        # Handle DDP/wrapped models
+        model.module.output_layer.register_forward_hook(_kl_capture_logits_hook)
+        print_rank_0(f"[KL] Registered logit capture hook on module.output_layer, "
+                     f"snapshotted {len(ref_weights)} router weight tensors")
+    else:
+        print_rank_0("[KL] WARNING: Could not find output_layer on model, KL constraint disabled")
+    
+    _kl_state['initialized'] = True
+
+
+def _run_reference_forward(model, tokens, position_ids, attention_mask, packed_seq_params):
+    """Run a no-grad forward with frozen router weights to get reference logits."""
+    ref_weights = _kl_state['ref_router_weights']
+    if not ref_weights:
+        return
+    
+    # Save current router weights and swap in frozen reference
+    saved_weights = {}
+    for name, param in model.named_parameters():
+        if name in ref_weights:
+            saved_weights[name] = param.data.clone()
+            param.data.copy_(ref_weights[name])
+    
+    # Reference forward (no grad, labels=None to get logits)
+    try:
+        with torch.no_grad():
+            ref_logits = model(tokens, position_ids, attention_mask,
+                               labels=None, packed_seq_params=packed_seq_params)
+            # ref_logits shape: [batch, seq, vocab] (transposed in _postprocess when labels=None)
+            _kl_state['ref_logits'] = ref_logits.detach()
+    except Exception as e:
+        print_rank_0(f"[KL] WARNING: Reference forward failed: {e}")
+        _kl_state['ref_logits'] = None
+    finally:
+        # Restore current router weights
+        for name, param in model.named_parameters():
+            if name in saved_weights:
+                param.data.copy_(saved_weights[name])
+
+
 def forward_step(data_iterator, model):
     """Forward training step.
 
@@ -422,15 +526,30 @@ def forward_step(data_iterator, model):
     timers = get_timers()
     args = get_args()
 
+    kl_loss_coeff = getattr(args, 'kl_loss_coeff', 0.0)
+
+    # One-time KL initialization (snapshot reference weights, register hook)
+    if kl_loss_coeff > 0 and not _kl_state['initialized']:
+        _init_kl_state(model)
+
     # Get the batch.
     timers("batch-generator", log_level=2).start()
     tokens, labels, loss_mask, attention_mask, position_ids, num_seqs, packed_seq_params = get_batch(data_iterator)
     timers("batch-generator").stop()
+
+    # Clear previous logits
+    _kl_state['current_logits'] = None
+
     if 'loss_mask' in inspect.signature(GPTModel.forward).parameters:
         # NOTE: MTP-head (since 0328) requires loss_mask to compute correct loss scale.
         output_tensor = model(tokens, position_ids, attention_mask, labels=labels, packed_seq_params=packed_seq_params, loss_mask=loss_mask)
     else:
         output_tensor = model(tokens, position_ids, attention_mask, labels=labels, packed_seq_params=packed_seq_params)
+    # After normal forward, _kl_state['current_logits'] is populated by the hook (if KL enabled)
+
+    # Run reference forward for KL constraint (only during training with grad)
+    if kl_loss_coeff > 0 and torch.is_grad_enabled():
+        _run_reference_forward(model, tokens, position_ids, attention_mask, packed_seq_params)
 
     # Choose loss function based on CLI arg parsed by Megatron
     # During eval (no grad), skip RL loss to avoid trajectory tracker issues and wasted compute

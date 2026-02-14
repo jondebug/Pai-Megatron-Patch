@@ -546,6 +546,10 @@ def get_patch_args(parser):
                       help='Discount factor (gamma) for RL returns calculation (default: 0.9). Lower values weight immediate rewards more.')
     group.add_argument('--rl-normalize-rewards', action='store_true', default=False,
                       help='Enable running-mean/std reward normalization. Expands compressed reward ranges to [-1, +1] for stronger RL gradients.')
+    group.add_argument('--kl-loss-coeff', type=float, default=0.0,
+                      help='KL divergence loss coefficient. 0 = disabled. '
+                           'Penalizes deviation of LM output distribution from pretrained reference. '
+                           'Requires one extra no-grad forward pass per step (~1.5x wall time).')
     group.add_argument('--enable-wandb-logging', action='store_true', default=False,
                       help='Enable wandb logging for training metrics')
     group.add_argument('--wandb-project-name', type=str, default='qwen3-moe-training',

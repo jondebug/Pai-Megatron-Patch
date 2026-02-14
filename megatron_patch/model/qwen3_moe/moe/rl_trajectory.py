@@ -429,31 +429,46 @@ class RouterTrajectoryTracker:
         return -(max_load - ideal_load) / ideal_load.clamp(min=1.0)
 
     def per_token_topn_binary_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
-        """Per-token reward: -1 if token routes to a top-N loaded expert, +1 otherwise.
+        """Per-token reward based on how many of the token's chosen experts are overloaded.
         
-        Provides token-level credit assignment: tokens that contribute to
-        overloading get penalized, tokens that avoid hot experts get rewarded.
+        Counts how many of each token's top-k chosen experts fall in the top-N
+        most loaded experts, then scales linearly:
+            reward = 1 - 2 * (num_hot / topk)
+        
+        Examples (with topk=8, reward_topn=6):
+            0 of 8 chosen are hot -> reward = +1.0  (great routing)
+            2 of 8 chosen are hot -> reward = +0.5
+            4 of 8 chosen are hot -> reward =  0.0  (neutral)
+            6 of 8 chosen are hot -> reward = -0.5
+            8 of 8 chosen are hot -> reward = -1.0  (worst case)
+        
+        This avoids saturation: even with large N, tokens that route fewer
+        experts to hot ones get better rewards than tokens that route many.
         
         Args:
             routing_map: Tensor of shape [seq_length, batch_size, num_experts]
             
         Returns:
-            reward: Tensor of shape [seq_length, batch_size], values in {-1, +1}
+            reward: Tensor of shape [seq_length, batch_size], values in [-1, +1]
         """
         expert_loads = routing_map.sum(dim=(0, 1)).float()  # [num_experts]
         _, topn_idx = expert_loads.topk(self.reward_topn)
         
         # Build mask: is each expert in the top-N most loaded?
-        is_hot = torch.zeros(routing_map.shape[-1], device=routing_map.device, dtype=torch.bool)
-        is_hot[topn_idx] = True
+        is_hot = torch.zeros(routing_map.shape[-1], device=routing_map.device, dtype=torch.float32)
+        is_hot[topn_idx] = 1.0
         
-        # For each token, check if ANY of its chosen experts is hot
-        # routing_map: [seq, batch, E], is_hot: [E] -> broadcast multiply -> sum over E
-        token_hits_hot = (routing_map.float() * is_hot.float()).sum(dim=-1) > 0  # [seq, batch]
+        # Count how many of each token's chosen experts are hot
+        # routing_map: [seq, batch, E], is_hot: [E] -> [seq, batch]
+        num_hot = (routing_map.float() * is_hot).sum(dim=-1)
         
-        return torch.where(token_hits_hot,
-                           torch.tensor(-1.0, device=routing_map.device),
-                           torch.tensor(1.0, device=routing_map.device))
+        # Total experts chosen per token (topk)
+        num_chosen = routing_map.float().sum(dim=-1).clamp(min=1.0)
+        
+        # Linear scale: 1 (no hot experts) to -1 (all hot experts)
+        reward = 1.0 - 2.0 * (num_hot / num_chosen)
+        
+        return reward
 
     def per_token_load_weighted_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
         """Per-token reward proportional to how overloaded the chosen experts are.
