@@ -1,0 +1,98 @@
+{
+    "_comment": "Per-token RL reward sweep: token-level credit assignment for routing optimization",
+    "_rationale": [
+        "Previous scalar rewards (critical_path, topn_load) failed because:",
+        "1. A single scalar reward shared across all tokens provides no credit assignment",
+        "2. Every token gets the same advantage, so REINFORCE pushes wrong tokens in wrong directions",
+        "3. Batch-to-batch data variation dominates the reward signal",
+        "",
+        "This sweep tests per-token reward functions that tell each token whether",
+        "IT specifically routed to an overloaded expert:",
+        "- per_token_topn_binary: binary -1/+1 based on whether token hits a top-N loaded expert",
+        "- per_token_load_weighted: continuous reward proportional to chosen expert's load vs ideal",
+        "- critical_path: scalar baseline for comparison (the old approach)",
+        "",
+        "Fixed: normalize=true, rlc=2.0, PPO+critic, discount=1.0 (layers are independent)"
+    ],
+    
+    "sweep_name": "per_token_rl_sweep",
+    
+    "env": "dsw",
+    "model_size": "A3B",
+    "batch_size": 1,
+    "global_batch_size": 8,
+    "lr": "1e-4",
+    "min_lr": "1e-6",
+    "seq_len": 128,
+    "pad_len": 128,
+    "precision": "bf16",
+    
+    "tp": 1,
+    "pp": 1,
+    "cp": 1,
+    "etp": 1,
+    "ep": 4,
+    "sp": true,
+    "do": true,
+    "fl": true,
+    "sft": false,
+    
+    "ac": "sel",
+    "optimizer_offload": false,
+    "save_interval": 1500,
+    "train_iters": 1500,
+    "eval_interval": 200,
+    "eval_iters": 50,
+    "dataset_path": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-datasets/mmap_qwen3_datasets_text_document",
+    "valid_dataset_path": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-datasets/mmap_qwen3_datasets_text_document",
+    "pretrain_checkpoint_path": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-ckpts/Qwen3-30B-A3B-to-mcore",
+    "train_tokens": 1024000,
+    "warmup_tokens": 10240,
+    "output_basepath": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/output_router_finetuning",
+    
+    "router_only_training": true,
+    "enable_wandb_logging": true,
+    "wandb_project_name": "qwen3-router-training",
+    "wandb_run_name_base": "per-token-rl-sweep",
+    "wandb_run_tags": ["router-only", "moe-training", "per-token-rl"],
+    
+    "_fixed_rl_params": "Fixed RL parameters based on previous sweep analysis",
+    "rl_algorithm": ["ppo"],
+    "rl_ppo_baseline_type": "critic",
+    "rl_critic_hidden_dims": [[256]],
+    "rl_ppo_entropy_coeff": [0.01],
+    "rl_loss_coeff": [0.1, 0.05, 0.01],
+    "rl_normalize_rewards": [true],
+    "rl_discount_factor": [0.2, 0.95],
+    "rl_reward_topn": [1, 2, 6],
+
+    "_sweep_comment": "Sweep axes: reward_type x aux_loss_coeff, plus aux-only baseline",
+    
+    "use_rl_loss": [true, false],
+    "rl_reward_type": ["per_token_topn_binary", "per_token_load_weighted", "critical_path"],
+    "moe_aux_loss_coeff": [0, 0.01],
+
+    "_filters_comment": "Filters to create meaningful combinations",
+    "filters": [
+        {
+            "_comment": "RL OFF baselines: only vary aux_loss_coeff, collapse all RL params",
+            "if": {"use_rl_loss": false},
+            "collapse": ["rl_loss_coeff", "rl_reward_type", "rl_normalize_rewards", "rl_reward_topn", "rl_algorithm", "rl_ppo_entropy_coeff", "rl_critic_hidden_dims"]
+        },
+        {
+            "_comment": "Aux-only baseline: skip the no-aux no-rl case (nothing would change)",
+            "if": {"use_rl_loss": false, "moe_aux_loss_coeff": 0},
+            "skip": true
+        },
+        {
+            "_comment": "critical_path doesn't use topn",
+            "if": {"rl_reward_type": "critical_path"},
+            "collapse": ["rl_reward_topn"]
+        },
+        {
+            "_comment": "per_token_load_weighted doesn't use topn (uses all expert loads continuously)",
+            "if": {"rl_reward_type": "per_token_load_weighted"},
+            "collapse": ["rl_reward_topn"]
+        }
+    ]
+}
