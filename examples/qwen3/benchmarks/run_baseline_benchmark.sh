@@ -10,12 +10,14 @@
 
 # =============================================================================
 # Baseline benchmark: measure critical path on pretrained Qwen3-30B-A3B
+# Runs inside the same container as training jobs.
 # =============================================================================
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/examples/qwen3/benchmarks"
 MODEL_PATH="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-ckpts/Qwen3-30B-A3B-complete"
 OUTPUT_DIR="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/benchmark_results"
+CONTAINER_IMAGE="/lustre/fsw/portfolios/nvr/users/jonathanp/containers/pai-megatron-patch_25.04.sqsh"
 NUM_BATCHES=100
 BATCH_SIZE=1
 SEQ_LENGTH=128
@@ -27,39 +29,41 @@ echo "Baseline Benchmark: Qwen3-30B-A3B (pretrained)"
 echo "============================================================"
 echo "Model:       ${MODEL_PATH}"
 echo "Output:      ${OUTPUT_DIR}"
+echo "Container:   ${CONTAINER_IMAGE}"
 echo "Batches:     ${NUM_BATCHES}"
 echo "Batch Size:  ${BATCH_SIZE}"
 echo "Seq Length:  ${SEQ_LENGTH}"
-echo "GPUs:        $(nvidia-smi -L 2>/dev/null | wc -l)"
 echo "============================================================"
 
-# Install dependencies if needed
-pip install -q wandb 2>/dev/null || true
+srun --container-image="${CONTAINER_IMAGE}" \
+     --container-mounts="$HOME:$HOME,/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing:/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing" \
+     --container-workdir="${SCRIPT_DIR}" \
+     bash -c "
+         pip install wandb --quiet 2>/dev/null
 
-# Run critical path measurement
-echo ""
-echo ">>> Measuring critical path metrics..."
-python3 "${SCRIPT_DIR}/measure_critical_path.py" \
-    --model-path "${MODEL_PATH}" \
-    --num-batches "${NUM_BATCHES}" \
-    --batch-size "${BATCH_SIZE}" \
-    --seq-length "${SEQ_LENGTH}" \
-    --output-file "${OUTPUT_DIR}/critical_path_baseline.json" \
-    --label "Qwen3-30B-A3B-pretrained"
+         echo '>>> Measuring critical path metrics...'
+         python3 ${SCRIPT_DIR}/measure_critical_path.py \
+             --model-path ${MODEL_PATH} \
+             --num-batches ${NUM_BATCHES} \
+             --batch-size ${BATCH_SIZE} \
+             --seq-length ${SEQ_LENGTH} \
+             --output-file ${OUTPUT_DIR}/critical_path_baseline.json \
+             --label Qwen3-30B-A3B-pretrained \
+             --device auto
 
-# Run latency measurement
-echo ""
-echo ">>> Measuring inference latency..."
-python3 "${SCRIPT_DIR}/measure_latency.py" \
-    --model-path "${MODEL_PATH}" \
-    --num-batches "${NUM_BATCHES}" \
-    --warmup-batches 10 \
-    --batch-size "${BATCH_SIZE}" \
-    --seq-length "${SEQ_LENGTH}" \
-    --output-file "${OUTPUT_DIR}/latency_baseline.json" \
-    --label "Qwen3-30B-A3B-pretrained"
+         echo '>>> Measuring inference latency...'
+         python3 ${SCRIPT_DIR}/measure_latency.py \
+             --model-path ${MODEL_PATH} \
+             --num-batches ${NUM_BATCHES} \
+             --warmup-batches 10 \
+             --batch-size ${BATCH_SIZE} \
+             --seq-length ${SEQ_LENGTH} \
+             --output-file ${OUTPUT_DIR}/latency_baseline.json \
+             --label Qwen3-30B-A3B-pretrained \
+             --device cuda:0
+     "
 
-# Log results to WandB
+# Log results to WandB (runs outside container, uses system python)
 echo ""
 echo ">>> Logging results to WandB..."
 python3 << 'PYEOF'
