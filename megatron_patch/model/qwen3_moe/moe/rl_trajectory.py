@@ -264,12 +264,14 @@ class RouterTrajectoryTracker:
         """Load critic state from checkpoint."""
         if 'critic_state_dict' not in state_dict:
             return
-        # Ensure critic exists (need input_dim, so we defer if not created yet)
         if self._critic is not None:
-            self._critic.load_state_dict(state_dict['critic_state_dict'])
-            if self._critic_optimizer and state_dict.get('critic_optimizer_state_dict'):
-                self._critic_optimizer.load_state_dict(state_dict['critic_optimizer_state_dict'])
-            wrap_print_rank_0(f"[RL DEBUG] Loaded critic state from checkpoint")
+            try:
+                self._critic.load_state_dict(state_dict['critic_state_dict'])
+                if self._critic_optimizer and state_dict.get('critic_optimizer_state_dict'):
+                    self._critic_optimizer.load_state_dict(state_dict['critic_optimizer_state_dict'])
+                wrap_print_rank_0(f"[RL DEBUG] Loaded critic state from checkpoint")
+            except RuntimeError as e:
+                wrap_print_rank_0(f"[RL WARNING] Could not load critic checkpoint (dimension mismatch?): {e}. Starting critic fresh.")
     
     def compute_critic_baseline(self, latent_representations: torch.Tensor, layer_num: int = None) -> torch.Tensor:
         """Compute baseline values using the critic network.
