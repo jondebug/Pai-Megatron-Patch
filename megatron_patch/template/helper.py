@@ -365,10 +365,14 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         loss_dict["rl_entropy_bonus"] = torch.tensor(components.get('entropy_bonus', 0.0))
         loss_dict["rl_mean_advantage"] = torch.tensor(components.get('mean_advantage', 0.0))
         loss_dict["rl_mean_reward"] = torch.tensor(components.get('mean_reward', 0.0))
+        loss_dict["rl_advantage_std"] = torch.tensor(components.get('advantage_std', 0.0))
+        loss_dict["rl_advantage_min"] = torch.tensor(components.get('advantage_min', 0.0))
+        loss_dict["rl_advantage_max"] = torch.tensor(components.get('advantage_max', 0.0))
         
         # Critical metrics for policy and value loss
         critical_metrics['critical/policy_loss'] = policy_loss.item() if hasattr(policy_loss, 'item') else float(policy_loss)
         critical_metrics['critical/value_loss'] = value_loss.item() if hasattr(value_loss, 'item') else float(value_loss)
+        critical_metrics['critical/advantage_std'] = float(components.get('advantage_std', 0.0))
         
         # Only log avg_topn_load when using topn_load reward
         avg_topn = components.get('avg_topn_load', 0.0)

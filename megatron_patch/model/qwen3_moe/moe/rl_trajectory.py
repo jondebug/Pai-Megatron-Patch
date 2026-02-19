@@ -711,6 +711,13 @@ class RouterTrajectoryTracker:
         for layer_num in sorted_layers:
             layer_advantages[layer_num] = (layer_returns[layer_num] - layer_baselines[layer_num]).detach()
         
+        # Normalize advantages across all tokens and layers to zero mean, unit variance
+        all_advs = torch.cat([layer_advantages[ln].flatten() for ln in sorted_layers])
+        adv_mean = all_advs.mean()
+        adv_std = all_advs.std().clamp(min=1e-8)
+        for ln in sorted_layers:
+            layer_advantages[ln] = (layer_advantages[ln] - adv_mean) / adv_std
+        
         total_loss = torch.tensor(0.0, device=device)
         total_tokens = 0
         
@@ -718,12 +725,10 @@ class RouterTrajectoryTracker:
             _, routing_map, routing_logits, reward = trajectory_data[layer_num]
             advantages = layer_advantages[layer_num]  # [seq_length, batch_size]
             
-            # Get log probabilities of chosen actions from router logits
             log_probs = torch.nn.functional.log_softmax(routing_logits, dim=-1)
             chosen_log_probs = log_probs * routing_map.float()
             per_token_log_prob = chosen_log_probs.sum(dim=-1)  # [seq_length, batch_size]
             
-            # REINFORCE loss: -log_prob(action) * advantage, per token
             per_token_loss = -per_token_log_prob * advantages
             
             layer_loss = per_token_loss.sum()
@@ -731,7 +736,7 @@ class RouterTrajectoryTracker:
             total_tokens += per_token_loss.numel()
             
             if layer_num == sorted_layers[0]:
-                wrap_print_rank_0(f"REINFORCE (per-token) Layer {layer_num}: advantages_mean={advantages.mean().item():.4f}")
+                wrap_print_rank_0(f"REINFORCE (per-token) Layer {layer_num}: advantages_mean={advantages.mean().item():.4f}, adv_std={advantages.std().item():.4f}")
         
         # Average over all tokens across all layers
         total_loss = total_loss / max(1, total_tokens)
@@ -831,12 +836,18 @@ class RouterTrajectoryTracker:
         for layer_num in sorted_layers:
             ret = returns[layer_num]
             baseline = baseline_values[layer_num]
-            # Ensure both are scalars
             if ret.numel() > 1:
                 ret = ret.mean()
             if baseline.numel() > 1:
                 baseline = baseline.mean()
             advantages[layer_num] = (ret - baseline).detach()
+        
+        # Normalize advantages across all layers to zero mean, unit variance
+        all_advs = torch.stack(list(advantages.values()))
+        adv_mean = all_advs.mean()
+        adv_std = all_advs.std().clamp(min=1e-8)
+        for layer_num in sorted_layers:
+            advantages[layer_num] = (advantages[layer_num] - adv_mean) / adv_std
         
         total_loss = torch.tensor(0.0, device=device)
         total_policy_loss = torch.tensor(0.0, device=device)
@@ -919,8 +930,8 @@ class RouterTrajectoryTracker:
             avg_topn_load = sum(topn_loads) / len(topn_loads) if topn_loads else 0.0
         
         # Store component losses for logging
-        # Use actual critic loss if critic was trained, otherwise use computed value_loss
         logged_value_loss = self._last_critic_loss if hasattr(self, '_last_critic_loss') else (total_value_loss / num_layers).item()
+        all_advs_for_log = torch.stack(list(advantages.values()))
         self.last_loss_components = {
             'policy_loss': (total_policy_loss / num_layers).item(),
             'value_loss': logged_value_loss,
@@ -928,8 +939,10 @@ class RouterTrajectoryTracker:
             'mean_advantage': (total_advantage / num_layers).item(),
             'mean_reward': (total_reward / num_layers).item() if isinstance(total_reward, torch.Tensor) else total_reward / num_layers,
             'avg_topn_load': avg_topn_load,
+            'advantage_std': all_advs_for_log.std().item(),
+            'advantage_min': all_advs_for_log.min().item(),
+            'advantage_max': all_advs_for_log.max().item(),
         }
-        # More detailed debug output
         first_layer = sorted_layers[0]
         _, _, routing_logits_first, _ = trajectory_data[first_layer]
         wrap_print_rank_0(f"PPO (scalar, baseline={self.baseline_type}) DEBUG: "
@@ -937,6 +950,7 @@ class RouterTrajectoryTracker:
                           f"policy_loss={(total_policy_loss / num_layers).item():.6f}, "
                           f"entropy={self.last_loss_components['entropy_bonus']:.4f}, "
                           f"advantage={self.last_loss_components['mean_advantage']:.4f}, "
+                          f"adv_std={self.last_loss_components['advantage_std']:.4f}, "
                           f"mean_reward={self.last_loss_components['mean_reward']:.4f}, "
                           f"routing_logits.requires_grad={routing_logits_first.requires_grad}")
         return total_loss
@@ -999,6 +1013,13 @@ class RouterTrajectoryTracker:
         layer_advantages = {}
         for layer_num in sorted_layers:
             layer_advantages[layer_num] = (layer_returns[layer_num] - layer_baselines[layer_num]).detach()
+        
+        # Normalize advantages across all tokens and layers to zero mean, unit variance
+        all_advs = torch.cat([layer_advantages[ln].flatten() for ln in sorted_layers])
+        adv_mean = all_advs.mean()
+        adv_std = all_advs.std().clamp(min=1e-8)
+        for ln in sorted_layers:
+            layer_advantages[ln] = (layer_advantages[ln] - adv_mean) / adv_std
         
         total_loss = torch.tensor(0.0, device=device)
         total_policy_loss = torch.tensor(0.0, device=device)
@@ -1068,17 +1089,20 @@ class RouterTrajectoryTracker:
         # Normalize
         total_loss = total_loss / max(1, total_tokens)
         
-        # Use actual critic loss if critic was trained, otherwise use computed value_loss
         logged_value_loss = self._last_critic_loss if hasattr(self, '_last_critic_loss') else (total_value_loss / max(1, total_tokens)).item()
+        all_advs_log = torch.cat([layer_advantages[ln].flatten() for ln in sorted_layers])
         self.last_loss_components = {
             'policy_loss': (total_policy_loss / max(1, total_tokens)).item(),
             'value_loss': logged_value_loss,
             'entropy_bonus': (total_entropy / max(1, total_tokens)).item(),
             'mean_advantage': (total_advantage / max(1, total_tokens)).item(),
             'mean_reward': (total_reward / max(1, total_tokens)).item(),
-            'avg_topn_load': 0.0,  # Not applicable for per-token mode
+            'avg_topn_load': 0.0,
+            'advantage_std': all_advs_log.std().item(),
+            'advantage_min': all_advs_log.min().item(),
+            'advantage_max': all_advs_log.max().item(),
         }
-        wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}, critic_loss={logged_value_loss:.6f}, total_tokens={total_tokens}")
+        wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}, critic_loss={logged_value_loss:.6f}, adv_std={self.last_loss_components['advantage_std']:.4f}, total_tokens={total_tokens}")
         return total_loss
 
 
