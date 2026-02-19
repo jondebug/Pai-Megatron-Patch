@@ -324,12 +324,16 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.critic_hidden_dims = getattr(args, 'rl_critic_hidden_dims', [256])
     trajectory_tracker.critic_lr = getattr(args, 'rl_critic_lr', 1e-3)
     trajectory_tracker.normalize_rewards = getattr(args, 'rl_normalize_rewards', False)
+    trajectory_tracker.ppo_clip_ratio = getattr(args, 'rl_ppo_clip_ratio', 0.2)
+    trajectory_tracker.use_ema_loads = getattr(args, 'rl_use_ema_loads', False)
     print(f"[RL CONFIG] reward_type={trajectory_tracker.reward_type}, "
           f"baseline_type={trajectory_tracker.baseline_type}, "
           f"per_token_rewards={trajectory_tracker.per_token_rewards}, "
           f"reward_topn={trajectory_tracker.reward_topn}, "
           f"normalize_rewards={trajectory_tracker.normalize_rewards}, "
-          f"critic_hidden_dims={trajectory_tracker.critic_hidden_dims}", flush=True)
+          f"critic_hidden_dims={trajectory_tracker.critic_hidden_dims}, "
+          f"clip_ratio={trajectory_tracker.ppo_clip_ratio}, "
+          f"use_ema_loads={trajectory_tracker.use_ema_loads}", flush=True)
     
     rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
     rl_algorithm = getattr(args, 'rl_algorithm', 'reinforce').lower()
@@ -341,7 +345,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
             trajectory_tracker.layer_decisions,
             trajectory_tracker.old_layer_decisions,
             discount_factor=rl_discount_factor,
-            clip_ratio=0.2,
+            clip_ratio=getattr(trajectory_tracker, 'ppo_clip_ratio', 0.2),
             value_coeff=0.5
         )
     else:  # reinforce

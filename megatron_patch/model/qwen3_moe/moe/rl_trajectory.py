@@ -195,6 +195,10 @@ class RouterTrajectoryTracker:
         self._pending_critic_update = False  # Flag to trigger critic update
         self.normalize_rewards = False  # Enable running-mean/std reward normalization
         self._reward_normalizer = RewardNormalizer(momentum=0.01)
+        self._num_layers = 48  # Updated from actual data on first forward pass
+        self.use_ema_loads = False  # Use EMA expert loads for reward (more stable)
+        self._ema_expert_loads = None  # [num_experts] running average of per-expert load
+        self._ema_momentum = 0.1  # EMA update rate for expert loads
         # Store last computed loss components for logging
         self.last_loss_components = {
             'policy_loss': 0.0,
@@ -267,19 +271,30 @@ class RouterTrajectoryTracker:
                 self._critic_optimizer.load_state_dict(state_dict['critic_optimizer_state_dict'])
             wrap_print_rank_0(f"[RL DEBUG] Loaded critic state from checkpoint")
     
-    def compute_critic_baseline(self, latent_representations: torch.Tensor) -> torch.Tensor:
+    def compute_critic_baseline(self, latent_representations: torch.Tensor, layer_num: int = None) -> torch.Tensor:
         """Compute baseline values using the critic network.
         
         Args:
             latent_representations: Tensor of shape [seq_length, batch_size, hidden_dim]
+            layer_num: Layer number (used to provide layer-conditional predictions)
             
         Returns:
             Value estimates of shape [seq_length, batch_size]
         """
         device = latent_representations.device
-        input_dim = latent_representations.shape[-1]
+        # +1 for normalized layer index feature
+        input_dim = latent_representations.shape[-1] + 1
         critic = self.get_critic(input_dim, device)
-        return critic(latent_representations)
+        
+        # Append normalized layer index as an extra feature
+        num_layers = max(self._num_layers, 1)
+        layer_frac = (layer_num / num_layers) if layer_num is not None else 0.0
+        layer_feature = torch.full(
+            latent_representations.shape[:-1] + (1,),
+            layer_frac, device=device, dtype=latent_representations.dtype
+        )
+        critic_input = torch.cat([latent_representations, layer_feature], dim=-1)
+        return critic(critic_input)
         
     def add_layer_decision(self, layer_num: int, latent_token_representations: torch.Tensor, routing_map: torch.Tensor, routing_logits: torch.Tensor):
         """Add routing decision from a MoE layer.
@@ -300,6 +315,17 @@ class RouterTrajectoryTracker:
         
         # Store detached copies to avoid keeping gradients
         latent_token_representations = latent_token_representations.detach()
+
+        # Track number of layers for critic layer-index feature
+        self._num_layers = max(self._num_layers, layer_num)
+
+        # Update EMA expert loads for stable reward computation
+        with torch.no_grad():
+            batch_loads = routing_map.sum(dim=(0, 1)).float()
+            if self._ema_expert_loads is None:
+                self._ema_expert_loads = batch_loads.clone()
+            else:
+                self._ema_expert_loads = (1 - self._ema_momentum) * self._ema_expert_loads + self._ema_momentum * batch_loads
 
         # Auto-set per_token_rewards for reward types that are inherently per-token
         _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "expert0"}
@@ -435,15 +461,9 @@ class RouterTrajectoryTracker:
         most loaded experts, then scales linearly:
             reward = 1 - 2 * (num_hot / topk)
         
-        Examples (with topk=8, reward_topn=6):
-            0 of 8 chosen are hot -> reward = +1.0  (great routing)
-            2 of 8 chosen are hot -> reward = +0.5
-            4 of 8 chosen are hot -> reward =  0.0  (neutral)
-            6 of 8 chosen are hot -> reward = -0.5
-            8 of 8 chosen are hot -> reward = -1.0  (worst case)
-        
-        This avoids saturation: even with large N, tokens that route fewer
-        experts to hot ones get better rewards than tokens that route many.
+        When use_ema_loads=True, uses exponential moving average of expert loads
+        across recent batches instead of current-batch loads. This provides a more
+        stable reward signal that doesn't fluctuate with per-batch data variance.
         
         Args:
             routing_map: Tensor of shape [seq_length, batch_size, num_experts]
@@ -451,7 +471,10 @@ class RouterTrajectoryTracker:
         Returns:
             reward: Tensor of shape [seq_length, batch_size], values in [-1, +1]
         """
-        expert_loads = routing_map.sum(dim=(0, 1)).float()  # [num_experts]
+        if self.use_ema_loads and self._ema_expert_loads is not None:
+            expert_loads = self._ema_expert_loads
+        else:
+            expert_loads = routing_map.sum(dim=(0, 1)).float()
         _, topn_idx = expert_loads.topk(self.reward_topn)
         
         # Build mask: is each expert in the top-N most loaded?
@@ -473,16 +496,8 @@ class RouterTrajectoryTracker:
     def per_token_load_weighted_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
         """Per-token reward proportional to how overloaded the chosen experts are.
         
-        For each token, computes the average load of its chosen experts relative
-        to the ideal (uniform) load. Tokens routed to overloaded experts get
-        negative reward; tokens at underloaded experts get positive reward.
-        
-        reward = -(avg_chosen_load - ideal_load) / ideal_load
-        
-        Examples (with ideal_load=8):
-            Token picks experts with loads [16, 4] -> avg=10, reward = -(10-8)/8 = -0.25
-            Token picks experts with loads [4, 4]  -> avg=4,  reward = -(4-8)/8  = +0.50
-            Token picks experts with loads [8, 8]  -> avg=8,  reward = 0.0
+        When use_ema_loads=True, uses exponential moving average of expert loads
+        for more stable rewards across batches.
         
         Args:
             routing_map: Tensor of shape [seq_length, batch_size, num_experts]
@@ -490,7 +505,10 @@ class RouterTrajectoryTracker:
         Returns:
             reward: Tensor of shape [seq_length, batch_size], continuously scaled
         """
-        expert_loads = routing_map.sum(dim=(0, 1)).float()  # [num_experts]
+        if self.use_ema_loads and self._ema_expert_loads is not None:
+            expert_loads = self._ema_expert_loads
+        else:
+            expert_loads = routing_map.sum(dim=(0, 1)).float()
         ideal_load = expert_loads.mean()
         
         # For each token: sum of loads of chosen experts
@@ -814,7 +832,7 @@ class RouterTrajectoryTracker:
             critic_loss = torch.tensor(0.0, device=device)
             for layer_num in sorted_layers:
                 latent_repr, _, _, _ = trajectory_data[layer_num]
-                value = self.compute_critic_baseline(latent_repr).mean()
+                value = self.compute_critic_baseline(latent_repr, layer_num=layer_num).mean()
                 target = returns[layer_num].mean().detach() if returns[layer_num].numel() > 1 else returns[layer_num].detach()
                 critic_loss = critic_loss + 0.5 * torch.square(target - value)
                 baseline_values[layer_num] = value.detach()  # Detach for use in advantages
@@ -991,7 +1009,7 @@ class RouterTrajectoryTracker:
             total_critic_tokens = 0
             for layer_num in sorted_layers:
                 latent_repr, _, _, _ = trajectory_data[layer_num]
-                value = self.compute_critic_baseline(latent_repr)
+                value = self.compute_critic_baseline(latent_repr, layer_num=layer_num)
                 target = layer_returns[layer_num].detach()
                 critic_loss = critic_loss + 0.5 * torch.square(target - value).sum()
                 total_critic_tokens += value.numel()

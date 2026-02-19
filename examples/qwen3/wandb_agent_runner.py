@@ -90,6 +90,14 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
             dims = sweep_params['rl_critic_hidden_dims']
             dims_str = 'x'.join(str(d) for d in dims) if isinstance(dims, list) else str(dims)
             parts.append(f'c{dims_str}')
+        
+        # PPO clip ratio (only if it varies)
+        if 'rl_ppo_clip_ratio' in sweep_params:
+            parts.append(f'clip{sweep_params["rl_ppo_clip_ratio"]}')
+        
+        # EMA loads (only if it varies)
+        if sweep_params.get('rl_use_ema_loads', False):
+            parts.append('ema')
     else:
         # RL is off — just mark it
         parts.append('norl')
@@ -182,6 +190,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('use_rl_loss', '--use_rl_loss'),
         ('rl_per_token_rewards', '--rl-per-token-rewards'),
         ('rl_normalize_rewards', '--rl-normalize-rewards'),
+        ('rl_use_ema_loads', '--rl-use-ema-loads'),
         ('moe_router_enable_expert_bias', '--moe-router-enable-expert-bias'),
         ('moe_router_topology_aware', '--moe-router-topology-aware'),
     ]
@@ -201,6 +210,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('rl_reward_type', '--rl-reward-type'),
         ('rl_reward_topn', '--rl-reward-topn'),
         ('rl_discount_factor', '--rl-discount-factor'),
+        ('rl_ppo_clip_ratio', '--rl-ppo-clip-ratio'),
         ('moe_aux_loss_coeff', '--moe-aux-loss-coeff'),
         ('moe_router_score_function', '--moe-router-score-function'),
         ('moe_router_bias_update_rate', '--moe-router-bias-update-rate'),
