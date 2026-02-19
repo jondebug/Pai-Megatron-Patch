@@ -24,8 +24,8 @@
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_DIR="$( cd "$( dirname "$0" )" && pwd )"
-REPO_ROOT="$( cd "${SCRIPT_DIR}/../../.." && pwd )"
+REPO_ROOT="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch"
+SCRIPT_DIR="${REPO_ROOT}/examples/qwen3/benchmarks"
 CONVERTOR_DIR="${REPO_ROOT}/toolkits/distributed_checkpoints_convertor"
 
 CONTAINER_IMAGE="/lustre/fsw/portfolios/nvr/users/jonathanp/containers/pai-megatron-patch_25.04.sqsh"
@@ -82,57 +82,55 @@ echo "Start Time:      $(date)"
 echo "============================================================"
 
 # =============================================================================
-# Step 1: Convert Megatron checkpoint to HuggingFace format
+# Steps 1-3 run inside the container (needs torchrun, accelerate, lm_eval)
 # =============================================================================
-if [ -d "${HF_OUTPUT_DIR}" ] && [ -f "${HF_OUTPUT_DIR}/config.json" ]; then
-    echo "Step 1: HF checkpoint already exists at ${HF_OUTPUT_DIR}, skipping conversion"
-else
-    echo "Step 1: Converting Megatron checkpoint -> HuggingFace"
+srun --container-image="${CONTAINER_IMAGE}" \
+     --container-mounts="$HOME:$HOME,/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing:/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing" \
+     --container-workdir="${SCRIPT_DIR}" \
+     bash -c "
+         pip install wandb lm_eval --quiet 2>/dev/null
 
-    # The converter expects ep=8 for A3B by default, but our training uses ep=4.
-    # Override MODEL_PARALLEL_ARGS to match training config.
-    export MODEL_PARALLEL_ARGS="--tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 --expert-model-parallel-size 4"
+         # Step 1: Convert Megatron checkpoint to HuggingFace format
+         if [ -d '${HF_OUTPUT_DIR}' ] && [ -f '${HF_OUTPUT_DIR}/config.json' ]; then
+             echo 'Step 1: HF checkpoint already exists, skipping conversion'
+         else
+             echo 'Step 1: Converting Megatron checkpoint -> HuggingFace'
+             export KUBERNETES_CONTAINER_RESOURCE_GPU=4
+             cd '${CONVERTOR_DIR}'
+             bash scripts/qwen3/run_8xH20.sh \
+                 '${MODEL_SIZE}' \
+                 '${CHECKPOINT_DIR}' \
+                 '${HF_OUTPUT_DIR}' \
+                 true \
+                 true \
+                 bf16 \
+                 '${ORIGINAL_HF}'
+             cd '${SCRIPT_DIR}'
+             echo 'Conversion complete: ${HF_OUTPUT_DIR}'
+         fi
 
-    cd "${CONVERTOR_DIR}"
-    bash scripts/qwen3/run_8xH20.sh \
-        "${MODEL_SIZE}" \
-        "${CHECKPOINT_DIR}" \
-        "${HF_OUTPUT_DIR}" \
-        true \
-        true \
-        bf16 \
-        "${ORIGINAL_HF}"
-    cd "${SCRIPT_DIR}"
+         # Step 2: Run lm-evaluation-harness
+         echo ''
+         echo 'Step 2: Running lm-evaluation-harness'
+         echo '  Model:  ${HF_OUTPUT_DIR}'
+         echo '  Tasks:  ${TASKS}'
+         echo '  Batch:  ${BATCH_SIZE}'
 
-    echo "Conversion complete: ${HF_OUTPUT_DIR}"
-fi
+         accelerate launch -m lm_eval \
+             --model hf \
+             --model_args 'pretrained=${HF_OUTPUT_DIR},trust_remote_code=True' \
+             --tasks ${TASKS} \
+             --batch_size '${BATCH_SIZE}' \
+             --output_path '${RESULTS_DIR}' \
+             --log_samples
 
-# =============================================================================
-# Step 2: Run lm-evaluation-harness
-# =============================================================================
-echo ""
-echo "Step 2: Running lm-evaluation-harness"
-echo "  Model:  ${HF_OUTPUT_DIR}"
-echo "  Tasks:  ${TASKS}"
-echo "  Batch:  ${BATCH_SIZE}"
+         echo 'lm-eval complete. Results in: ${RESULTS_DIR}'
 
-accelerate launch -m lm_eval \
-    --model hf \
-    --model_args "pretrained=${HF_OUTPUT_DIR},trust_remote_code=True" \
-    --tasks ${TASKS} \
-    --batch_size "${BATCH_SIZE}" \
-    --output_path "${RESULTS_DIR}" \
-    --log_samples
-
-echo "lm-eval complete. Results in: ${RESULTS_DIR}"
-
-# =============================================================================
-# Step 3: Parse results
-# =============================================================================
-echo ""
-echo "Step 3: Parsing results"
-
-python3 "${SCRIPT_DIR}/_parse_lm_eval_results.py" "${RESULTS_DIR}"
+         # Step 3: Parse results
+         echo ''
+         echo 'Step 3: Parsing results'
+         python3 '${SCRIPT_DIR}/_parse_lm_eval_results.py' '${RESULTS_DIR}'
+     "
 
 # =============================================================================
 # Step 4: Log to WandB (same training run)
