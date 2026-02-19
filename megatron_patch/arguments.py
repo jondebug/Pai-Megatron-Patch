@@ -550,6 +550,13 @@ def get_patch_args(parser):
                       help='KL divergence loss coefficient. 0 = disabled. '
                            'Penalizes deviation of LM output distribution from pretrained reference. '
                            'Requires one extra no-grad forward pass per step (~1.5x wall time).')
+    group.add_argument('--moe-router-topology-aware', action='store_true', default=False,
+                      help='Enable topology-aware routing: adds a non-trainable bias to local '
+                           'expert logits before top-k selection, reducing cross-GPU communication. '
+                           'Mutually exclusive with --use_rl_loss.')
+    group.add_argument('--moe-router-topology-lambda', type=float, default=0.01,
+                      help='Locality bias strength for topology-aware routing. '
+                           'Higher values favor local experts more aggressively (default: 0.01).')
     group.add_argument('--enable-wandb-logging', action='store_true', default=False,
                       help='Enable wandb logging for training metrics')
     group.add_argument('--wandb-project-name', type=str, default='qwen3-moe-training',

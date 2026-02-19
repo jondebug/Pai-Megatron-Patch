@@ -110,6 +110,11 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
     if 'moe_router_load_balancing_type' in sweep_params and not sweep_params.get('moe_router_enable_expert_bias', False):
         parts.append(f'lb_{sweep_params["moe_router_load_balancing_type"]}')
     
+    # Topology-aware routing
+    if all_params.get('moe_router_topology_aware', False):
+        lam = sweep_params.get('moe_router_topology_lambda', all_params.get('moe_router_topology_lambda', 0.01))
+        parts.append(f'topo{lam}')
+    
     # KL loss coefficient
     if 'kl_loss_coeff' in sweep_params:
         v = sweep_params['kl_loss_coeff']
@@ -178,6 +183,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('rl_per_token_rewards', '--rl-per-token-rewards'),
         ('rl_normalize_rewards', '--rl-normalize-rewards'),
         ('moe_router_enable_expert_bias', '--moe-router-enable-expert-bias'),
+        ('moe_router_topology_aware', '--moe-router-topology-aware'),
     ]
     
     for config_key, flag in bool_flags:
@@ -200,6 +206,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('moe_router_bias_update_rate', '--moe-router-bias-update-rate'),
         ('moe_router_load_balancing_type', '--moe-router-load-balancing-type'),
         ('kl_loss_coeff', '--kl-loss-coeff'),
+        ('moe_router_topology_lambda', '--moe-router-topology-lambda'),
         ('train_iters', '--train-iters'),
         ('eval_interval', '--eval-interval'),
         ('eval_iters', '--eval-iters'),

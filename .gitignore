@@ -3,6 +3,7 @@
 .vscode
 *.DS_Store
 .ipynb_checkpoints
+.commit_msg.txt
 
 # Sweep auto-generated files
 examples/qwen3/sweep_combinations.json
@@ -10,3 +11,11 @@ examples/qwen3/sweep_logs/
 examples/qwen3/wandb_sweep.yaml
 examples/qwen3/wandb/
 examples/qwen3/wandb_logs/
+examples/qwen3/run_config_jsons/sweep_combinations.json
+
+# Generated outputs (HTML plots, CSV caches)
+*.html
+sweep_*.csv
+
+# Benchmark wandb artifacts
+examples/qwen3/benchmarks/wandb/

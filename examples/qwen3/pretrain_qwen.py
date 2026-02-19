@@ -371,6 +371,21 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
         print_rank_0("ROUTER-ONLY TRAINING: Configuring model for router-only parameter updates")
         configure_router_only_training(model)
 
+    # Topology-aware routing and RL loss are mutually exclusive
+    topology_aware = getattr(args, 'moe_router_topology_aware', False)
+    if topology_aware and args.use_rl_loss:
+        raise ValueError("--moe-router-topology-aware and --use_rl_loss are mutually exclusive. "
+                         "Topology bias is rank-specific and conflicts with RL gradient averaging.")
+
+    # Initialize topology-aware routing if enabled
+    if topology_aware:
+        topo_lambda = getattr(args, 'moe_router_topology_lambda', 0.01)
+        print_rank_0(f"TOPOLOGY-AWARE ROUTING: lambda={topo_lambda}")
+        for module in model.modules():
+            if 'router' in module.__class__.__name__.lower():
+                module._topology_aware = True
+                module._topology_lambda = topo_lambda
+
     # Initialize RL loss if enabled
     print_rank_0(f"[RL DEBUG] Initializing training with use_rl_loss={args.use_rl_loss}")
     if args.use_rl_loss:
@@ -378,15 +393,9 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
         if not args.router_only_training:
             print_rank_0("WARNING: RL loss is typically used with router-only training")
         
-        
         for module in model.modules():
             if 'router' in module.__class__.__name__.lower():
-                
-                # Set the trajectory tracking attribute directly on the config
-            
                 module.config.moe_router_use_trajectory_tracking = True
-              
-                    # Also reinitialize the router's trajectory tracking since config changed
                 module._use_trajectory_tracking = True
                 from megatron_patch.model.qwen3_moe.moe.rl_trajectory import get_trajectory_tracker
                 module._trajectory_tracker = get_trajectory_tracker()

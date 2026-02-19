@@ -1,0 +1,74 @@
+{
+    "_comment": "Topology-aware routing sweep: test locality bias that favors local experts",
+    "_rationale": [
+        "With ep=4, each GPU holds 16 of 64 experts. Tokens routed to remote experts",
+        "require all-to-all communication. A small non-trainable bias added to local",
+        "expert logits before top-k selection can reduce cross-GPU traffic.",
+        "",
+        "This bias is rank-specific (not learned via gradients) and operates purely",
+        "at the selection stage -- the scoring/gating weights remain unchanged.",
+        "",
+        "Sweep: 4 lambda values (bias strength) x 2 aux loss settings + baselines"
+    ],
+    
+    "sweep_name": "topology_sweep",
+    
+    "env": "dsw",
+    "model_size": "A3B",
+    "batch_size": 1,
+    "global_batch_size": 8,
+    "lr": "1e-4",
+    "min_lr": "1e-6",
+    "seq_len": 128,
+    "pad_len": 128,
+    "precision": "bf16",
+    
+    "tp": 1,
+    "pp": 1,
+    "cp": 1,
+    "etp": 1,
+    "ep": 4,
+    "sp": true,
+    "do": true,
+    "fl": true,
+    "sft": false,
+    
+    "ac": "sel",
+    "optimizer_offload": false,
+    "save_interval": 1500,
+    "train_iters": 1500,
+    "eval_interval": 200,
+    "eval_iters": 50,
+    "dataset_path": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-datasets/mmap_qwen3_datasets_text_document",
+    "valid_dataset_path": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-datasets/mmap_qwen3_datasets_text_document",
+    "pretrain_checkpoint_path": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-ckpts/Qwen3-30B-A3B-to-mcore",
+    "train_tokens": 1024000,
+    "warmup_tokens": 10240,
+    "output_basepath": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/output_router_finetuning",
+    
+    "router_only_training": true,
+    "enable_wandb_logging": true,
+    "wandb_project_name": "qwen3-router-training",
+    "wandb_run_name_base": "topology-sweep",
+    "wandb_run_tags": ["router-only", "moe-training", "topology-aware"],
+    
+    "use_rl_loss": [false],
+    
+    "_sweep_comment": "Sweep: topology on/off x lambda x aux_loss",
+    "moe_router_topology_aware": [true, false],
+    "moe_router_topology_lambda": [0.001, 0.01, 0.1, 1.0],
+    "moe_aux_loss_coeff": [0, 0.01],
+
+    "filters": [
+        {
+            "_comment": "When topology is off, collapse lambda (it has no effect)",
+            "if": {"moe_router_topology_aware": false},
+            "collapse": ["moe_router_topology_lambda"]
+        },
+        {
+            "_comment": "Skip the no-topology no-aux case (nothing changes from pretrained)",
+            "if": {"moe_router_topology_aware": false, "moe_aux_loss_coeff": 0},
+            "skip": true
+        }
+    ]
+}
