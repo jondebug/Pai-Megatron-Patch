@@ -1,0 +1,120 @@
+{
+    "_comment": "ALF-LB (Aux-Loss-Free Load Balancing) sweep: DeepSeek-V3 style dynamic expert bias",
+    "_rationale": [
+        "Tests the built-in Megatron ALF-LB mechanism against standard aux loss.",
+        "ALF-LB uses sigmoid scoring + dynamic per-expert bias updated each step via:",
+        "  bias_i += alpha * sign(target_load - actual_load_i)",
+        "This is non-differentiable and does not add any loss term to the gradient.",
+        "Instead it directly adjusts routing selection to balance loads.",
+        "",
+        "Comparison axes:",
+        "- ALF-LB with different update rates (alpha)",
+        "- Standard aux loss baselines",
+        "- ALF-LB + RL combinations (can RL improve on top of ALF-LB?)"
+    ],
+    
+    "sweep_name": "alf_lb_sweep",
+    
+    "env": "dsw",
+    "model_size": "A3B",
+    "batch_size": 1,
+    "global_batch_size": 8,
+    "lr": "1e-4",
+    "min_lr": "1e-6",
+    "seq_len": 128,
+    "pad_len": 128,
+    "precision": "bf16",
+    
+    "tp": 1,
+    "pp": 1,
+    "cp": 1,
+    "etp": 1,
+    "ep": 4,
+    "sp": true,
+    "do": true,
+    "fl": true,
+    "sft": false,
+    
+    "ac": "sel",
+    "optimizer_offload": false,
+    "save_interval": 1500,
+    "train_iters": 1500,
+    "eval_interval": 200,
+    "eval_iters": 50,
+    "dataset_path": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-datasets/mmap_qwen3_datasets_text_document",
+    "valid_dataset_path": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-datasets/mmap_qwen3_datasets_text_document",
+    "pretrain_checkpoint_path": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-ckpts/Qwen3-30B-A3B-to-mcore",
+    "train_tokens": 1024000,
+    "warmup_tokens": 10240,
+    "output_basepath": "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/output_router_finetuning",
+    
+    "router_only_training": true,
+    "enable_wandb_logging": true,
+    "wandb_project_name": "qwen3-router-training",
+    "wandb_run_name_base": "alf-lb-sweep",
+    "wandb_run_tags": ["router-only", "moe-training", "alf-lb"],
+    
+    "_fixed_rl_params": "RL params for ALF-LB+RL combination runs",
+    "rl_algorithm": ["ppo"],
+    "rl_ppo_baseline_type": "critic",
+    "rl_critic_hidden_dims": [[256]],
+    "rl_ppo_entropy_coeff": [0.01],
+    "rl_loss_coeff": [0.05],
+    "rl_normalize_rewards": [true],
+    "rl_discount_factor": "0",
+    "rl_reward_topn": [6],
+    "rl_reward_type": ["per_token_topn_binary"],
+
+    "_sweep_comment": "Sweep: ALF-LB vs aux loss, with optional RL on top",
+    
+    "moe_router_enable_expert_bias": [true, false],
+    "moe_router_score_function": ["sigmoid", "softmax"],
+    "moe_router_bias_update_rate": [0.001, 0.01],
+    "moe_router_load_balancing_type": ["none", "aux_loss"],
+    "moe_aux_loss_coeff": [0, 0.01],
+    "use_rl_loss": [false],
+
+    "_filters_comment": "Filters to create meaningful, mutually exclusive combinations",
+    "filters": [
+        {
+            "_comment": "ALF-LB requires sigmoid + expert_bias + no aux_loss + lb_type=none",
+            "if": {"moe_router_enable_expert_bias": true, "moe_router_score_function": "softmax"},
+            "skip": true
+        },
+        {
+            "_comment": "ALF-LB must use lb_type=none (bias replaces aux loss)",
+            "if": {"moe_router_enable_expert_bias": true, "moe_router_load_balancing_type": "aux_loss"},
+            "skip": true
+        },
+        {
+            "_comment": "ALF-LB must have aux_loss_coeff=0",
+            "if": {"moe_router_enable_expert_bias": true, "moe_aux_loss_coeff": 0.01},
+            "skip": true
+        },
+        {
+            "_comment": "Standard aux loss must use softmax + no expert_bias + lb_type=aux_loss",
+            "if": {"moe_router_enable_expert_bias": false, "moe_router_score_function": "sigmoid"},
+            "skip": true
+        },
+        {
+            "_comment": "Standard aux loss must use lb_type=aux_loss",
+            "if": {"moe_router_enable_expert_bias": false, "moe_router_load_balancing_type": "none"},
+            "skip": true
+        },
+        {
+            "_comment": "Standard aux loss must have aux_loss_coeff > 0",
+            "if": {"moe_router_enable_expert_bias": false, "moe_aux_loss_coeff": 0},
+            "skip": true
+        },
+        {
+            "_comment": "Non-ALF-LB runs don't use bias_update_rate",
+            "if": {"moe_router_enable_expert_bias": false},
+            "collapse": ["moe_router_bias_update_rate"]
+        },
+        {
+            "_comment": "Collapse RL params for non-RL runs",
+            "if": {"use_rl_loss": false},
+            "collapse": ["rl_loss_coeff", "rl_reward_type", "rl_normalize_rewards", "rl_reward_topn", "rl_algorithm", "rl_ppo_entropy_coeff", "rl_critic_hidden_dims"]
+        }
+    ]
+}

@@ -1,356 +1,401 @@
+#!/usr/bin/env python3
 """
-measure_critical_path.py -- Measure critical path and routing metrics on a HuggingFace checkpoint.
+measure_critical_path.py -- Critical Path & Load Metrics
 
-Loads a HuggingFace MoE model, runs forward passes on a dataset, and collects
-per-layer routing statistics including the critical path metric.
+Loads a HuggingFace Qwen3-MoE checkpoint, runs forward passes on a
+held-out dataset, and measures per-layer routing statistics.
+
+Metrics collected per batch (then averaged):
+  - num_tokens_on_critical_path (sum of max_tokens_per_expert across layers)
+  - Per-layer max_tokens_per_expert (the bottleneck)
+  - Per-layer load_balancing_entropy
+  - Per-layer tokens_per_expert std (imbalance measure)
+  - lm_loss (perplexity on held-out data)
+
+Also computes theoretical speedup:
+  theoretical_speedup = baseline_critical_path / optimized_critical_path
 
 Usage:
     python measure_critical_path.py \
         --model-path /path/to/hf/checkpoint \
-        --dataset-path /path/to/dataset  \
-        --num-batches 100 \
-        --batch-size 1 \
-        --seq-length 128 \
-        --output-file critical_path_results.json
-
-The critical path is: sum over all MoE layers of max(tokens_per_expert[layer]).
-This is the theoretical compute bottleneck for expert-parallel inference.
+        --output-path ./critical_path_results.json \
+        [--dataset-name wikitext --dataset-config wikitext-2-raw-v1] \
+        [--num-batches 100] \
+        [--batch-size 4] \
+        [--seq-length 2048] \
+        [--baseline-critical-path <float>]
 """
 
 import argparse
 import json
+import math
 import os
 import time
-import sys
 from collections import defaultdict
 
 import torch
-import numpy as np
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Measure MoE critical path metrics")
-    parser.add_argument("--model-path", required=True, help="Path to HuggingFace model checkpoint")
-    parser.add_argument("--num-batches", type=int, default=100, help="Number of batches to evaluate")
-    parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
-    parser.add_argument("--seq-length", type=int, default=128, help="Sequence length")
-    parser.add_argument("--output-file", default="critical_path_results.json", help="Output JSON file")
-    parser.add_argument("--dataset", default=None, help="HuggingFace dataset name (default: random input)")
-    parser.add_argument("--device", default="cuda", help="Device to use")
-    parser.add_argument("--label", default=None, help="Label for this checkpoint (e.g., 'baseline' or 'optimized')")
+    parser = argparse.ArgumentParser(description="Measure MoE critical path and load metrics")
+    parser.add_argument("--model-path", type=str, required=True,
+                        help="Path to HuggingFace model checkpoint")
+    parser.add_argument("--output-path", type=str, default="./critical_path_results.json",
+                        help="Path to save results JSON")
+    parser.add_argument("--dataset-name", type=str, default="wikitext",
+                        help="HuggingFace dataset name")
+    parser.add_argument("--dataset-config", type=str, default="wikitext-2-raw-v1",
+                        help="HuggingFace dataset config")
+    parser.add_argument("--dataset-split", type=str, default="test",
+                        help="Dataset split to use")
+    parser.add_argument("--num-batches", type=int, default=100,
+                        help="Number of batches to evaluate")
+    parser.add_argument("--batch-size", type=int, default=4,
+                        help="Batch size for evaluation")
+    parser.add_argument("--seq-length", type=int, default=2048,
+                        help="Sequence length")
+    parser.add_argument("--baseline-critical-path", type=float, default=None,
+                        help="Baseline critical path value for speedup computation")
+    parser.add_argument("--dtype", type=str, default="bfloat16",
+                        choices=["float16", "bfloat16", "float32"],
+                        help="Model dtype")
     return parser.parse_args()
 
 
-class RoutingMetricsCollector:
-    """Hooks into MoE router forward passes to collect per-layer routing statistics."""
+class RoutingHook:
+    """Captures routing decisions from MoE layers via forward hooks."""
 
     def __init__(self):
-        self.hooks = []
-        self.batch_metrics = []  # list of per-batch metric dicts
-        self._current_batch = {}  # layer_idx -> tokens_per_expert
+        self.layer_stats = defaultdict(list)
+        self._hooks = []
 
-    def attach(self, model):
-        """Find MoE layers and attach forward hooks to routers."""
-        layer_idx = 0
-        for name, module in model.named_modules():
-            # Look for router/gate modules that produce routing decisions
-            # Common patterns: TopKRouter, MoeGate, SparseMoeBlock
-            if self._is_moe_block(name, module):
-                hook = module.register_forward_hook(
-                    self._make_hook(layer_idx, name)
-                )
-                self.hooks.append(hook)
-                layer_idx += 1
+    def _get_gate_hook(self, layer_idx):
+        """Create a hook for a specific MoE gate layer.
 
-        if layer_idx == 0:
-            print("WARNING: No MoE layers found. Trying alternative detection...")
-            layer_idx = self._attach_fallback(model)
-
-        print(f"Attached routing hooks to {layer_idx} MoE layers")
-        return layer_idx
-
-    def _is_moe_block(self, name, module):
-        """Detect MoE block modules by class name."""
-        cls_name = type(module).__name__.lower()
-        # Common HuggingFace MoE module names
-        moe_patterns = ["sparsemoeblock", "qwen3moespraseblock", "moelayer",
-                        "qwen2moesparsemoeblock", "mixtralsparsemoeblock"]
-        return any(p in cls_name for p in moe_patterns)
-
-    def _attach_fallback(self, model):
-        """Fallback: look for modules with a 'gate' submodule."""
-        layer_idx = 0
-        for name, module in model.named_modules():
-            if hasattr(module, 'gate') and hasattr(module, 'experts'):
-                hook = module.register_forward_hook(
-                    self._make_hook(layer_idx, name)
-                )
-                self.hooks.append(hook)
-                layer_idx += 1
-        return layer_idx
-
-    def _make_hook(self, layer_idx, name):
-        """Create a forward hook that captures routing decisions."""
+        The HuggingFace Qwen3 MoE block's forward returns
+        (final_hidden_states, router_logits). We hook the entire MoE block
+        to capture router_logits, then compute statistics.
+        """
         def hook_fn(module, input, output):
-            # Try to extract routing information from the module
-            # After forward, many MoE blocks store routing info
-            try:
-                hidden = input[0] if isinstance(input, tuple) else input
-                if hasattr(module, 'gate'):
-                    gate = module.gate
-                    with torch.no_grad():
-                        if hasattr(gate, 'weight'):
-                            logits = torch.nn.functional.linear(
-                                hidden.view(-1, hidden.shape[-1]).float(),
-                                gate.weight.float()
-                            )
-                            # Top-k selection (use k from model config if available)
-                            k = getattr(module, 'num_experts_per_tok',
-                                       getattr(module, 'top_k', 8))
-                            _, top_indices = logits.topk(k, dim=-1)
+            # output is (hidden_states, router_logits)
+            if isinstance(output, tuple) and len(output) >= 2:
+                router_logits = output[1]
+            else:
+                return
 
-                            num_experts = logits.shape[-1]
-                            # Count tokens per expert
-                            expert_counts = torch.zeros(num_experts, device=logits.device)
-                            for ki in range(k):
-                                expert_counts.scatter_add_(
-                                    0, top_indices[:, ki],
-                                    torch.ones(top_indices.shape[0], device=logits.device)
-                                )
+            with torch.no_grad():
+                # router_logits: [num_tokens, num_experts]
+                num_tokens, num_experts = router_logits.shape
 
-                            self._current_batch[layer_idx] = {
-                                'tokens_per_expert': expert_counts.cpu().numpy(),
-                                'max_tokens': expert_counts.max().item(),
-                                'min_tokens': expert_counts.min().item(),
-                                'mean_tokens': expert_counts.float().mean().item(),
-                                'std_tokens': expert_counts.float().std().item(),
-                                'num_experts': num_experts,
-                                'topk': k,
-                                'num_tokens': logits.shape[0],
-                            }
-            except Exception as e:
-                pass  # Don't crash the forward pass
+                # Compute routing probabilities
+                routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+
+                # Get top-k selections (use model's top_k if available)
+                topk = getattr(module, 'top_k', None) or getattr(module, 'num_experts_per_tok', 8)
+                _, selected_experts = torch.topk(routing_weights, topk, dim=-1)
+
+                # Build routing map: [num_tokens, num_experts] boolean
+                routing_map = torch.zeros(num_tokens, num_experts,
+                                          dtype=torch.bool, device=router_logits.device)
+                routing_map.scatter_(1, selected_experts, True)
+
+                # tokens_per_expert: [num_experts]
+                tokens_per_expert = routing_map.sum(dim=0).float()
+
+                # max_tokens_per_expert (the critical path bottleneck for this layer)
+                max_tpe = tokens_per_expert.max().item()
+
+                # Load balancing entropy
+                token_dist = tokens_per_expert / (tokens_per_expert.sum() + 1e-10)
+                epsilon = 1e-10
+                token_dist = token_dist + epsilon
+                lb_entropy = -torch.sum(token_dist * torch.log(token_dist)).item()
+
+                # Maximum possible entropy (uniform distribution)
+                max_entropy = math.log(num_experts)
+
+                # Std of tokens per expert (imbalance measure)
+                tpe_std = tokens_per_expert.std().item()
+                tpe_mean = tokens_per_expert.mean().item()
+
+                # Ideal load (perfectly balanced)
+                ideal_load = num_tokens * topk / num_experts
+
+                self.layer_stats[layer_idx].append({
+                    "max_tokens_per_expert": max_tpe,
+                    "load_balancing_entropy": lb_entropy,
+                    "max_entropy": max_entropy,
+                    "tokens_per_expert_std": tpe_std,
+                    "tokens_per_expert_mean": tpe_mean,
+                    "ideal_load_per_expert": ideal_load,
+                    "num_tokens": num_tokens,
+                    "num_experts": num_experts,
+                    "topk": topk,
+                })
 
         return hook_fn
 
-    def start_batch(self):
-        """Call before each forward pass."""
-        self._current_batch = {}
+    def register_hooks(self, model):
+        """Register forward hooks on all MoE layers in the model."""
+        layer_idx = 0
+        for name, module in model.named_modules():
+            # Match Qwen3 MoE block class names
+            module_class = type(module).__name__
+            if "SparseMoe" in module_class or "MoeBlock" in module_class:
+                hook = module.register_forward_hook(self._get_gate_hook(layer_idx))
+                self._hooks.append(hook)
+                layer_idx += 1
+                continue
+            # Also check for modules that have 'gate' and 'experts' attributes (standard MoE pattern)
+            if (hasattr(module, 'gate') and hasattr(module, 'experts')
+                    and not any("SparseMoe" in type(p).__name__ or "MoeBlock" in type(p).__name__
+                                for p in module.children())):
+                hook = module.register_forward_hook(self._get_gate_hook(layer_idx))
+                self._hooks.append(hook)
+                layer_idx += 1
 
-    def end_batch(self):
-        """Call after each forward pass. Computes aggregate metrics."""
-        if not self._current_batch:
-            return None
-
-        num_layers = len(self._current_batch)
-        critical_path = sum(d['max_tokens'] for d in self._current_batch.values())
-
-        # Ideal critical path: if perfectly balanced
-        if self._current_batch:
-            sample = next(iter(self._current_batch.values()))
-            ideal_per_layer = sample['num_tokens'] * sample['topk'] / sample['num_experts']
-            ideal_critical_path = num_layers * ideal_per_layer
-        else:
-            ideal_critical_path = 0
-
-        # Per-layer entropy
-        entropies = []
-        for layer_data in self._current_batch.values():
-            counts = layer_data['tokens_per_expert']
-            total = counts.sum()
-            if total > 0:
-                probs = counts / total
-                probs = probs[probs > 0]
-                entropy = -np.sum(probs * np.log(probs))
-                max_entropy = np.log(layer_data['num_experts'])
-                entropies.append(entropy / max_entropy)  # normalized [0, 1]
-
-        metrics = {
-            'critical_path': critical_path,
-            'ideal_critical_path': ideal_critical_path,
-            'imbalance_ratio': critical_path / max(ideal_critical_path, 1),
-            'num_moe_layers': num_layers,
-            'per_layer_max_tokens': [d['max_tokens'] for d in sorted(self._current_batch.items())],
-            'per_layer_mean_tokens': [d['mean_tokens'] for d in sorted(self._current_batch.items())],
-            'per_layer_std_tokens': [d['std_tokens'] for d in sorted(self._current_batch.items())],
-            'mean_normalized_entropy': float(np.mean(entropies)) if entropies else 0,
-        }
-
-        self._current_batch = {}
-        self.batch_metrics.append(metrics)
-        return metrics
-
-    def summary(self):
-        """Compute aggregate statistics over all batches."""
-        if not self.batch_metrics:
-            return {}
-
-        crit_paths = [m['critical_path'] for m in self.batch_metrics]
-        ideal_paths = [m['ideal_critical_path'] for m in self.batch_metrics]
-        entropies = [m['mean_normalized_entropy'] for m in self.batch_metrics]
-
-        # Per-layer averages
-        num_layers = self.batch_metrics[0]['num_moe_layers']
-        per_layer_avg_max = []
-        for l in range(num_layers):
-            layer_maxes = [m['per_layer_max_tokens'][l] for m in self.batch_metrics
-                          if l < len(m['per_layer_max_tokens'])]
-            per_layer_avg_max.append(float(np.mean(layer_maxes)))
-
-        return {
-            'num_batches': len(self.batch_metrics),
-            'num_moe_layers': num_layers,
-            'critical_path': {
-                'mean': float(np.mean(crit_paths)),
-                'std': float(np.std(crit_paths)),
-                'min': float(np.min(crit_paths)),
-                'max': float(np.max(crit_paths)),
-                'p50': float(np.percentile(crit_paths, 50)),
-                'p95': float(np.percentile(crit_paths, 95)),
-            },
-            'ideal_critical_path': float(np.mean(ideal_paths)),
-            'imbalance_ratio': {
-                'mean': float(np.mean(crit_paths)) / max(float(np.mean(ideal_paths)), 1),
-            },
-            'normalized_entropy': {
-                'mean': float(np.mean(entropies)),
-                'std': float(np.std(entropies)),
-            },
-            'per_layer_avg_max_tokens': per_layer_avg_max,
-            # Top-5 most imbalanced layers
-            'bottleneck_layers': sorted(
-                range(num_layers), key=lambda l: per_layer_avg_max[l], reverse=True
-            )[:5],
-        }
+        print(f"Registered routing hooks on {layer_idx} MoE layers")
+        return layer_idx
 
     def remove_hooks(self):
-        for hook in self.hooks:
+        for hook in self._hooks:
             hook.remove()
-        self.hooks = []
+        self._hooks.clear()
+
+    def clear_stats(self):
+        self.layer_stats.clear()
+
+    def get_batch_stats(self):
+        """Get statistics for the current batch (latest entry per layer)."""
+        stats = {}
+        for layer_idx, entries in self.layer_stats.items():
+            if entries:
+                stats[layer_idx] = entries[-1]
+        return stats
 
 
-def load_model(model_path, device):
-    """Load a HuggingFace model for evaluation."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+def prepare_dataset(tokenizer, args):
+    """Load and tokenize dataset, return a DataLoader."""
+    from datasets import load_dataset
 
-    print(f"Loading model from {model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    dataset = load_dataset(args.dataset_name, args.dataset_config, split=args.dataset_split)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        device_map=device if device == "auto" else {"": device},
-    )
-    model.eval()
+    # Concatenate all text and chunk into seq_length segments
+    all_text = "\n\n".join([t for t in dataset["text"] if t.strip()])
+    encodings = tokenizer(all_text, return_tensors="pt", truncation=False)
+    input_ids = encodings.input_ids[0]
 
-    print(f"Model loaded: {type(model).__name__}")
-    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    return model, tokenizer
+    # Create chunks of seq_length
+    seq_length = args.seq_length
+    num_chunks = len(input_ids) // seq_length
+    input_ids = input_ids[:num_chunks * seq_length].reshape(num_chunks, seq_length)
 
+    # Create a simple dataset
+    class TokenDataset(torch.utils.data.Dataset):
+        def __init__(self, input_ids):
+            self.input_ids = input_ids
 
-def generate_inputs(tokenizer, batch_size, seq_length, device, dataset=None):
-    """Generate input batches for evaluation."""
-    if dataset:
-        # Load real dataset
-        try:
-            from datasets import load_dataset
-            ds = load_dataset(dataset, split="test", streaming=True)
-            for item in ds:
-                text = item.get("text", item.get("content", str(item)))
-                tokens = tokenizer(
-                    text, return_tensors="pt", max_length=seq_length,
-                    truncation=True, padding="max_length"
-                )
-                yield {k: v.to(device) for k, v in tokens.items()}
-        except Exception as e:
-            print(f"WARNING: Could not load dataset '{dataset}': {e}")
-            print("Falling back to random input.")
+        def __len__(self):
+            return len(self.input_ids)
 
-    # Random input fallback
-    vocab_size = tokenizer.vocab_size or 32000
-    while True:
-        input_ids = torch.randint(100, vocab_size, (batch_size, seq_length), device=device)
-        attention_mask = torch.ones_like(input_ids)
-        yield {"input_ids": input_ids, "attention_mask": attention_mask}
+        def __getitem__(self, idx):
+            ids = self.input_ids[idx]
+            return {"input_ids": ids, "labels": ids.clone()}
+
+    dataset = TokenDataset(input_ids)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=True)
+    return dataloader
 
 
 def main():
     args = parse_args()
 
-    model, tokenizer = load_model(args.model_path, args.device)
-    collector = RoutingMetricsCollector()
-    num_layers = collector.attach(model)
+    # Load model and tokenizer
+    print(f"Loading model from: {args.model_path}")
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    if num_layers == 0:
-        print("ERROR: No MoE layers detected. Is this an MoE model?")
-        sys.exit(1)
-
-    device = next(model.parameters()).device
-    input_gen = generate_inputs(tokenizer, args.batch_size, args.seq_length, device, args.dataset)
-
-    print(f"\nRunning {args.num_batches} forward passes "
-          f"(batch_size={args.batch_size}, seq_length={args.seq_length})...")
-
-    lm_losses = []
-    for batch_idx in range(args.num_batches):
-        inputs = next(input_gen)
-
-        collector.start_batch()
-        with torch.no_grad():
-            outputs = model(**inputs, labels=inputs.get("input_ids"))
-
-        metrics = collector.end_batch()
-
-        if outputs.loss is not None:
-            lm_losses.append(outputs.loss.item())
-
-        if (batch_idx + 1) % 10 == 0:
-            print(f"  Batch {batch_idx + 1}/{args.num_batches}: "
-                  f"crit_path={metrics['critical_path']:.0f}, "
-                  f"lm_loss={lm_losses[-1]:.4f}" if lm_losses else "")
-
-    # Compute summary
-    summary = collector.summary()
-    summary['lm_loss'] = {
-        'mean': float(np.mean(lm_losses)) if lm_losses else None,
-        'std': float(np.std(lm_losses)) if lm_losses else None,
-        'perplexity': float(np.exp(np.mean(lm_losses))) if lm_losses else None,
+    dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
     }
-    summary['config'] = {
-        'model_path': args.model_path,
-        'num_batches': args.num_batches,
-        'batch_size': args.batch_size,
-        'seq_length': args.seq_length,
-        'label': args.label or os.path.basename(args.model_path),
+    model_dtype = dtype_map[args.dtype]
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        torch_dtype=model_dtype,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    model.eval()
+
+    # Prepare dataset
+    print("Preparing dataset...")
+    dataloader = prepare_dataset(tokenizer, args)
+
+    # Set up routing hooks
+    routing_hook = RoutingHook()
+    num_moe_layers = routing_hook.register_hooks(model)
+
+    if num_moe_layers == 0:
+        print("WARNING: No MoE layers found. Check model architecture.")
+
+    # Run evaluation
+    print(f"Running evaluation for {args.num_batches} batches...")
+    all_batch_metrics = []
+    total_loss = 0.0
+    num_evaluated = 0
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= args.num_batches:
+                break
+
+            input_ids = batch["input_ids"].to(model.device)
+            labels = batch["labels"].to(model.device)
+
+            routing_hook.clear_stats()
+
+            outputs = model(input_ids=input_ids, labels=labels)
+            loss = outputs.loss.item()
+            total_loss += loss
+            num_evaluated += 1
+
+            # Collect routing statistics for this batch
+            batch_stats = routing_hook.get_batch_stats()
+
+            # Compute critical path for this batch
+            critical_path = sum(
+                batch_stats[l]["max_tokens_per_expert"]
+                for l in sorted(batch_stats.keys())
+            )
+
+            batch_metrics = {
+                "batch_idx": batch_idx,
+                "lm_loss": loss,
+                "perplexity": math.exp(min(loss, 20)),  # Clamp to avoid overflow
+                "num_tokens_on_critical_path": critical_path,
+                "per_layer": {},
+            }
+
+            for layer_idx in sorted(batch_stats.keys()):
+                layer_data = batch_stats[layer_idx]
+                batch_metrics["per_layer"][layer_idx] = {
+                    "max_tokens_per_expert": layer_data["max_tokens_per_expert"],
+                    "load_balancing_entropy": layer_data["load_balancing_entropy"],
+                    "max_entropy": layer_data["max_entropy"],
+                    "tokens_per_expert_std": layer_data["tokens_per_expert_std"],
+                    "tokens_per_expert_mean": layer_data["tokens_per_expert_mean"],
+                    "ideal_load_per_expert": layer_data["ideal_load_per_expert"],
+                }
+
+            all_batch_metrics.append(batch_metrics)
+
+            if (batch_idx + 1) % 10 == 0:
+                avg_loss = total_loss / num_evaluated
+                print(f"  Batch {batch_idx + 1}/{args.num_batches}: "
+                      f"loss={avg_loss:.4f}, critical_path={critical_path:.0f}")
+
+    routing_hook.remove_hooks()
+
+    if num_evaluated == 0:
+        print("ERROR: No batches evaluated.")
+        return
+
+    # Aggregate results
+    avg_loss = total_loss / num_evaluated
+    avg_ppl = math.exp(min(avg_loss, 20))
+    avg_critical_path = sum(m["num_tokens_on_critical_path"] for m in all_batch_metrics) / num_evaluated
+
+    # Per-layer averages
+    per_layer_avg = {}
+    for layer_idx in range(num_moe_layers):
+        layer_entries = [m["per_layer"].get(layer_idx) for m in all_batch_metrics
+                         if layer_idx in m.get("per_layer", {})]
+        if layer_entries:
+            per_layer_avg[layer_idx] = {
+                "max_tokens_per_expert": sum(e["max_tokens_per_expert"] for e in layer_entries) / len(layer_entries),
+                "load_balancing_entropy": sum(e["load_balancing_entropy"] for e in layer_entries) / len(layer_entries),
+                "max_entropy": layer_entries[0]["max_entropy"],
+                "tokens_per_expert_std": sum(e["tokens_per_expert_std"] for e in layer_entries) / len(layer_entries),
+                "tokens_per_expert_mean": sum(e["tokens_per_expert_mean"] for e in layer_entries) / len(layer_entries),
+                "ideal_load_per_expert": layer_entries[0]["ideal_load_per_expert"],
+            }
+
+    # Compute ideal critical path (perfectly balanced)
+    if per_layer_avg:
+        first_layer = per_layer_avg[min(per_layer_avg.keys())]
+        ideal_critical_path = num_moe_layers * first_layer["ideal_load_per_expert"]
+    else:
+        ideal_critical_path = 0
+
+    # Theoretical speedup
+    speedup_vs_ideal = avg_critical_path / ideal_critical_path if ideal_critical_path > 0 else float("inf")
+    speedup_vs_baseline = None
+    if args.baseline_critical_path is not None and args.baseline_critical_path > 0:
+        speedup_vs_baseline = args.baseline_critical_path / avg_critical_path
+
+    # Build results
+    results = {
+        "summary": {
+            "avg_lm_loss": avg_loss,
+            "avg_perplexity": avg_ppl,
+            "avg_num_tokens_on_critical_path": avg_critical_path,
+            "ideal_critical_path": ideal_critical_path,
+            "critical_path_ratio": speedup_vs_ideal,
+            "theoretical_speedup_vs_baseline": speedup_vs_baseline,
+            "num_moe_layers": num_moe_layers,
+            "num_batches_evaluated": num_evaluated,
+        },
+        "per_layer_averages": {str(k): v for k, v in per_layer_avg.items()},
+        "config": {
+            "model_path": args.model_path,
+            "dataset_name": args.dataset_name,
+            "dataset_config": args.dataset_config,
+            "batch_size": args.batch_size,
+            "seq_length": args.seq_length,
+            "num_batches": args.num_batches,
+            "dtype": args.dtype,
+        },
     }
 
-    # Print results
-    print("\n" + "=" * 70)
-    print(f"CRITICAL PATH METRICS: {summary['config']['label']}")
+    # Print summary
+    print()
     print("=" * 70)
-    cp = summary['critical_path']
-    print(f"  MoE Layers:            {summary['num_moe_layers']}")
-    print(f"  Critical Path (mean):  {cp['mean']:.1f} tokens")
-    print(f"  Critical Path (std):   {cp['std']:.1f}")
-    print(f"  Critical Path (p95):   {cp['p95']:.1f}")
-    print(f"  Ideal Critical Path:   {summary['ideal_critical_path']:.1f}")
-    print(f"  Imbalance Ratio:       {summary['imbalance_ratio']['mean']:.3f}x")
-    print(f"  Normalized Entropy:    {summary['normalized_entropy']['mean']:.4f}")
-    if summary['lm_loss']['mean']:
-        print(f"  LM Loss (mean):        {summary['lm_loss']['mean']:.4f}")
-        print(f"  Perplexity:            {summary['lm_loss']['perplexity']:.2f}")
-    print(f"\n  Top-5 Bottleneck Layers: {summary['bottleneck_layers']}")
+    print("CRITICAL PATH & LOAD METRICS SUMMARY")
+    print("=" * 70)
+    print(f"  Model:                          {args.model_path}")
+    print(f"  MoE layers:                     {num_moe_layers}")
+    print(f"  Batches evaluated:              {num_evaluated}")
+    print(f"  Avg LM loss:                    {avg_loss:.4f}")
+    print(f"  Avg perplexity:                 {avg_ppl:.2f}")
+    print(f"  Avg critical path (tokens):     {avg_critical_path:.1f}")
+    print(f"  Ideal critical path (tokens):   {ideal_critical_path:.1f}")
+    print(f"  Critical path ratio:            {speedup_vs_ideal:.4f}x ideal")
+    if speedup_vs_baseline is not None:
+        print(f"  Speedup vs baseline:            {speedup_vs_baseline:.4f}x")
+    print()
+
+    # Per-layer table
+    print("Per-layer averages:")
+    print(f"  {'Layer':>5s}  {'MaxTPE':>8s}  {'Entropy':>8s}  {'MaxEnt':>8s}  {'StdTPE':>8s}  {'MeanTPE':>8s}  {'Ideal':>8s}")
+    print("  " + "-" * 62)
+    for layer_idx in sorted(per_layer_avg.keys()):
+        d = per_layer_avg[layer_idx]
+        print(f"  {layer_idx:5d}  {d['max_tokens_per_expert']:8.1f}  "
+              f"{d['load_balancing_entropy']:8.4f}  {d['max_entropy']:8.4f}  "
+              f"{d['tokens_per_expert_std']:8.2f}  {d['tokens_per_expert_mean']:8.2f}  "
+              f"{d['ideal_load_per_expert']:8.2f}")
     print("=" * 70)
 
     # Save results
-    output_file = args.output_file
-    with open(output_file, 'w') as f:
-        json.dump(summary, f, indent=2, default=str)
-    print(f"\nResults saved to: {output_file}")
-
-    collector.remove_hooks()
-    return summary
+    os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
+    with open(args.output_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved to: {args.output_path}")
 
 
 if __name__ == "__main__":

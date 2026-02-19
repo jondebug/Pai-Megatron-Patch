@@ -1,179 +1,229 @@
+#!/usr/bin/env python3
 """
-measure_latency.py -- Measure actual inference latency for MoE models.
+measure_latency.py -- Actual Inference Timing
 
-Compares wall-clock forward pass latency between checkpoints to validate
-that critical path reduction translates to real speedup.
+Measures wall-clock inference latency for a HuggingFace model checkpoint.
+Runs N forward-pass batches, discards warmup iterations, and reports
+latency statistics (mean, p50, p95, p99).
+
+Can compare two checkpoints (baseline vs optimized) in a single run.
 
 Usage:
+    # Single model
     python measure_latency.py \
         --model-path /path/to/hf/checkpoint \
-        --num-batches 100 \
-        --warmup-batches 10 \
-        --batch-size 1 \
-        --seq-length 128 \
-        --output-file latency_results.json
+        --output-path ./latency_results.json \
+        [--num-batches 100] [--warmup-batches 10] \
+        [--batch-size 4] [--seq-length 2048]
 
-For comparing two checkpoints:
+    # Compare two models
     python measure_latency.py \
-        --model-path /path/to/baseline \
-        --compare-path /path/to/optimized \
-        --output-file latency_comparison.json
+        --model-path /path/to/optimized \
+        --baseline-model-path /path/to/baseline \
+        --output-path ./latency_comparison.json
 """
 
 import argparse
 import json
+import math
 import os
 import time
-import sys
 
-import torch
 import numpy as np
+import torch
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Measure MoE inference latency")
-    parser.add_argument("--model-path", required=True, help="Path to HuggingFace model")
-    parser.add_argument("--compare-path", default=None, help="Second model to compare against")
-    parser.add_argument("--num-batches", type=int, default=100, help="Number of batches to time")
-    parser.add_argument("--warmup-batches", type=int, default=10, help="Warmup batches (discarded)")
-    parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
-    parser.add_argument("--seq-length", type=int, default=128, help="Sequence length")
-    parser.add_argument("--output-file", default="latency_results.json", help="Output JSON file")
-    parser.add_argument("--device", default="cuda:0", help="Device to use (single GPU)")
-    parser.add_argument("--label", default=None, help="Label for this checkpoint")
-    parser.add_argument("--compare-label", default=None, help="Label for comparison checkpoint")
+    parser = argparse.ArgumentParser(description="Measure inference latency")
+    parser.add_argument("--model-path", type=str, required=True,
+                        help="Path to HuggingFace model checkpoint")
+    parser.add_argument("--baseline-model-path", type=str, default=None,
+                        help="Path to baseline HuggingFace model for comparison")
+    parser.add_argument("--output-path", type=str, default="./latency_results.json",
+                        help="Path to save results JSON")
+    parser.add_argument("--num-batches", type=int, default=100,
+                        help="Number of batches for timing (excluding warmup)")
+    parser.add_argument("--warmup-batches", type=int, default=10,
+                        help="Number of warmup batches to discard")
+    parser.add_argument("--batch-size", type=int, default=4,
+                        help="Batch size")
+    parser.add_argument("--seq-length", type=int, default=2048,
+                        help="Sequence length")
+    parser.add_argument("--dtype", type=str, default="bfloat16",
+                        choices=["float16", "bfloat16", "float32"],
+                        help="Model dtype")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="Device to run on")
     return parser.parse_args()
 
 
-def measure_model_latency(model_path, device, num_batches, warmup_batches,
-                          batch_size, seq_length, label=None):
-    """Load a model and measure per-batch forward pass latency."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+def generate_synthetic_batch(batch_size, seq_length, vocab_size, device):
+    """Generate a synthetic input batch for timing."""
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_length), device=device)
+    return input_ids
 
-    print(f"\n{'='*60}")
-    print(f"Measuring latency: {label or model_path}")
-    print(f"{'='*60}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+def measure_model_latency(model_path, args, device):
+    """Load a model and measure its forward-pass latency.
+
+    Returns:
+        dict with latency statistics and the loaded model's config info.
+    """
+    from transformers import AutoModelForCausalLM, AutoConfig
+
+    dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
+    model_dtype = dtype_map[args.dtype]
+
+    print(f"Loading model: {model_path}")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
+        torch_dtype=model_dtype,
+        device_map=device,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        device_map={"": device},
     )
     model.eval()
 
-    vocab_size = tokenizer.vocab_size or 32000
+    vocab_size = config.vocab_size
 
-    # Warmup
-    print(f"  Warming up ({warmup_batches} batches)...")
-    for _ in range(warmup_batches):
-        input_ids = torch.randint(100, vocab_size, (batch_size, seq_length), device=device)
-        with torch.no_grad():
-            _ = model(input_ids)
-        torch.cuda.synchronize()
-
-    # Timed runs
-    print(f"  Timing {num_batches} batches...")
+    total_batches = args.warmup_batches + args.num_batches
     latencies_ms = []
-    for i in range(num_batches):
-        input_ids = torch.randint(100, vocab_size, (batch_size, seq_length), device=device)
 
-        torch.cuda.synchronize()
-        start = time.perf_counter()
+    print(f"Running {args.warmup_batches} warmup + {args.num_batches} timed batches "
+          f"(bs={args.batch_size}, seq_len={args.seq_length})...")
 
-        with torch.no_grad():
-            _ = model(input_ids)
+    with torch.no_grad():
+        for i in range(total_batches):
+            input_ids = generate_synthetic_batch(
+                args.batch_size, args.seq_length, vocab_size, device
+            )
 
-        torch.cuda.synchronize()
-        end = time.perf_counter()
+            # Synchronize before timing
+            if device == "cuda" or (isinstance(device, str) and device.startswith("cuda")):
+                torch.cuda.synchronize()
 
-        latency_ms = (end - start) * 1000
-        latencies_ms.append(latency_ms)
+            start = time.perf_counter()
+            _ = model(input_ids=input_ids)
 
+            if device == "cuda" or (isinstance(device, str) and device.startswith("cuda")):
+                torch.cuda.synchronize()
+
+            end = time.perf_counter()
+            elapsed_ms = (end - start) * 1000.0
+
+            if i >= args.warmup_batches:
+                latencies_ms.append(elapsed_ms)
+
+            if (i + 1) % 20 == 0:
+                phase = "warmup" if i < args.warmup_batches else "timed"
+                print(f"  Batch {i + 1}/{total_batches} ({phase}): {elapsed_ms:.2f} ms")
+
+    # Free model memory
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Compute statistics
     latencies = np.array(latencies_ms)
-
-    results = {
-        'label': label or os.path.basename(model_path),
-        'model_path': model_path,
-        'num_batches': num_batches,
-        'warmup_batches': warmup_batches,
-        'batch_size': batch_size,
-        'seq_length': seq_length,
-        'device': device,
-        'latency_ms': {
-            'mean': float(latencies.mean()),
-            'std': float(latencies.std()),
-            'min': float(latencies.min()),
-            'max': float(latencies.max()),
-            'p50': float(np.percentile(latencies, 50)),
-            'p90': float(np.percentile(latencies, 90)),
-            'p95': float(np.percentile(latencies, 95)),
-            'p99': float(np.percentile(latencies, 99)),
-        },
-        'throughput_tokens_per_sec': float(
-            (batch_size * seq_length) / (latencies.mean() / 1000)
+    stats = {
+        "model_path": model_path,
+        "num_batches": len(latencies),
+        "batch_size": args.batch_size,
+        "seq_length": args.seq_length,
+        "dtype": args.dtype,
+        "mean_ms": float(np.mean(latencies)),
+        "std_ms": float(np.std(latencies)),
+        "p50_ms": float(np.percentile(latencies, 50)),
+        "p95_ms": float(np.percentile(latencies, 95)),
+        "p99_ms": float(np.percentile(latencies, 99)),
+        "min_ms": float(np.min(latencies)),
+        "max_ms": float(np.max(latencies)),
+        "throughput_samples_per_sec": float(args.batch_size * 1000.0 / np.mean(latencies)),
+        "throughput_tokens_per_sec": float(
+            args.batch_size * args.seq_length * 1000.0 / np.mean(latencies)
         ),
     }
 
-    # Print summary
-    lat = results['latency_ms']
-    print(f"\n  Results:")
-    print(f"    Mean:   {lat['mean']:.2f} ms")
-    print(f"    Std:    {lat['std']:.2f} ms")
-    print(f"    P50:    {lat['p50']:.2f} ms")
-    print(f"    P95:    {lat['p95']:.2f} ms")
-    print(f"    P99:    {lat['p99']:.2f} ms")
-    print(f"    Throughput: {results['throughput_tokens_per_sec']:.0f} tokens/sec")
+    return stats
 
-    # Free memory
-    del model
-    torch.cuda.empty_cache()
 
-    return results
+def print_stats(stats, label="Model"):
+    """Print latency statistics in a formatted table."""
+    print(f"\n  {label}:")
+    print(f"    Path:                {stats['model_path']}")
+    print(f"    Mean latency:        {stats['mean_ms']:8.2f} ms  (std: {stats['std_ms']:.2f})")
+    print(f"    P50 latency:         {stats['p50_ms']:8.2f} ms")
+    print(f"    P95 latency:         {stats['p95_ms']:8.2f} ms")
+    print(f"    P99 latency:         {stats['p99_ms']:8.2f} ms")
+    print(f"    Min / Max:           {stats['min_ms']:8.2f} / {stats['max_ms']:.2f} ms")
+    print(f"    Throughput:          {stats['throughput_samples_per_sec']:8.2f} samples/sec")
+    print(f"    Token throughput:    {stats['throughput_tokens_per_sec']:8.0f} tokens/sec")
 
 
 def main():
     args = parse_args()
 
-    results = {}
+    device = args.device
+    if device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU")
+        device = "cpu"
 
     # Measure primary model
-    primary = measure_model_latency(
-        args.model_path, args.device, args.num_batches, args.warmup_batches,
-        args.batch_size, args.seq_length,
-        label=args.label or "primary"
-    )
-    results['primary'] = primary
+    print("=" * 70)
+    print("LATENCY MEASUREMENT")
+    print("=" * 70)
 
-    # Measure comparison model if provided
-    if args.compare_path:
-        comparison = measure_model_latency(
-            args.compare_path, args.device, args.num_batches, args.warmup_batches,
-            args.batch_size, args.seq_length,
-            label=args.compare_label or "comparison"
-        )
-        results['comparison'] = comparison
+    optimized_stats = measure_model_latency(args.model_path, args, device)
 
-        # Compute speedup
-        speedup = primary['latency_ms']['mean'] / comparison['latency_ms']['mean']
-        results['speedup'] = {
-            'mean_latency_ratio': speedup,
-            'throughput_ratio': comparison['throughput_tokens_per_sec'] / primary['throughput_tokens_per_sec'],
+    # Optionally measure baseline
+    baseline_stats = None
+    if args.baseline_model_path is not None:
+        print()
+        baseline_stats = measure_model_latency(args.baseline_model_path, args, device)
+
+    # Build results
+    results = {
+        "optimized": optimized_stats,
+    }
+
+    if baseline_stats is not None:
+        results["baseline"] = baseline_stats
+        speedup = baseline_stats["mean_ms"] / optimized_stats["mean_ms"]
+        results["comparison"] = {
+            "speedup": speedup,
+            "baseline_mean_ms": baseline_stats["mean_ms"],
+            "optimized_mean_ms": optimized_stats["mean_ms"],
+            "latency_reduction_pct": (1.0 - optimized_stats["mean_ms"] / baseline_stats["mean_ms"]) * 100,
         }
 
-        print(f"\n{'='*60}")
-        print(f"COMPARISON: {primary['label']} vs {comparison['label']}")
-        print(f"{'='*60}")
-        print(f"  {primary['label']:>20s}: {primary['latency_ms']['mean']:.2f} ms (mean)")
-        print(f"  {comparison['label']:>20s}: {comparison['latency_ms']['mean']:.2f} ms (mean)")
-        print(f"  {'Speedup':>20s}: {speedup:.3f}x")
-        print(f"{'='*60}")
+    # Print summary
+    print()
+    print("=" * 70)
+    print("LATENCY RESULTS SUMMARY")
+    print("=" * 70)
+
+    if baseline_stats is not None:
+        print_stats(baseline_stats, "Baseline")
+    print_stats(optimized_stats, "Optimized" if baseline_stats else "Model")
+
+    if baseline_stats is not None:
+        speedup = results["comparison"]["speedup"]
+        reduction = results["comparison"]["latency_reduction_pct"]
+        print(f"\n  Comparison:")
+        print(f"    Speedup:             {speedup:.4f}x")
+        print(f"    Latency reduction:   {reduction:.2f}%")
+
+    print("=" * 70)
 
     # Save results
-    with open(args.output_file, 'w') as f:
+    os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
+    with open(args.output_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\nResults saved to: {args.output_file}")
+    print(f"\nResults saved to: {args.output_path}")
 
 
 if __name__ == "__main__":

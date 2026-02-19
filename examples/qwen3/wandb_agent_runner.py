@@ -37,64 +37,69 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
     
     parts = []
     
+    # Determine if RL is active for this specific run
+    rl_active = all_params.get('use_rl_loss', True)
+    
     # Only include parameters that are in sweep_params (i.e., they vary across runs).
-    # Map each sweep param to a short, readable name fragment.
+    # RL-specific params are skipped entirely when use_rl_loss=False.
     
-    # Reward type (short names)
-    if 'rl_reward_type' in sweep_params:
-        _REWARD_SHORT = {
-            'critical_path': 'crit',
-            'topn_load': 'topn',
-            'per_token_topn_binary': 'ptbin',
-            'per_token_load_weighted': 'ptload',
-            'entropy': 'entr',
-            'expert0': 'exp0',
-        }
-        rt = sweep_params['rl_reward_type']
-        parts.append(_REWARD_SHORT.get(rt, rt))
+    if rl_active:
+        # Reward type (short names)
+        if 'rl_reward_type' in sweep_params:
+            _REWARD_SHORT = {
+                'critical_path': 'crit',
+                'topn_load': 'topn',
+                'per_token_topn_binary': 'ptbin',
+                'per_token_load_weighted': 'ptload',
+                'entropy': 'entr',
+                'expert0': 'exp0',
+            }
+            rt = sweep_params['rl_reward_type']
+            parts.append(_REWARD_SHORT.get(rt, rt))
+        
+        # Top-N (only meaningful for topn-based rewards)
+        if 'rl_reward_topn' in sweep_params:
+            parts.append(f'n{sweep_params["rl_reward_topn"]}')
+        
+        # RL loss coefficient
+        if 'rl_loss_coeff' in sweep_params:
+            parts.append(f'rlc{sweep_params["rl_loss_coeff"]}')
+        
+        # Discount factor
+        if 'rl_discount_factor' in sweep_params:
+            parts.append(f'g{sweep_params["rl_discount_factor"]}')
+        
+        # Normalize rewards
+        if 'rl_normalize_rewards' in sweep_params:
+            parts.append('norm' if sweep_params['rl_normalize_rewards'] else 'nonorm')
+        
+        # Algorithm (only if it varies)
+        if 'rl_algorithm' in sweep_params:
+            parts.append(sweep_params['rl_algorithm'].upper())
+        
+        # Baseline type (only if it varies)
+        if 'rl_ppo_baseline_type' in sweep_params:
+            parts.append(sweep_params['rl_ppo_baseline_type'])
+        
+        # Entropy coeff (only if it varies)
+        if 'rl_ppo_entropy_coeff' in sweep_params:
+            parts.append(f'ent{sweep_params["rl_ppo_entropy_coeff"]}')
+        
+        # Critic dims (only if it varies)
+        if 'rl_critic_hidden_dims' in sweep_params:
+            dims = sweep_params['rl_critic_hidden_dims']
+            dims_str = 'x'.join(str(d) for d in dims) if isinstance(dims, list) else str(dims)
+            parts.append(f'c{dims_str}')
+    else:
+        # RL is off — just mark it
+        parts.append('norl')
     
-    # Top-N (only meaningful for topn-based rewards)
-    if 'rl_reward_topn' in sweep_params:
-        parts.append(f'n{sweep_params["rl_reward_topn"]}')
-    
-    # RL loss coefficient
-    if 'rl_loss_coeff' in sweep_params:
-        parts.append(f'rlc{sweep_params["rl_loss_coeff"]}')
-    
-    # Discount factor
-    if 'rl_discount_factor' in sweep_params:
-        parts.append(f'g{sweep_params["rl_discount_factor"]}')
+    # Non-RL params (always included when they vary)
     
     # Aux loss coefficient
     if 'moe_aux_loss_coeff' in sweep_params:
         v = sweep_params['moe_aux_loss_coeff']
         parts.append(f'aux{v}' if v and float(v) > 0 else 'noaux')
-    
-    # RL on/off (for baseline runs)
-    if 'use_rl_loss' in sweep_params and not sweep_params['use_rl_loss']:
-        parts.append('norl')
-    
-    # Normalize rewards
-    if 'rl_normalize_rewards' in sweep_params:
-        parts.append('norm' if sweep_params['rl_normalize_rewards'] else 'nonorm')
-    
-    # Algorithm (only if it varies)
-    if 'rl_algorithm' in sweep_params:
-        parts.append(sweep_params['rl_algorithm'].upper())
-    
-    # Baseline type (only if it varies)
-    if 'rl_ppo_baseline_type' in sweep_params:
-        parts.append(sweep_params['rl_ppo_baseline_type'])
-    
-    # Entropy coeff (only if it varies)
-    if 'rl_ppo_entropy_coeff' in sweep_params:
-        parts.append(f'ent{sweep_params["rl_ppo_entropy_coeff"]}')
-    
-    # Critic dims (only if it varies)
-    if 'rl_critic_hidden_dims' in sweep_params:
-        dims = sweep_params['rl_critic_hidden_dims']
-        dims_str = 'x'.join(str(d) for d in dims) if isinstance(dims, list) else str(dims)
-        parts.append(f'c{dims_str}')
     
     # ALF-LB (aux-loss-free load balancing via dynamic expert bias)
     if sweep_params.get('moe_router_enable_expert_bias', False):
@@ -323,6 +328,15 @@ def main():
     except Exception as e:
         print(f"Note: Could not log to wandb: {e}")
     
+    # Capture WandB run ID for post-training benchmark logging
+    wandb_run_id = None
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb_run_id = wandb.run.id
+    except Exception:
+        pass
+    
     # Setup log file
     log_file = None
     if sweep_dir:
@@ -385,6 +399,40 @@ def main():
         print(f"\nLog saved to: {log_file}")
     else:
         result = subprocess.run(cmd, cwd=script_dir)
+    
+    # Submit post-training benchmark if enabled and training succeeded
+    all_params = {**fixed_params, **sweep_params}
+    if result.returncode == 0 and all_params.get('run_benchmarks', False):
+        try:
+            benchmark_script = os.path.join(script_dir, 'benchmarks', 'submit_benchmark.sh')
+            base_output = all_params.get('output_basepath', '/tmp/output')
+            checkpoint_dir = os.path.join(base_output, run_name, 'checkpoint')
+            # Find the actual checkpoint subdirectory (contains iter_XXXXXX)
+            ckpt_subdirs = [d for d in os.listdir(checkpoint_dir) if os.path.isdir(os.path.join(checkpoint_dir, d))]
+            if ckpt_subdirs:
+                checkpoint_dir = os.path.join(checkpoint_dir, ckpt_subdirs[0])
+            
+            benchmark_cmd = [
+                'sbatch',
+                benchmark_script,
+                '--checkpoint-dir', checkpoint_dir,
+                '--run-name', run_name,
+            ]
+            if wandb_run_id:
+                benchmark_cmd.extend(['--wandb-run-id', wandb_run_id])
+            wandb_project = all_params.get('wandb_project_name', 'qwen3-router-training')
+            benchmark_cmd.extend(['--wandb-project', wandb_project])
+            
+            print(f"\nSubmitting benchmark job for: {run_name}")
+            print(f"  Checkpoint: {checkpoint_dir}")
+            print(f"  Command: {' '.join(benchmark_cmd)}")
+            bench_result = subprocess.run(benchmark_cmd, capture_output=True, text=True)
+            if bench_result.returncode == 0:
+                print(f"  Benchmark job submitted: {bench_result.stdout.strip()}")
+            else:
+                print(f"  WARNING: Benchmark submission failed: {bench_result.stderr.strip()}")
+        except Exception as e:
+            print(f"  WARNING: Could not submit benchmark job: {e}")
     
     return result.returncode
 

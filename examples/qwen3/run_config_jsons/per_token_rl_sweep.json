@@ -77,7 +77,7 @@
         {
             "_comment": "RL OFF baselines: only vary aux_loss_coeff, collapse all RL params",
             "if": {"use_rl_loss": false},
-            "collapse": ["rl_loss_coeff", "rl_reward_type", "rl_normalize_rewards", "rl_reward_topn", "rl_algorithm", "rl_ppo_entropy_coeff", "rl_critic_hidden_dims"]
+            "collapse": ["rl_loss_coeff", "rl_reward_type", "rl_normalize_rewards", "rl_reward_topn", "rl_algorithm", "rl_ppo_entropy_coeff", "rl_critic_hidden_dims", "rl_discount_factor"]
         },
         {
             "_comment": "Aux-only baseline: skip the no-aux no-rl case (nothing would change)",

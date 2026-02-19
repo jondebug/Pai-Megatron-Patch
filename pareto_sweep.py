@@ -21,9 +21,11 @@ PROJECT = "qwen3-router-training"
 SWEEP_ID = "84wy7dfg"
 LAST_PERCENT = 0.05
 
-# Key metrics for Pareto analysis
-X_METRIC = "train/num_tokens_on_critical_path"
-Y_METRIC = "train/lm loss"
+# Key metrics for Pareto analysis (prefer eval, fallback to train)
+X_METRIC = "eval/num_tokens_on_critical_path"
+X_METRIC_FALLBACK = "train/num_tokens_on_critical_path"
+Y_METRIC = "eval/lm loss"
+Y_METRIC_FALLBACK = "train/lm loss"
 
 # All config keys to show in tooltip (from sweep config + parsed from name)
 TOOLTIP_KEYS = [
@@ -185,8 +187,8 @@ def fetch_sweep_data(entity, project, sweep_id, last_percent=0.05):
             n_last = max(1, int(len(values) * last_percent))
             last_values = values.iloc[-n_last:]
             
-            # Clean metric name for column
-            clean_name = col.replace("train/", "").replace(" ", "_")
+            # Clean metric name for column (strip train/ or eval/ prefix)
+            clean_name = col.replace("train/", "").replace("eval/", "eval_").replace(" ", "_")
             row[clean_name] = last_values.mean()
             row[f"{clean_name}_var"] = last_values.var() if len(last_values) > 1 else 0.0
         
@@ -239,15 +241,46 @@ def add_binary_flags(df):
     if 'moe_aux_loss_coeff' in df.columns:
         df['aux_loss_active'] = df['moe_aux_loss_coeff'] > 0
     
+    # Override rl_reward_type to "none" for no-RL runs so they form a distinct group
+    if 'rl_reward_type' in df.columns:
+        df.loc[~df['rl_loss_active'], 'rl_reward_type'] = 'none'
+    
     return df
+
+
+def _clean_metric_name(metric):
+    """Convert WandB metric name to dataframe column name."""
+    return metric.replace("train/", "").replace("eval/", "eval_").replace(" ", "_")
 
 
 def create_pareto_plot(df, group_by_cols, x_col, y_col, x_min=None, y_max=None):
     """Create interactive Pareto plot with grouping."""
     
-    # Clean column names (remove train/ prefix)
-    x_clean = x_col.replace("train/", "").replace(" ", "_")
-    y_clean = y_col.replace("train/", "").replace(" ", "_")
+    x_clean = _clean_metric_name(x_col)
+    y_clean = _clean_metric_name(y_col)
+    
+    # Fallback to train metrics if eval columns are missing or all-zero
+    x_fb = _clean_metric_name(X_METRIC_FALLBACK)
+    y_fb = _clean_metric_name(Y_METRIC_FALLBACK)
+    
+    if x_clean not in df.columns and x_fb in df.columns:
+        print(f"  Falling back from {x_clean} to {x_fb}")
+        x_clean = x_fb
+    if y_clean not in df.columns and y_fb in df.columns:
+        print(f"  Falling back from {y_clean} to {y_fb}")
+        y_clean = y_fb
+    
+    # For runs missing eval metrics, fill from train metrics
+    if x_clean in df.columns and x_fb in df.columns and x_clean != x_fb:
+        mask = df[x_clean].isna() | (df[x_clean] == 0)
+        if mask.any():
+            df.loc[mask, x_clean] = df.loc[mask, x_fb]
+            print(f"  Filled {mask.sum()} missing {x_clean} values from {x_fb}")
+    if y_clean in df.columns and y_fb in df.columns and y_clean != y_fb:
+        mask = df[y_clean].isna() | (df[y_clean] == 0)
+        if mask.any():
+            df.loc[mask, y_clean] = df.loc[mask, y_fb]
+            print(f"  Filled {mask.sum()} missing {y_clean} values from {y_fb}")
     
     if x_clean not in df.columns or y_clean not in df.columns:
         print(f"Error: Required columns not found.")
@@ -477,8 +510,13 @@ def main():
         print("DATA SUMMARY")
         print("=" * 60)
         
-        x_clean = X_METRIC.replace("train/", "").replace(" ", "_")
-        y_clean = Y_METRIC.replace("train/", "").replace(" ", "_")
+        x_clean = _clean_metric_name(X_METRIC)
+        y_clean = _clean_metric_name(Y_METRIC)
+        # Use fallback names if primary not available
+        if x_clean not in df.columns:
+            x_clean = _clean_metric_name(X_METRIC_FALLBACK)
+        if y_clean not in df.columns:
+            y_clean = _clean_metric_name(Y_METRIC_FALLBACK)
         
         print(f"\n{x_clean} range: {df[x_clean].min():.2f} - {df[x_clean].max():.2f}")
         print(f"{y_clean} range: {df[y_clean].min():.4f} - {df[y_clean].max():.4f}")
