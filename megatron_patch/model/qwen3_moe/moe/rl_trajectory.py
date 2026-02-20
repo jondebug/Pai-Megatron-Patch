@@ -278,24 +278,29 @@ class RouterTrajectoryTracker:
         
         Args:
             latent_representations: Tensor of shape [seq_length, batch_size, hidden_dim]
-            layer_num: Layer number (used to provide layer-conditional predictions)
+            layer_num: Layer number (used for layer-conditional predictions when critic_layer_aware=True)
             
         Returns:
             Value estimates of shape [seq_length, batch_size]
         """
         device = latent_representations.device
-        # +1 for normalized layer index feature
-        input_dim = latent_representations.shape[-1] + 1
-        critic = self.get_critic(input_dim, device)
+        layer_aware = getattr(self, 'critic_layer_aware', False)
         
-        # Append normalized layer index as an extra feature
-        num_layers = max(self._num_layers, 1)
-        layer_frac = (layer_num / num_layers) if layer_num is not None else 0.0
-        layer_feature = torch.full(
-            latent_representations.shape[:-1] + (1,),
-            layer_frac, device=device, dtype=latent_representations.dtype
-        )
-        critic_input = torch.cat([latent_representations, layer_feature], dim=-1)
+        if layer_aware:
+            input_dim = latent_representations.shape[-1] + 1
+            critic = self.get_critic(input_dim, device)
+            num_layers = max(self._num_layers, 1)
+            layer_frac = (layer_num / num_layers) if layer_num is not None else 0.0
+            layer_feature = torch.full(
+                latent_representations.shape[:-1] + (1,),
+                layer_frac, device=device, dtype=latent_representations.dtype
+            )
+            critic_input = torch.cat([latent_representations, layer_feature], dim=-1)
+        else:
+            input_dim = latent_representations.shape[-1]
+            critic = self.get_critic(input_dim, device)
+            critic_input = latent_representations
+        
         return critic(critic_input)
         
     def add_layer_decision(self, layer_num: int, latent_token_representations: torch.Tensor, routing_map: torch.Tensor, routing_logits: torch.Tensor):

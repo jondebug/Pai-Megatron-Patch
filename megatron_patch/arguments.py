@@ -552,6 +552,9 @@ def get_patch_args(parser):
     group.add_argument('--rl-use-ema-loads', action='store_true', default=False,
                       help='Use exponential moving average of expert loads for reward computation. '
                            'More stable signal across batches, less sensitive to per-batch noise.')
+    group.add_argument('--rl-critic-layer-aware', action='store_true', default=False,
+                      help='Give the critic network the layer index as an input feature. '
+                           'Enables layer-conditional value predictions.')
     group.add_argument('--kl-loss-coeff', type=float, default=0.0,
                       help='KL divergence loss coefficient. 0 = disabled. '
                            'Penalizes deviation of LM output distribution from pretrained reference. '

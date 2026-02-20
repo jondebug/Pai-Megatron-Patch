@@ -326,6 +326,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.normalize_rewards = getattr(args, 'rl_normalize_rewards', False)
     trajectory_tracker.ppo_clip_ratio = getattr(args, 'rl_ppo_clip_ratio', 0.2)
     trajectory_tracker.use_ema_loads = getattr(args, 'rl_use_ema_loads', False)
+    trajectory_tracker.critic_layer_aware = getattr(args, 'rl_critic_layer_aware', False)
     print(f"[RL CONFIG] reward_type={trajectory_tracker.reward_type}, "
           f"baseline_type={trajectory_tracker.baseline_type}, "
           f"per_token_rewards={trajectory_tracker.per_token_rewards}, "

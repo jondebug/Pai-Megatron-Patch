@@ -98,6 +98,10 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
         # EMA loads (only if it varies)
         if sweep_params.get('rl_use_ema_loads', False):
             parts.append('ema')
+        
+        # Layer-aware critic (only if it varies)
+        if 'rl_critic_layer_aware' in sweep_params:
+            parts.append('lcrit' if sweep_params['rl_critic_layer_aware'] else 'nocrit')
     else:
         # RL is off — just mark it
         parts.append('norl')
@@ -191,6 +195,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('rl_per_token_rewards', '--rl-per-token-rewards'),
         ('rl_normalize_rewards', '--rl-normalize-rewards'),
         ('rl_use_ema_loads', '--rl-use-ema-loads'),
+        ('rl_critic_layer_aware', '--rl-critic-layer-aware'),
         ('moe_router_enable_expert_bias', '--moe-router-enable-expert-bias'),
         ('moe_router_topology_aware', '--moe-router-topology-aware'),
     ]
