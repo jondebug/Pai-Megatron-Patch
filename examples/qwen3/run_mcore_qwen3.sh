@@ -394,6 +394,15 @@ if [ $PRETRAIN_CHECKPOINT_PATH != none ]; then
             --load $PRETRAIN_CHECKPOINT_PATH"
 fi
 
+# Auto-resume: if a saved checkpoint exists from a previous run, load from there instead.
+# This enables multi-allocation training (e.g., 10K steps across multiple 4-hour jobs).
+SAVED_CKPT_DIR="${OUTPUT_BASEPATH}/checkpoint/${NAME}"
+if [ -f "${SAVED_CKPT_DIR}/latest_checkpointed_iteration.txt" ]; then
+    SAVED_ITER=$(cat "${SAVED_CKPT_DIR}/latest_checkpointed_iteration.txt" | tr -d '[:space:]')
+    echo "AUTO-RESUME: Found saved checkpoint at iteration ${SAVED_ITER} in ${SAVED_CKPT_DIR}"
+    load_option=" --load ${SAVED_CKPT_DIR}"
+fi
+
 if [ $OPTIMIZER_OFFLOAD != false ]; then
     offload_option=" \
         --optimizer-cpu-offload \

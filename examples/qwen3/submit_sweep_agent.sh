@@ -64,7 +64,46 @@ srun --container-image="$CONTAINER_IMAGE" \
          export WANDB_RESUME=allow
          cd $WORKDIR
          
-         # Launch multiple agents in parallel
+         # Phase 1: Resume incomplete runs from previous allocations.
+         # Check the latest sweep dir for runs with checkpoints that haven't finished.
+         SWEEP_DIR=\$(readlink -f sweep_logs/latest 2>/dev/null)
+         if [ -n \"\$SWEEP_DIR\" ] && [ -f \"\$SWEEP_DIR/sweep_combinations.json\" ]; then
+             COMBOS=\$SWEEP_DIR/sweep_combinations.json
+             CONFIG=\$SWEEP_DIR/sweep_config.json
+             OUTPUT_BASE=\$(python3 -c \"import json; print(json.load(open('\$CONFIG')).get('output_basepath',''))\" 2>/dev/null)
+             TRAIN_ITERS=\$(python3 -c \"import json; c=json.load(open('\$CONFIG')); print(c.get('train_iters', c.get('fixed_params',{}).get('train_iters',0)))\" 2>/dev/null)
+             N_COMBOS=\$(python3 -c \"import json; print(len(json.load(open('\$COMBOS')).get('combinations',[])))\" 2>/dev/null)
+             
+             if [ -n \"\$OUTPUT_BASE\" ] && [ \"\$TRAIN_ITERS\" -gt 0 ] 2>/dev/null; then
+                 echo \"Checking for incomplete runs (target: \$TRAIN_ITERS steps)...\"
+                 for IDX in \$(seq 0 \$((N_COMBOS - 1))); do
+                     # Build the run name to find its checkpoint directory
+                     RUN_NAME=\$(python3 -c \"
+import sys; sys.path.insert(0,'.')
+from wandb_agent_runner import build_run_name, load_combinations
+combos, fixed, _, _ = load_combinations('\$COMBOS')
+if $IDX < len(combos):
+    print(build_run_name(combos[$IDX], $IDX, fixed))
+\" 2>/dev/null)
+                     [ -z \"\$RUN_NAME\" ] && continue
+                     
+                     CKPT_DIR=\"\$OUTPUT_BASE/checkpoint/\$RUN_NAME\"
+                     ITER_FILE=\"\$CKPT_DIR/latest_checkpointed_iteration.txt\"
+                     if [ -f \"\$ITER_FILE\" ]; then
+                         SAVED_ITER=\$(cat \"\$ITER_FILE\" | tr -d '[:space:]')
+                         if [ \"\$SAVED_ITER\" -lt \"\$TRAIN_ITERS\" ] 2>/dev/null; then
+                             echo \"RESUME: \$RUN_NAME at iter \$SAVED_ITER/\$TRAIN_ITERS\"
+                             python3 wandb_agent_runner.py --run_index \$IDX --sweep-dir \"\$SWEEP_DIR\" &
+                             RESUME_PID=\$!
+                             wait \$RESUME_PID
+                             echo \"Resume of \$RUN_NAME completed (exit \$?)\"
+                         fi
+                     fi
+                 done
+             fi
+         fi
+         
+         # Phase 2: Launch wandb agents for new (unstarted) configs
          PIDS=()
          for i in \$(seq 1 $AGENTS_PER_JOB); do
              echo \"Starting agent \$i of $AGENTS_PER_JOB\"

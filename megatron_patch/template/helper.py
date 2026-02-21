@@ -299,6 +299,13 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
             loss_dict['num_tokens_on_critical_path'] = num_critical_path
             critical_metrics['critical/num_tokens_on_critical_path'] = num_critical_path.item()
         
+        if 'locality_ratio' in tracker and 'values' in tracker['locality_ratio']:
+            lr_values = tracker['locality_ratio']['values'].float()
+            lr_avg = lr_values.sum() / max(1, len(lr_values.nonzero()))
+            critical_metrics['critical/locality_ratio'] = lr_avg.item()
+            critical_metrics['critical/locality_ratio_max'] = lr_values.max().item()
+            critical_metrics['critical/locality_ratio_min'] = lr_values.min().item()
+        
         # Clear the tracker for next iteration
         clear_aux_losses_tracker()
 
@@ -339,6 +346,11 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
     rl_algorithm = getattr(args, 'rl_algorithm', 'reinforce').lower()
     rl_discount_factor = getattr(args, 'rl_discount_factor', 0.9)
+    
+    # Inject per-token LM cross-entropy as additional reward if enabled
+    lm_reward_coeff = getattr(args, 'rl_lm_reward_coeff', 0.0)
+    if lm_reward_coeff > 0:
+        trajectory_tracker.inject_lm_reward(output_tensor, lm_reward_coeff)
     
     # Compute RL loss based on selected algorithm
     if rl_algorithm == 'ppo':

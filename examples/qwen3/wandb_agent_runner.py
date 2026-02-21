@@ -102,6 +102,12 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
         # Layer-aware critic (only if it varies)
         if 'rl_critic_layer_aware' in sweep_params:
             parts.append('lcrit' if sweep_params['rl_critic_layer_aware'] else 'nocrit')
+        
+        # LM reward coefficient
+        if 'rl_lm_reward_coeff' in sweep_params:
+            v = sweep_params['rl_lm_reward_coeff']
+            if v and float(v) > 0:
+                parts.append(f'lm{v}')
     else:
         # RL is off — just mark it
         parts.append('norl')
@@ -126,6 +132,12 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
     if all_params.get('moe_router_topology_aware', False):
         lam = sweep_params.get('moe_router_topology_lambda', all_params.get('moe_router_topology_lambda', 0.01))
         parts.append(f'topo{lam}')
+    
+    # Critical-path dynamic bias
+    if all_params.get('moe_router_critical_path_bias', False):
+        topn = sweep_params.get('moe_router_critical_path_topn', all_params.get('moe_router_critical_path_topn', 1))
+        alpha = sweep_params.get('moe_router_critical_path_alpha', all_params.get('moe_router_critical_path_alpha', 0.001))
+        parts.append(f'cpb_n{topn}_a{alpha}')
     
     # KL loss coefficient
     if 'kl_loss_coeff' in sweep_params:
@@ -198,6 +210,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('rl_critic_layer_aware', '--rl-critic-layer-aware'),
         ('moe_router_enable_expert_bias', '--moe-router-enable-expert-bias'),
         ('moe_router_topology_aware', '--moe-router-topology-aware'),
+        ('moe_router_critical_path_bias', '--moe-router-critical-path-bias'),
     ]
     
     for config_key, flag in bool_flags:
@@ -220,8 +233,12 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('moe_router_score_function', '--moe-router-score-function'),
         ('moe_router_bias_update_rate', '--moe-router-bias-update-rate'),
         ('moe_router_load_balancing_type', '--moe-router-load-balancing-type'),
+        ('rl_lm_reward_coeff', '--rl-lm-reward-coeff'),
         ('kl_loss_coeff', '--kl-loss-coeff'),
         ('moe_router_topology_lambda', '--moe-router-topology-lambda'),
+        ('moe_router_critical_path_topn', '--moe-router-critical-path-topn'),
+        ('moe_router_critical_path_alpha', '--moe-router-critical-path-alpha'),
+        ('exit_duration_in_mins', '--exit-duration-in-mins'),
         ('train_iters', '--train-iters'),
         ('eval_interval', '--eval-interval'),
         ('eval_iters', '--eval-iters'),
@@ -291,7 +308,33 @@ def main():
     sweep_params = combinations[args.run_index]
     run_name = build_run_name(sweep_params, args.run_index, fixed_params)
     
-    # Log sweep parameters to wandb (wandb agent already initialized a run)
+    # WandB resume: if this run was previously started, resume the same wandb run
+    # instead of creating a new one. This enables multi-allocation training.
+    all_params_for_resume = {**fixed_params, **sweep_params}
+    base_output = all_params_for_resume.get('output_basepath', '/tmp/output')
+    run_output_dir = os.path.join(base_output, 'checkpoint', run_name)
+    wandb_id_file = os.path.join(run_output_dir, 'wandb_run_id.txt')
+    
+    try:
+        import wandb
+        if os.path.exists(wandb_id_file):
+            saved_id = open(wandb_id_file).read().strip()
+            print(f"RESUME: Found previous wandb run ID: {saved_id}")
+            if wandb.run is not None:
+                wandb.finish(quiet=True)
+            wandb_project = all_params_for_resume.get('wandb_project_name', 'qwen3-router-training')
+            wandb.init(id=saved_id, resume="must", project=wandb_project,
+                       entity="nvr-israel", name=run_name)
+            print(f"RESUMED wandb run: {saved_id}")
+        elif wandb.run is not None:
+            os.makedirs(run_output_dir, exist_ok=True)
+            with open(wandb_id_file, 'w') as f:
+                f.write(wandb.run.id)
+            print(f"SAVED wandb run ID: {wandb.run.id} to {wandb_id_file}")
+    except Exception as e:
+        print(f"Note: WandB resume handling: {e}")
+
+    # Log sweep parameters to wandb
     try:
         import wandb
         if wandb.run is not None:

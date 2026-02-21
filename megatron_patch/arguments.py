@@ -546,6 +546,10 @@ def get_patch_args(parser):
                       help='Discount factor (gamma) for RL returns calculation (default: 0.9). Lower values weight immediate rewards more.')
     group.add_argument('--rl-normalize-rewards', action='store_true', default=False,
                       help='Enable running-mean/std reward normalization. Expands compressed reward ranges to [-1, +1] for stronger RL gradients.')
+    group.add_argument('--rl-lm-reward-coeff', type=float, default=0.0,
+                      help='Coefficient (beta) for per-token LM cross-entropy reward. '
+                           '0 = disabled. When > 0, adds -cross_entropy(token) as an additional '
+                           'reward component to all layers, centered per-batch.')
     group.add_argument('--rl-ppo-clip-ratio', type=float, default=0.2,
                       help='PPO clipping ratio for policy updates (default: 0.2). '
                            'Lower values are more conservative, higher allow larger updates.')
@@ -566,6 +570,15 @@ def get_patch_args(parser):
     group.add_argument('--moe-router-topology-lambda', type=float, default=0.01,
                       help='Locality bias strength for topology-aware routing. '
                            'Higher values favor local experts more aggressively (default: 0.01).')
+    group.add_argument('--moe-router-critical-path-bias', action='store_true', default=False,
+                      help='Enable critical-path dynamic bias: after each batch, reduce bias '
+                           'for the top-N most loaded experts per layer. Only targets the peak, '
+                           'leaving other experts undisturbed. Can combine with aux loss and topology bias.')
+    group.add_argument('--moe-router-critical-path-topn', type=int, default=1,
+                      help='Number of most-loaded experts to penalize per layer (default: 1). '
+                           'N=1 targets only the single bottleneck expert.')
+    group.add_argument('--moe-router-critical-path-alpha', type=float, default=0.001,
+                      help='Bias update rate for critical-path bias (default: 0.001).')
     group.add_argument('--enable-wandb-logging', action='store_true', default=False,
                       help='Enable wandb logging for training metrics')
     group.add_argument('--wandb-project-name', type=str, default='qwen3-moe-training',

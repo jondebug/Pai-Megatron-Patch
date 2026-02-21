@@ -306,7 +306,7 @@ class RouterTrajectoryTracker:
     def add_layer_decision(self, layer_num: int, latent_token_representations: torch.Tensor, routing_map: torch.Tensor, routing_logits: torch.Tensor):
         """Add routing decision from a MoE layer.
         
-        Args:
+        Args:   
             layer_num (int): Layer number (1-indexed)
             latent_token_representations (torch.Tensor) - state space
             routing_map (torch.Tensor): Token routing assignments - action space
@@ -381,6 +381,39 @@ class RouterTrajectoryTracker:
             routing_logits,
             reward
         )
+
+    def inject_lm_reward(self, per_token_losses: torch.Tensor, lm_reward_coeff: float):
+        """Add per-token LM cross-entropy as an additional reward component to all layers.
+
+        Called from loss_func_with_rl after the forward pass produces per-token losses.
+        The LM reward is: -cross_entropy (lower loss = higher reward), centered per-batch
+        to remove data-driven variance and isolate routing-driven quality effects.
+
+        Args:
+            per_token_losses: Per-token cross-entropy, shape [seq_len * batch_size] or [seq_len, batch_size]
+            lm_reward_coeff: Scaling factor (beta) for the LM reward component
+        """
+        if not self.layer_decisions or lm_reward_coeff == 0:
+            return
+
+        example_layer = next(iter(self.layer_decisions.values()))
+        target_shape = example_layer[3].shape  # reward shape: [seq_len, batch_size] or scalar
+
+        lm_reward = -per_token_losses.float().detach()
+
+        if lm_reward.dim() == 1 and len(target_shape) == 2:
+            seq_len, batch_size = target_shape
+            lm_reward = lm_reward.view(seq_len, batch_size)
+
+        # Center per-batch to remove data-driven variance
+        lm_reward = lm_reward - lm_reward.mean()
+
+        for layer_num, (latent, routing_map, logits, load_reward) in self.layer_decisions.items():
+            if load_reward.dim() == 0 and lm_reward.dim() > 0:
+                combined = load_reward + lm_reward_coeff * lm_reward.mean()
+            else:
+                combined = load_reward + lm_reward_coeff * lm_reward
+            self.layer_decisions[layer_num] = (latent, routing_map, logits, combined)
 
     def focus_tokens_on_expert_0_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
         """Reward to focus token routing on expert 0.

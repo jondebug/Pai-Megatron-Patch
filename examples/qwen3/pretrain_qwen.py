@@ -155,10 +155,13 @@ def setup_wandb_logging():
                     saved_consumed = args.consumed_valid_samples
                     args.consumed_valid_samples = 0
                     
+                    import time as _time
+                    _eval_start = _time.monotonic()
                     total_loss_dict, collected_non_loss_data, timelimit = original_evaluate_fn(
                         forward_step_func, data_iterator, model,
                         process_non_loss_data_func, config, verbose, non_loss_data_func,
                     )
+                    _eval_wall_time = _time.monotonic() - _eval_start
                     
                     # Restore consumed_valid_samples (don't let it accumulate)
                     args.consumed_valid_samples = saved_consumed
@@ -183,9 +186,12 @@ def setup_wandb_logging():
                             _CRITICAL_EVAL_MAP = {
                                 "lm loss": "critical_eval/lm_loss",
                                 "num_tokens_on_critical_path": "critical_eval/critical_path",
-                                "aux_loss": "critical_eval/aux_loss",
-                                "load_balancing_entropy": "critical_eval/lb_entropy",
-                                "max_tokens_per_expert": "critical_eval/max_tokens_per_expert",
+                                # "aux_loss": "critical_eval/aux_loss",
+                                # "load_balancing_entropy": "critical_eval/lb_entropy",
+                                # "max_tokens_per_expert": "critical_eval/max_tokens_per_expert",
+                                "locality_ratio": "critical_eval/locality_ratio",
+                                # "locality_ratio_max": "critical_eval/locality_ratio_max",
+                                # "locality_ratio_min": "critical_eval/locality_ratio_min",
                                 "rl_loss": "critical_eval/rl_loss",
                                 "rl_mean_reward": "critical_eval/rl_mean_reward",
                                 "rl_value_loss": "critical_eval/rl_value_loss",
@@ -196,6 +202,8 @@ def setup_wandb_logging():
                             for raw_key, clean_key in _CRITICAL_EVAL_MAP.items():
                                 if f"eval/{raw_key}" in eval_metrics:
                                     eval_metrics[clean_key] = eval_metrics[f"eval/{raw_key}"]
+                            
+                            eval_metrics["critical_eval/wall_time_sec"] = _eval_wall_time
                             
                             if eval_metrics:
                                 iteration = _eval_state.get("iteration", 0)
@@ -385,6 +393,18 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
             if 'router' in module.__class__.__name__.lower():
                 module._topology_aware = True
                 module._topology_lambda = topo_lambda
+
+    # Initialize critical-path dynamic bias if enabled
+    cp_bias = getattr(args, 'moe_router_critical_path_bias', False)
+    if cp_bias:
+        cp_topn = getattr(args, 'moe_router_critical_path_topn', 1)
+        cp_alpha = getattr(args, 'moe_router_critical_path_alpha', 0.001)
+        print_rank_0(f"CRITICAL-PATH BIAS: topn={cp_topn}, alpha={cp_alpha}")
+        for module in model.modules():
+            if 'router' in module.__class__.__name__.lower():
+                module._critical_path_bias_enabled = True
+                module._critical_path_topn = cp_topn
+                module._critical_path_alpha = cp_alpha
 
     # Initialize RL loss if enabled
     print_rank_0(f"[RL DEBUG] Initializing training with use_rl_loss={args.use_rl_loss}")
