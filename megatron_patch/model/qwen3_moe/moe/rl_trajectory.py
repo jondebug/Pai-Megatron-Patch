@@ -382,6 +382,20 @@ class RouterTrajectoryTracker:
             reward
         )
 
+        # #region agent log
+        if layer_num == 1:
+            import json, time as _t
+            _dbg = {"sessionId":"63a0ae","hypothesisId":"H2_H5","location":"rl_trajectory.py:add_layer_decision","timestamp":int(_t.time()*1000),
+                    "message":"layer_decision_stored",
+                    "data":{"layer":layer_num,"logits_requires_grad":bool(routing_logits.requires_grad),
+                            "logits_shape":list(routing_logits.shape),"routing_map_shape":list(routing_map.shape),
+                            "reward_shape":list(reward.shape) if reward.dim()>0 else "scalar",
+                            "reward_val":float(reward.mean().item()) if reward.dim()>0 else float(reward.item()),
+                            "routing_map_sum_per_token":float(routing_map.float().sum(dim=-1).mean().item()),
+                            "num_experts":int(routing_map.shape[-1])}}
+            with open("/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/.cursor/debug-63a0ae.log","a") as _f: _f.write(json.dumps(_dbg)+"\n")
+        # #endregion
+
     def inject_lm_reward(self, per_token_losses: torch.Tensor, lm_reward_coeff: float):
         """Add per-token LM cross-entropy as an additional reward component to all layers.
 
@@ -926,24 +940,14 @@ class RouterTrajectoryTracker:
             num_tokens_routed = routing_map.sum().clamp_min(1).float()
             current_log_prob = chosen_log_probs.sum() / num_tokens_routed
             
-            # Old policy log probabilities
-            if old_trajectory_data is not None and layer_num in old_trajectory_data:
-                _, old_routing_map, old_routing_logits, _ = old_trajectory_data[layer_num]
-                old_routing_logits = old_routing_logits.detach()
-                old_log_probs = torch.nn.functional.log_softmax(old_routing_logits, dim=-1)
-                old_chosen_log_probs = old_log_probs * old_routing_map.float()
-                old_num_tokens_routed = old_routing_map.sum().clamp_min(1).float()
-                old_log_prob = old_chosen_log_probs.sum() / old_num_tokens_routed
-                
-                log_ratio = torch.clamp(current_log_prob - old_log_prob, min=-10.0, max=10.0)
-                ratio = torch.exp(log_ratio)
-            else:
-                ratio = torch.tensor(1.0, device=device)
+            # NOTE: Importance ratio is 1.0 because we use a fresh batch each step
+            # (single-epoch online learning). PPO's importance sampling requires
+            # evaluating old actions under the new policy on the SAME data, which
+            # we don't do. ratio=1.0 reduces to REINFORCE with critic baseline.
+            ratio = torch.tensor(1.0, device=device)
             
-            # PPO clipped objective
-            pg_obj1 = ratio * advantage
-            pg_obj2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantage
-            policy_loss = -torch.min(pg_obj1, pg_obj2)
+            # REINFORCE-style policy gradient (critic baseline provides variance reduction)
+            policy_loss = -current_log_prob * advantage
             
             # Value function loss for logging (critic already trained above)
             if self.baseline_type == "critic":
@@ -1011,6 +1015,32 @@ class RouterTrajectoryTracker:
                           f"adv_std={self.last_loss_components['advantage_std']:.4f}, "
                           f"mean_reward={self.last_loss_components['mean_reward']:.4f}, "
                           f"routing_logits.requires_grad={routing_logits_first.requires_grad}")
+
+        # #region agent log
+        import json, time as _t
+        _l1 = sorted_layers[0]
+        _, _rm1, _rl1, _rw1 = trajectory_data[_l1]
+        _lp1 = torch.nn.functional.log_softmax(_rl1, dim=-1)
+        _clp1 = (_lp1 * _rm1.float()).sum(dim=-1)  # per-token log prob
+        _has_old = old_trajectory_data is not None and _l1 in old_trajectory_data
+        _old_eq = False
+        if _has_old:
+            _, _orm, _orl, _ = old_trajectory_data[_l1]
+            _old_eq = bool(torch.equal(_orl, _rl1))
+        _dbg = {"sessionId":"63a0ae","hypothesisId":"H2_H4","location":"rl_trajectory.py:ppo_scalar_end","timestamp":int(_t.time()*1000),
+                "message":"ppo_scalar_diagnostics",
+                "data":{"total_loss":float(total_loss.item()),"total_loss_requires_grad":bool(total_loss.requires_grad),
+                        "logits_requires_grad":bool(_rl1.requires_grad),
+                        "per_token_log_prob_mean":float(_clp1.mean().item()),
+                        "per_token_log_prob_std":float(_clp1.std().item()),
+                        "num_experts_per_token":float(_rm1.float().sum(dim=-1).mean().item()),
+                        "has_old_trajectory":_has_old,"old_logits_equal_current":_old_eq,
+                        "advantage_mean":float(self.last_loss_components['mean_advantage']),
+                        "advantage_std":float(self.last_loss_components['advantage_std']),
+                        "num_layers":num_layers}}
+        with open("/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/.cursor/debug-63a0ae.log","a") as _f: _f.write(json.dumps(_dbg)+"\n")
+        # #endregion
+
         return total_loss
     
     def _compute_ppo_loss_per_token(self, trajectory_data: Dict, old_trajectory_data: Dict = None, 
@@ -1098,23 +1128,11 @@ class RouterTrajectoryTracker:
             chosen_log_probs = log_probs * routing_map.float()
             current_per_token_log_prob = chosen_log_probs.sum(dim=-1)
             
-            # Old policy log probabilities
-            if old_trajectory_data is not None and layer_num in old_trajectory_data:
-                _, old_routing_map, old_routing_logits, _ = old_trajectory_data[layer_num]
-                old_routing_logits = old_routing_logits.detach()
-                old_log_probs = torch.nn.functional.log_softmax(old_routing_logits, dim=-1)
-                old_chosen_log_probs = old_log_probs * old_routing_map.float()
-                old_per_token_log_prob = old_chosen_log_probs.sum(dim=-1)
-                
-                log_ratio = torch.clamp(current_per_token_log_prob - old_per_token_log_prob, min=-10.0, max=10.0)
-                ratio = torch.exp(log_ratio)
-            else:
-                ratio = torch.ones_like(current_per_token_log_prob)
+            # NOTE: ratio=1.0 because each step uses a fresh batch (see scalar PPO comment)
+            ratio = torch.ones_like(current_per_token_log_prob)
             
-            # PPO clipped objective per token
-            pg_obj1 = ratio * advantages
-            pg_obj2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages
-            per_token_policy_loss = -torch.min(pg_obj1, pg_obj2)
+            # REINFORCE-style per-token policy gradient with critic baseline
+            per_token_policy_loss = -current_per_token_log_prob * advantages
             
             # Value function loss per token for logging (critic already trained above)
             baseline_for_layer = layer_baselines[layer_num]
@@ -1161,6 +1179,33 @@ class RouterTrajectoryTracker:
             'advantage_max': all_advs_log.max().item(),
         }
         wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}, critic_loss={logged_value_loss:.6f}, adv_std={self.last_loss_components['advantage_std']:.4f}, total_tokens={total_tokens}")
+
+        # #region agent log
+        import json, time as _t
+        _l1 = sorted_layers[0]
+        _, _rm1, _rl1, _rw1 = trajectory_data[_l1]
+        _has_old = old_trajectory_data is not None and _l1 in old_trajectory_data
+        _old_eq = False
+        if _has_old:
+            _, _orm, _orl, _ = old_trajectory_data[_l1]
+            _old_eq = bool(torch.equal(_orl, _rl1))
+        _lp1 = torch.nn.functional.log_softmax(_rl1, dim=-1)
+        _clp1 = (_lp1 * _rm1.float()).sum(dim=-1)
+        _dbg = {"sessionId":"63a0ae","hypothesisId":"H2_H4_pertoken","location":"rl_trajectory.py:ppo_pertoken_end","timestamp":int(_t.time()*1000),
+                "message":"ppo_pertoken_diagnostics",
+                "data":{"total_loss":float(total_loss.item()),"total_loss_requires_grad":bool(total_loss.requires_grad),
+                        "logits_requires_grad":bool(_rl1.requires_grad),
+                        "per_token_log_prob_mean":float(_clp1.mean().item()),
+                        "per_token_log_prob_std":float(_clp1.std().item()),
+                        "num_experts_per_token":float(_rm1.float().sum(dim=-1).mean().item()),
+                        "has_old_trajectory":_has_old,"old_logits_equal_current":_old_eq,
+                        "reward_mean":float(_rw1.mean().item()),"reward_std":float(_rw1.std().item()),
+                        "advantage_mean":float(self.last_loss_components['mean_advantage']),
+                        "advantage_std":float(self.last_loss_components['advantage_std']),
+                        "num_layers":len(sorted_layers),"total_tokens":total_tokens}}
+        with open("/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/.cursor/debug-63a0ae.log","a") as _f: _f.write(json.dumps(_dbg)+"\n")
+        # #endregion
+
         return total_loss
 
 

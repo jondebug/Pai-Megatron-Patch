@@ -468,6 +468,20 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
 
     # Reset trajectory for next iteration
     reset_trajectory_tracker()
+
+    # #region agent log
+    import json, time as _t
+    _dbg = {"sessionId":"63a0ae","hypothesisId":"H5_loss_combine","location":"helper.py:loss_combine","timestamp":int(_t.time()*1000),
+            "message":"rl_loss_combination",
+            "data":{"rl_loss_raw":float(rl_loss.item()),"rl_loss_requires_grad":bool(rl_loss.requires_grad),
+                    "lm_loss_sum":float(loss[0].item()),"loss_count":float(loss[1].item()),
+                    "rl_loss_coeff":float(rl_loss_coeff),
+                    "rl_loss_scaled":float((rl_loss * loss[1]).item()),
+                    "lm_loss_avg":float((loss[0]/loss[1]).item()),
+                    "combined_loss_avg":float(((loss[0] + rl_loss * loss[1])/loss[1]).item())}}
+    with open("/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/.cursor/debug-63a0ae.log","a") as _f: _f.write(json.dumps(_dbg)+"\n")
+    # #endregion
+
     # Scale RL loss to match the LM loss scale (RL loss is averaged, LM loss is summed)
     use_only_rl_loss = False
     if use_only_rl_loss:
