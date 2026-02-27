@@ -93,13 +93,16 @@ srun --container-image="${CONTAINER_IMAGE}" \
          # Fix PYTHONPATH: converter script references Megatron-LM-250707 but we use 250624
          export PYTHONPATH=${REPO_ROOT}:${REPO_ROOT}/backends/megatron/Megatron-LM-250624:${CONVERTOR_DIR}/impl:\${PYTHONPATH}
 
+         # Override MODEL_PARALLEL_ARGS to match training ep=4 (converter defaults to ep=8)
+         export MODEL_PARALLEL_ARGS='--tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 --expert-model-parallel-size 4'
+         export KUBERNETES_CONTAINER_RESOURCE_GPU=4
+
          # Step 1: Convert Megatron checkpoint to HuggingFace format
          # Check for actual model weights, not just config files (conversion may have failed partially)
          if ls '${HF_OUTPUT_DIR}'/*.safetensors 1>/dev/null 2>&1; then
              echo 'Step 1: HF checkpoint with model weights already exists, skipping conversion'
          else
              echo 'Step 1: Converting Megatron checkpoint -> HuggingFace'
-             export KUBERNETES_CONTAINER_RESOURCE_GPU=4
              cd '${CONVERTOR_DIR}'
              bash scripts/qwen3/run_8xH20.sh \
                  '${MODEL_SIZE}' \
