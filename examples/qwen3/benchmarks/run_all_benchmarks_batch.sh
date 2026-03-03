@@ -19,14 +19,29 @@ CONTAINER_IMAGE="/lustre/fsw/portfolios/nvr/users/jonathanp/containers/pai-megat
 TASKS="hellaswag,arc_challenge,winogrande"
 BATCH_SIZE=8
 BASE="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/output_router_finetuning"
-CKPT_SUB="pretrain-mcore-qwen3-moe-megatron-A3B-lr-1e-4-minlr-1e-6-bs-1-gbs-8-seqlen-128-pr-bf16-tp-1-pp-1-cp-1-ac-sel-do-true-sp-true-ti-1500-wi-10"
+CKPT_SUB="pretrain-mcore-qwen3-moe-megatron-A3B-lr-1e-4-minlr-1e-6-bs-1-gbs-8-seqlen-128-pr-bf16-tp-1-pp-1-cp-1-ac-sel-do-true-sp-true-ti-3000-wi-10"
+PRETRAIN_CKPT="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-ckpts/Qwen3-30B-A3B-to-mcore"
 
-# List of runs to benchmark
+# List of runs to benchmark (all ptload from ic7dzzax sweep + norl baseline + pretrained)
 RUNS=(
-    "ptbin_n6_rlc0.1_g0.2_noaux_norm_PPO_ent0.01_c256_r09"
-    "ptload_n1_rlc0.01_g0.2_noaux_norm_PPO_ent0.01_c256_r44"
-    "ptbin_n1_rlc0.1_g0.2_aux0.01_norl_norm_PPO_ent0.01_c256_r06"
-    "crit_n1_rlc0.01_g0.95_noaux_norm_PPO_ent0.01_c256_r56"
+    "ptload_n2_rlc0.1_norm_PPO_ent0.01_c256_ema_aux0.01_r02"
+    "ptload_n2_rlc0.1_norm_PPO_ent0.01_c256_ema_lm1.0_aux0.01_r03"
+    "ptload_n2_rlc0.5_norm_PPO_ent0.01_c256_ema_aux0.01_r06"
+    "ptload_n2_rlc0.5_norm_PPO_ent0.01_c256_ema_lm1.0_aux0.01_r07"
+    "ptload_n2_rlc1.0_norm_PPO_ent0.01_c256_ema_aux0.01_r10"
+    "ptload_n2_rlc1.0_norm_PPO_ent0.01_c256_ema_lm1.0_aux0.01_r11"
+    "norl_aux0.01_r12"
+)
+
+# Comments for each run (matched by index)
+COMMENTS=(
+    "RL+aux rlc=0.1, load-weighted reward, EMA loads"
+    "RL+aux+LM_reward rlc=0.1, tests LM reward protection"
+    "RL+aux rlc=0.5, moderate RL strength"
+    "RL+aux+LM_reward rlc=0.5, best Pareto balance"
+    "RL+aux rlc=1.0, strongest RL, best critical path"
+    "RL+aux+LM_reward rlc=1.0, strong RL with LM protection"
+    "Aux-only baseline, no RL"
 )
 
 echo "============================================================"
@@ -46,7 +61,7 @@ srun --container-image="${CONTAINER_IMAGE}" \
          export HF_DATASETS_CACHE=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/.hf_cache/datasets
          mkdir -p \${HF_HOME} \${HF_DATASETS_CACHE}
 
-         RUNS_STR='${RUNS[0]} ${RUNS[1]} ${RUNS[2]} ${RUNS[3]}'
+         RUNS_STR='${RUNS[@]}'
 
          for run in \${RUNS_STR}; do
              HF_MODEL='${BASE}/'\${run}'/checkpoint/${CKPT_SUB}/hf_converted'
@@ -103,16 +118,56 @@ srun --container-image="${CONTAINER_IMAGE}" \
              echo \"lm-eval complete for: \${run}\"
              echo ''
 
-             # Parse results and collect into CSV
+             # Parse results and update CSV after each run
              python3 '${REPO_ROOT}/examples/qwen3/benchmarks/_parse_lm_eval_results.py' \${RESULTS_DIR} || true
+             python3 '${REPO_ROOT}/examples/qwen3/benchmarks/collect_benchmark_results.py' || true
          done
+
+         # --- Pretrained baseline (original Qwen3 weights, no training) ---
+         echo ''
+         echo '============================================================'
+         echo 'BENCHMARKING: pretrained_baseline (original Qwen3-30B-A3B)'
+         echo '============================================================'
+         PRETRAIN_HF='/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-ckpts/Qwen3-30B-A3B-complete'
+         PRETRAIN_RESULTS='${BASE}/pretrained_baseline/benchmark_results'
+         mkdir -p \${PRETRAIN_RESULTS}
+
+         TOTAL_START=\$(date +%s)
+         TIMING_JSON='{\"per_task\": {'
+         FIRST_TASK=true
+
+         for task in hellaswag arc_challenge winogrande; do
+             echo \"  Running task: \${task}\"
+             TASK_START=\$(date +%s)
+             python3 -m lm_eval \
+                 --model hf \
+                 --model_args \"pretrained=\${PRETRAIN_HF},trust_remote_code=True,dtype=bfloat16,device_map=auto\" \
+                 --tasks \${task} \
+                 --batch_size ${BATCH_SIZE} \
+                 --output_path \${PRETRAIN_RESULTS} \
+                 --limit 1000
+             TASK_END=\$(date +%s)
+             TASK_ELAPSED=\$((\${TASK_END} - \${TASK_START}))
+             echo \"  Task \${task}: \${TASK_ELAPSED} seconds\"
+             if [ \"\${FIRST_TASK}\" = true ]; then
+                 TIMING_JSON=\"\${TIMING_JSON}\\\"\${task}\\\": \${TASK_ELAPSED}\"
+                 FIRST_TASK=false
+             else
+                 TIMING_JSON=\"\${TIMING_JSON}, \\\"\${task}\\\": \${TASK_ELAPSED}\"
+             fi
+         done
+         TOTAL_END=\$(date +%s)
+         TOTAL_ELAPSED=\$((\${TOTAL_END} - \${TOTAL_START}))
+         TIMING_JSON=\"\${TIMING_JSON}}, \\\"total_seconds\\\": \${TOTAL_ELAPSED}}\"
+         echo \"\${TIMING_JSON}\" > \${PRETRAIN_RESULTS}/timing.json
+         echo \"BENCHMARK_TIME: pretrained_baseline \${TOTAL_ELAPSED} seconds\"
+         python3 '${REPO_ROOT}/examples/qwen3/benchmarks/_parse_lm_eval_results.py' \${PRETRAIN_RESULTS} || true
+         python3 '${REPO_ROOT}/examples/qwen3/benchmarks/collect_benchmark_results.py' || true
 
          echo ''
          echo '============================================================'
          echo 'ALL LM-EVAL BENCHMARKS COMPLETE'
          echo '============================================================'
-
-         python3 '${REPO_ROOT}/examples/qwen3/benchmarks/collect_benchmark_results.py' || true
      "
 
 # =============================================================================
