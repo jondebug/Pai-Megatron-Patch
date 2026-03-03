@@ -61,9 +61,7 @@ srun --container-image="${CONTAINER_IMAGE}" \
          export HF_DATASETS_CACHE=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/.hf_cache/datasets
          mkdir -p \${HF_HOME} \${HF_DATASETS_CACHE}
 
-         RUNS_STR='${RUNS[@]}'
-
-         for run in \${RUNS_STR}; do
+         for run in ${RUNS[@]}; do
              HF_MODEL='${BASE}/'\${run}'/checkpoint/${CKPT_SUB}/hf_converted'
              RESULTS_DIR='${BASE}/'\${run}'/checkpoint/${CKPT_SUB}/benchmark_results'
              mkdir -p \${RESULTS_DIR}
