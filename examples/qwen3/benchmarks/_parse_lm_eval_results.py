@@ -111,10 +111,26 @@ def main():
         f.write("\n".join(tex_lines) + "\n")
     print(f"\nLaTeX table saved to: {tex_path}")
 
+    # Load timing data if available
+    timing = {}
+    timing_path = os.path.join(results_dir, "timing.json")
+    if os.path.exists(timing_path):
+        try:
+            with open(timing_path) as f:
+                timing = json.load(f)
+            total_sec = timing.get("total_seconds", 0)
+            per_task = timing.get("per_task", {})
+            print(f"\n  Timing: {total_sec}s total")
+            for task, secs in per_task.items():
+                print(f"    {task}: {secs}s")
+        except Exception:
+            pass
+
     summary = {
         "scores": {k: v for k, v in scores.items()},
         "average": avg,
         "source_file": result_file,
+        "timing": timing,
     }
     summary_path = os.path.join(results_dir, "accuracy_summary.json")
     with open(summary_path, "w") as f:

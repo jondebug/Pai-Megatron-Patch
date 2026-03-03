@@ -394,14 +394,7 @@ if [ $PRETRAIN_CHECKPOINT_PATH != none ]; then
             --load $PRETRAIN_CHECKPOINT_PATH"
 fi
 
-# Auto-resume: if a saved checkpoint exists from a previous run, load from there instead.
-# This enables multi-allocation training (e.g., 10K steps across multiple 4-hour jobs).
-SAVED_CKPT_DIR="${OUTPUT_BASEPATH}/checkpoint/${NAME}"
-if [ -f "${SAVED_CKPT_DIR}/latest_checkpointed_iteration.txt" ]; then
-    SAVED_ITER=$(cat "${SAVED_CKPT_DIR}/latest_checkpointed_iteration.txt" | tr -d '[:space:]')
-    echo "AUTO-RESUME: Found saved checkpoint at iteration ${SAVED_ITER} in ${SAVED_CKPT_DIR}"
-    load_option=" --load ${SAVED_CKPT_DIR}"
-fi
+# Auto-resume is handled after NAME is defined (see below, after megatron_options)
 
 if [ $OPTIMIZER_OFFLOAD != false ]; then
     offload_option=" \
@@ -503,9 +496,19 @@ TENSORBOARD_DIR="${OUTPUT_BASEPATH}/tensorboard/${NAME}_${current_time}"
 mkdir -p ${TENSORBOARD_DIR}
 SAVED_PRETRAIN_CHECKPOINT_PATH="${OUTPUT_BASEPATH}/checkpoint/${NAME}"
 
+# Auto-resume: if a saved checkpoint exists from a previous allocation, load from there.
+if [ -f "${SAVED_PRETRAIN_CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" ]; then
+    SAVED_ITER=$(cat "${SAVED_PRETRAIN_CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" | tr -d '[:space:]')
+    echo "AUTO-RESUME: Found saved checkpoint at iteration ${SAVED_ITER} in ${SAVED_PRETRAIN_CHECKPOINT_PATH}"
+    load_option=" --load ${SAVED_PRETRAIN_CHECKPOINT_PATH}"
+fi
+
 mkdir -p ${SAVED_PRETRAIN_CHECKPOINT_PATH}
-find -L ${PRETRAIN_CHECKPOINT_PATH} -maxdepth 1 -type f -name "*.json" -print0 | xargs -0 cp -t ${SAVED_PRETRAIN_CHECKPOINT_PATH}
-find -L ${PRETRAIN_CHECKPOINT_PATH} -maxdepth 1 -type f -name "merges.txt" -print0 | xargs -0 cp -t ${SAVED_PRETRAIN_CHECKPOINT_PATH}
+# Copy config files from pretrained checkpoint (skip if already resuming from the same dir)
+if [ "${PRETRAIN_CHECKPOINT_PATH}" != "${SAVED_PRETRAIN_CHECKPOINT_PATH}" ]; then
+    find -L ${PRETRAIN_CHECKPOINT_PATH} -maxdepth 1 -type f -name "*.json" -print0 | xargs -0 cp -t ${SAVED_PRETRAIN_CHECKPOINT_PATH} 2>/dev/null || true
+    find -L ${PRETRAIN_CHECKPOINT_PATH} -maxdepth 1 -type f -name "merges.txt" -print0 | xargs -0 cp -t ${SAVED_PRETRAIN_CHECKPOINT_PATH} 2>/dev/null || true
+fi
 
 megatron_options="  \
         --save ${SAVED_PRETRAIN_CHECKPOINT_PATH} \

@@ -90,6 +90,21 @@ echo "Per job:            $AGENTS_PER_JOB run(s) per 4-hour allocation, auto-cha
 echo "Log dir:            $LOG_DIR"
 echo "============================================================"
 
+# Find the sweep directory by grep'ing for the sweep ID in sweep_id.txt files.
+# Can't rely on 'latest' symlink since it gets overwritten by any new sweep creation.
+SWEEP_DIR=""
+for d in "$SCRIPT_DIR"/sweep_logs/*/; do
+    if [ -f "$d/sweep_id.txt" ] && grep -q "^${SWEEP_ID}$" "$d/sweep_id.txt" 2>/dev/null; then
+        SWEEP_DIR="$d"
+        break
+    fi
+done
+if [ -z "$SWEEP_DIR" ]; then
+    echo "WARNING: Could not find sweep directory for $SWEEP_ID, falling back to latest"
+    SWEEP_DIR="$SCRIPT_DIR/sweep_logs/$(readlink "$SCRIPT_DIR/sweep_logs/latest" 2>/dev/null)"
+fi
+echo "Sweep dir:          $SWEEP_DIR"
+
 # Submit jobs
 SUBMITTED_JOBS=()
 for i in $(seq 1 $PARALLEL); do
@@ -101,7 +116,7 @@ for i in $(seq 1 $PARALLEL); do
         --job-name="$JOB_NAME" \
         --output="$LOG_DIR/${JOB_NAME}_%j.out" \
         --error="$LOG_DIR/${JOB_NAME}_%j.err" \
-        "$SCRIPT_DIR/submit_sweep_agent.sh" "$SWEEP_ID" 0 "$AGENTS_PER_JOB" 2>&1)
+        "$SCRIPT_DIR/submit_sweep_agent.sh" "$SWEEP_ID" 0 "$AGENTS_PER_JOB" "$SWEEP_DIR" 2>&1)
     
     JOB_ID=$(echo "$JOB_OUTPUT" | awk '{print $NF}')
     SUBMITTED_JOBS+=("$JOB_ID")

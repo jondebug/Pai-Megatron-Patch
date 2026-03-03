@@ -4,7 +4,7 @@
 #SBATCH --account=nvr_israel_scne
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/benchmark_logs/benchmark_%j.out
 #SBATCH --error=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/benchmark_logs/benchmark_%j.err
 
@@ -39,7 +39,7 @@ WANDB_PROJECT="qwen3-router-training"
 RUN_NAME=""
 MODEL_SIZE="A3B"
 BATCH_SIZE=8
-TASKS="mmlu,hellaswag,arc_challenge,winogrande"
+TASKS="hellaswag,arc_challenge,winogrande"
 
 # Parse arguments (passed after -- by sbatch, or directly)
 while [[ $# -gt 0 ]]; do
@@ -88,7 +88,12 @@ srun --container-image="${CONTAINER_IMAGE}" \
      --container-mounts="$HOME:$HOME,/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing:/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing" \
      --container-workdir="${SCRIPT_DIR}" \
      bash -c "
-         pip install wandb lm_eval --quiet 2>/dev/null
+         pip install wandb 'lm_eval' 'accelerate>=1.2.0' --quiet 2>/dev/null
+
+         # Use persistent cache on Lustre to avoid re-downloading datasets
+         export HF_HOME=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/.hf_cache
+         export HF_DATASETS_CACHE=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/.hf_cache/datasets
+         mkdir -p \${HF_HOME} \${HF_DATASETS_CACHE}
 
          # Fix PYTHONPATH: converter script references Megatron-LM-250707 but we use 250624
          export PYTHONPATH=${REPO_ROOT}:${REPO_ROOT}/backends/megatron/Megatron-LM-250624:${CONVERTOR_DIR}/impl:\${PYTHONPATH}
@@ -123,9 +128,12 @@ srun --container-image="${CONTAINER_IMAGE}" \
          echo '  Tasks:  ${TASKS}'
          echo '  Batch:  ${BATCH_SIZE}'
 
-         accelerate launch -m lm_eval \
+         # Use single-process python (not accelerate launch) to avoid 4 ranks
+         # all hitting HuggingFace Hub simultaneously and getting rate-limited (429)
+         python3 -m lm_eval \
              --model hf \
-             --model_args 'pretrained=${HF_OUTPUT_DIR},trust_remote_code=True' \
+             --model_args 'pretrained=${HF_OUTPUT_DIR},trust_remote_code=True,dtype=bfloat16' \
+             --device cuda:0 \
              --tasks ${TASKS} \
              --batch_size '${BATCH_SIZE}' \
              --output_path '${RESULTS_DIR}' \
