@@ -546,6 +546,14 @@ def get_patch_args(parser):
                       help='Discount factor (gamma) for RL returns calculation (default: 0.9). Lower values weight immediate rewards more.')
     group.add_argument('--rl-normalize-rewards', action='store_true', default=False,
                       help='Enable running-mean/std reward normalization. Expands compressed reward ranges to [-1, +1] for stronger RL gradients.')
+    group.add_argument('--rl-ppo-reeval', action='store_true', default=False,
+                      help='Enable proper PPO: re-evaluate old states under current router weights '
+                           'to compute correct importance ratios. Costs one extra linear layer per '
+                           'MoE layer per step. Without this, falls back to REINFORCE (ratio=1.0).')
+    group.add_argument('--rl-ppo-epochs', type=int, default=1,
+                      help='Number of PPO epochs per training step (default: 1 = no extra epochs). '
+                           'K>1 runs K-1 additional RL-only gradient steps on the stored trajectory '
+                           'after each main training step. Requires --rl-ppo-reeval.')
     group.add_argument('--rl-lm-reward-coeff', type=float, default=0.0,
                       help='Coefficient (beta) for per-token LM cross-entropy reward. '
                            '0 = disabled. When > 0, adds -cross_entropy(token) as an additional '

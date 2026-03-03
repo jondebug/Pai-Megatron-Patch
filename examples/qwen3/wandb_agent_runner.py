@@ -103,6 +103,11 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
         if 'rl_critic_layer_aware' in sweep_params:
             parts.append('lcrit' if sweep_params['rl_critic_layer_aware'] else 'nocrit')
         
+        # PPO re-evaluation and multi-epoch
+        if sweep_params.get('rl_ppo_reeval', False) or all_params.get('rl_ppo_reeval', False):
+            epochs = sweep_params.get('rl_ppo_epochs', all_params.get('rl_ppo_epochs', 1))
+            parts.append(f'ppo_k{epochs}' if int(epochs) > 1 else 'ppo')
+        
         # LM reward coefficient
         if 'rl_lm_reward_coeff' in sweep_params:
             v = sweep_params['rl_lm_reward_coeff']
@@ -209,6 +214,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('rl_use_ema_loads', '--rl-use-ema-loads'),
         ('rl_critic_layer_aware', '--rl-critic-layer-aware'),
         ('moe_router_enable_expert_bias', '--moe-router-enable-expert-bias'),
+        ('rl_ppo_reeval', '--rl-ppo-reeval'),
         ('moe_router_topology_aware', '--moe-router-topology-aware'),
         ('moe_router_critical_path_bias', '--moe-router-critical-path-bias'),
     ]
@@ -233,6 +239,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('moe_router_score_function', '--moe-router-score-function'),
         ('moe_router_bias_update_rate', '--moe-router-bias-update-rate'),
         ('moe_router_load_balancing_type', '--moe-router-load-balancing-type'),
+        ('rl_ppo_epochs', '--rl-ppo-epochs'),
         ('rl_lm_reward_coeff', '--rl-lm-reward-coeff'),
         ('kl_loss_coeff', '--kl-loss-coeff'),
         ('moe_router_topology_lambda', '--moe-router-topology-lambda'),

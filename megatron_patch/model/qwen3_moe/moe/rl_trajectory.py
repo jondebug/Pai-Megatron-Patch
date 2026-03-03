@@ -199,6 +199,11 @@ class RouterTrajectoryTracker:
         self.use_ema_loads = False  # Use EMA expert loads for reward (more stable)
         self._ema_expert_loads = None  # [num_experts] running average of per-expert load
         self._ema_momentum = 0.1  # EMA update rate for expert loads
+        self.ppo_reeval = False  # Proper PPO: re-evaluate old states under current policy
+        self.reeval_logits = {}  # Populated by router.forward() when ppo_reeval=True
+        self.ppo_epochs = 1  # K: number of PPO epochs per training step
+        self._router_modules = {}  # layer_num -> router gating module (set by pretrain_qwen)
+        self._ppo_optimizer = None  # Separate optimizer for multi-epoch PPO
         # Store last computed loss components for logging
         self.last_loss_components = {
             'policy_loss': 0.0,
@@ -214,7 +219,8 @@ class RouterTrajectoryTracker:
         """Reset the trajectory for a new forward pass."""
         # Store old trajectory for PPO importance sampling
         self.old_layer_decisions = getattr(self, 'layer_decisions', {}).copy()
-        self.layer_decisions = {}  # layer_number -> (latent_token_representations, routing_map, probs, entropy_reward)
+        self.layer_decisions = {}
+        self.reeval_logits = {}  # layer_num -> re-evaluated logits (current weights, old states)
     
     def get_critic(self, input_dim: int, device: torch.device) -> CriticNetwork:
         """Get or create the critic network.
@@ -940,13 +946,10 @@ class RouterTrajectoryTracker:
             num_tokens_routed = routing_map.sum().clamp_min(1).float()
             current_log_prob = chosen_log_probs.sum() / num_tokens_routed
             
-            # NOTE: Importance ratio is 1.0 because we use a fresh batch each step
-            # (single-epoch online learning). PPO's importance sampling requires
-            # evaluating old actions under the new policy on the SAME data, which
-            # we don't do. ratio=1.0 reduces to REINFORCE with critic baseline.
+            # Main step always uses ratio=1.0 (REINFORCE): data was just collected with
+            # current policy. PPO ratios only matter in extra epochs (run_extra_ppo_epochs)
+            # where weights have been updated since data collection.
             ratio = torch.tensor(1.0, device=device)
-            
-            # REINFORCE-style policy gradient (critic baseline provides variance reduction)
             policy_loss = -current_log_prob * advantage
             
             # Value function loss for logging (critic already trained above)
@@ -1128,10 +1131,8 @@ class RouterTrajectoryTracker:
             chosen_log_probs = log_probs * routing_map.float()
             current_per_token_log_prob = chosen_log_probs.sum(dim=-1)
             
-            # NOTE: ratio=1.0 because each step uses a fresh batch (see scalar PPO comment)
+            # Main step: ratio=1.0 (REINFORCE). PPO clipping only in extra epochs.
             ratio = torch.ones_like(current_per_token_log_prob)
-            
-            # REINFORCE-style per-token policy gradient with critic baseline
             per_token_policy_loss = -current_per_token_log_prob * advantages
             
             # Value function loss per token for logging (critic already trained above)
@@ -1207,6 +1208,129 @@ class RouterTrajectoryTracker:
         # #endregion
 
         return total_loss
+
+
+    def run_extra_ppo_epochs(self, rl_loss_coeff: float, discount_factor: float = 0.0,
+                              clip_ratio: float = 0.2):
+        """Run K-1 additional PPO epochs on the stored trajectory.
+
+        Called after the main training step (forward + backward + optimizer.step()).
+        Each epoch: re-evaluates stored states under the (now-updated) router weights,
+        computes PPO loss, and does a gradient step on router weights only.
+
+        Requires self._router_modules to be populated with {layer_num: gating_module}.
+        """
+        if self.ppo_epochs <= 1 or not self._router_modules:
+            return
+        if not self.old_layer_decisions:
+            return
+
+        sorted_layers = sorted(self.old_layer_decisions.keys())
+        if not sorted_layers:
+            return
+
+        # Get the original (pre-update) logits and actions from the stored trajectory
+        original_logits = {}
+        for layer_num in sorted_layers:
+            _, _, logits, _ = self.old_layer_decisions[layer_num]
+            original_logits[layer_num] = logits.detach()
+
+        # Pre-compute advantages (same for all epochs — from the original trajectory)
+        layer_rewards = {}
+        for layer_num in sorted_layers:
+            _, _, _, reward = self.old_layer_decisions[layer_num]
+            layer_rewards[layer_num] = reward.detach()
+
+        layer_returns = {}
+        if self.per_token_rewards:
+            reward_to_go = torch.zeros_like(layer_rewards[sorted_layers[0]])
+        else:
+            device = layer_rewards[sorted_layers[0]].device if isinstance(layer_rewards[sorted_layers[0]], torch.Tensor) else 'cuda'
+            reward_to_go = torch.tensor(0.0, device=device)
+
+        for layer_num in reversed(sorted_layers):
+            r = layer_rewards[layer_num]
+            if not self.per_token_rewards and r.dim() > 0:
+                r = r.mean()
+            reward_to_go = r + discount_factor * reward_to_go
+            layer_returns[layer_num] = reward_to_go.clone() if isinstance(reward_to_go, torch.Tensor) else reward_to_go
+
+        # Compute advantages
+        if self.per_token_rewards:
+            all_returns = torch.cat([layer_returns[ln].flatten() for ln in sorted_layers])
+            ret_mean = all_returns.mean()
+            ret_std = all_returns.std().clamp(min=1e-8)
+            layer_advantages = {ln: ((layer_returns[ln] - ret_mean) / ret_std).detach() for ln in sorted_layers}
+        else:
+            all_rets = torch.stack([layer_returns[ln] if isinstance(layer_returns[ln], torch.Tensor) else torch.tensor(layer_returns[ln]) for ln in sorted_layers])
+            ret_mean = all_rets.mean()
+            ret_std = all_rets.std().clamp(min=1e-8)
+            layer_advantages = {ln: ((layer_returns[ln] - ret_mean) / ret_std).detach() for ln in sorted_layers}
+
+        # Lazy-init separate optimizer for router weights
+        if self._ppo_optimizer is None:
+            router_params = []
+            for gating in self._router_modules.values():
+                router_params.extend(gating.parameters())
+            if not router_params:
+                return
+            self._ppo_optimizer = torch.optim.Adam(router_params, lr=1e-4)
+
+        # Run K-1 extra epochs
+        for epoch in range(self.ppo_epochs - 1):
+            total_loss = torch.tensor(0.0, device=next(iter(self._router_modules.values())).weight.device)
+            total_tokens = 0
+
+            for layer_num in sorted_layers:
+                old_latent, old_routing_map, _, _ = self.old_layer_decisions[layer_num]
+                gating = self._router_modules[layer_num]
+                advantages = layer_advantages[layer_num]
+
+                # Re-evaluate old states under current (updated) weights
+                new_logits = gating(old_latent)
+                new_lp = torch.nn.functional.log_softmax(new_logits, dim=-1)
+
+                # Original policy log-probs
+                orig_lp = torch.nn.functional.log_softmax(original_logits[layer_num], dim=-1)
+
+                old_rm = old_routing_map.float()
+
+                if self.per_token_rewards:
+                    new_per_token = (new_lp * old_rm).sum(dim=-1)
+                    orig_per_token = (orig_lp * old_rm).sum(dim=-1)
+                    log_ratio = torch.clamp(new_per_token - orig_per_token, -10.0, 10.0)
+                    ratio = torch.exp(log_ratio)
+
+                    pg1 = ratio * advantages
+                    pg2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages
+                    per_token_loss = -torch.min(pg1, pg2)
+                    total_loss += per_token_loss.sum()
+                    total_tokens += per_token_loss.numel()
+                else:
+                    adv = advantages if isinstance(advantages, torch.Tensor) else torch.tensor(advantages)
+                    if adv.dim() > 0:
+                        adv = adv.mean()
+                    n = old_rm.sum().clamp_min(1)
+                    new_lp_scalar = (new_lp * old_rm).sum() / n
+                    orig_lp_scalar = (orig_lp * old_rm).sum() / n
+                    log_ratio = torch.clamp(new_lp_scalar - orig_lp_scalar, -10.0, 10.0)
+                    ratio = torch.exp(log_ratio)
+
+                    pg1 = ratio * adv
+                    pg2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv
+                    total_loss += -torch.min(pg1, pg2)
+                    total_tokens += 1
+
+            total_loss = total_loss / max(1, total_tokens) * rl_loss_coeff
+
+            self._ppo_optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for g in self._router_modules.values() for p in g.parameters()], 1.0)
+            self._ppo_optimizer.step()
+
+        wrap_print_rank_0(f"[PPO MULTI-EPOCH] Ran {self.ppo_epochs - 1} extra epochs, "
+                         f"last_loss={total_loss.item():.6f}")
 
 
 # Global trajectory tracker instance

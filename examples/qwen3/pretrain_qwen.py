@@ -413,12 +413,16 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
         if not args.router_only_training:
             print_rank_0("WARNING: RL loss is typically used with router-only training")
         
+        from megatron_patch.model.qwen3_moe.moe.rl_trajectory import get_trajectory_tracker
+        tracker = get_trajectory_tracker()
         for module in model.modules():
             if 'router' in module.__class__.__name__.lower():
                 module.config.moe_router_use_trajectory_tracking = True
                 module._use_trajectory_tracking = True
-                from megatron_patch.model.qwen3_moe.moe.rl_trajectory import get_trajectory_tracker
-                module._trajectory_tracker = get_trajectory_tracker()
+                module._trajectory_tracker = tracker
+                # Store router gating reference for multi-epoch PPO re-evaluation
+                if hasattr(module, 'layer_number') and hasattr(module, 'gating'):
+                    tracker._router_modules[module.layer_number] = module.gating
 
 
     # Initialize wandb if enabled

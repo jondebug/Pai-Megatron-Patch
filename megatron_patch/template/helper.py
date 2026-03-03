@@ -334,6 +334,8 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.ppo_clip_ratio = getattr(args, 'rl_ppo_clip_ratio', 0.2)
     trajectory_tracker.use_ema_loads = getattr(args, 'rl_use_ema_loads', False)
     trajectory_tracker.critic_layer_aware = getattr(args, 'rl_critic_layer_aware', False)
+    trajectory_tracker.ppo_reeval = getattr(args, 'rl_ppo_reeval', False)
+    trajectory_tracker.ppo_epochs = getattr(args, 'rl_ppo_epochs', 1)
     print(f"[RL CONFIG] reward_type={trajectory_tracker.reward_type}, "
           f"baseline_type={trajectory_tracker.baseline_type}, "
           f"per_token_rewards={trajectory_tracker.per_token_rewards}, "
@@ -466,8 +468,16 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         except Exception as e:
             print_rank_0(f"[KL] WARNING: KL computation failed: {e}")
 
-    # Reset trajectory for next iteration
+    # Reset trajectory for next iteration (moves current layer_decisions → old_layer_decisions)
     reset_trajectory_tracker()
+
+    # Run extra PPO epochs on the just-stored trajectory (now in old_layer_decisions)
+    if trajectory_tracker.ppo_epochs > 1 and trajectory_tracker.ppo_reeval:
+        trajectory_tracker.run_extra_ppo_epochs(
+            rl_loss_coeff=rl_loss_coeff,
+            discount_factor=rl_discount_factor,
+            clip_ratio=getattr(trajectory_tracker, 'ppo_clip_ratio', 0.2),
+        )
 
     # #region agent log
     import json, time as _t
