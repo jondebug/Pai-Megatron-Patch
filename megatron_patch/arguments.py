@@ -567,6 +567,13 @@ def get_patch_args(parser):
     group.add_argument('--rl-critic-layer-aware', action='store_true', default=False,
                       help='Give the critic network the layer index as an input feature. '
                            'Enables layer-conditional value predictions.')
+    group.add_argument('--rl-replay-buffer-size', type=int, default=0,
+                      help='Size of the replay buffer for PPO multi-epoch training. '
+                           '0 = disabled (use only current trajectory). '
+                           'When > 0, stores past trajectories and replays them during extra PPO epochs.')
+    group.add_argument('--rl-ppo-extra-lr', type=float, default=1e-4,
+                      help='Learning rate for the separate optimizer used in extra PPO epochs. '
+                           'Automatically scaled by 1/(K-1) where K is rl_ppo_epochs.')
     group.add_argument('--kl-loss-coeff', type=float, default=0.0,
                       help='KL divergence loss coefficient. 0 = disabled. '
                            'Penalizes deviation of LM output distribution from pretrained reference. '

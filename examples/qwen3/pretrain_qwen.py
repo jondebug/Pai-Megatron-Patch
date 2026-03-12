@@ -420,9 +420,9 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
                 module.config.moe_router_use_trajectory_tracking = True
                 module._use_trajectory_tracking = True
                 module._trajectory_tracker = tracker
-                # Store router gating reference for multi-epoch PPO re-evaluation
+                # Store router module reference for multi-epoch PPO re-evaluation
                 if hasattr(module, 'layer_number') and hasattr(module, 'gating'):
-                    tracker._router_modules[module.layer_number] = module.gating
+                    tracker._router_modules[module.layer_number] = module
 
 
     # Initialize wandb if enabled

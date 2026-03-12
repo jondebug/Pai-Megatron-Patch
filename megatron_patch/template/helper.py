@@ -336,6 +336,8 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.critic_layer_aware = getattr(args, 'rl_critic_layer_aware', False)
     trajectory_tracker.ppo_reeval = getattr(args, 'rl_ppo_reeval', False)
     trajectory_tracker.ppo_epochs = getattr(args, 'rl_ppo_epochs', 1)
+    trajectory_tracker.replay_buffer_size = getattr(args, 'rl_replay_buffer_size', 0)
+    trajectory_tracker.ppo_extra_lr = getattr(args, 'rl_ppo_extra_lr', 1e-4)
     print(f"[RL CONFIG] reward_type={trajectory_tracker.reward_type}, "
           f"baseline_type={trajectory_tracker.baseline_type}, "
           f"per_token_rewards={trajectory_tracker.per_token_rewards}, "
@@ -428,6 +430,48 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     except Exception:
         pass
 
+    # Expert heatmap logging (if enabled)
+    log_heatmap = getattr(args, 'log_expert_heatmap', False)
+    if log_heatmap and hasattr(trajectory_tracker, 'log_heatmap'):
+        try:
+            from megatron.training import get_num_microbatches
+            iteration = getattr(args, 'iteration', 0)
+            trajectory_tracker.log_heatmap(iteration)
+        except Exception:
+            pass
+
+    # Output distribution metrics (entropy, top-1 prob, router weight drift)
+    if _kl_state.get('current_logits') is not None:
+        try:
+            cur_logits = _kl_state['current_logits'].detach().float()
+            probs = torch.softmax(cur_logits, dim=-1)
+            log_probs = torch.log_softmax(cur_logits, dim=-1)
+            entropy = -(probs * log_probs).sum(dim=-1).mean()
+            top1_prob = probs.max(dim=-1).values.mean()
+            loss_dict["output_entropy"] = entropy
+            loss_dict["output_top1_prob"] = top1_prob
+            critical_metrics['critical/output_entropy'] = entropy.item()
+            critical_metrics['critical/output_top1_prob'] = top1_prob.item()
+        except Exception:
+            pass
+
+    # Router weight drift from initial checkpoint
+    if _kl_state.get('ref_router_weights'):
+        try:
+            total_drift = 0.0
+            n_params = 0
+            for name, param in model.named_parameters() if hasattr(model, 'named_parameters') else []:
+                if name in _kl_state['ref_router_weights']:
+                    drift = (param.data - _kl_state['ref_router_weights'][name]).norm().item()
+                    total_drift += drift
+                    n_params += 1
+            if n_params > 0:
+                avg_drift = total_drift / n_params
+                loss_dict["router_weight_drift"] = torch.tensor(avg_drift)
+                critical_metrics['critical/router_weight_drift'] = avg_drift
+        except Exception:
+            pass
+
     # Log critical metrics directly to wandb (without train/ prefix)
     try:
         from megatron.core import parallel_state as mpu
@@ -503,30 +547,29 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         return loss[0] / loss[1] * args.context_parallel_size, loss_dict
     return loss[0] * args.context_parallel_size, num_seqs.sum(), loss_dict   
 
-def _init_kl_state(model):
-    """One-time initialization: snapshot router weights and register logit capture hook."""
+def _init_kl_state(model, snapshot_weights=True):
+    """One-time initialization: register logit capture hook and optionally snapshot router weights."""
     if _kl_state['initialized']:
         return
     
-    # Snapshot all router weights (frozen reference)
-    ref_weights = {}
-    for name, param in model.named_parameters():
-        if 'router' in name and 'weight' in name:
-            ref_weights[name] = param.data.clone().detach()
-    _kl_state['ref_router_weights'] = ref_weights
+    # Snapshot all router weights (frozen reference) — only when KL loss is enabled
+    if snapshot_weights:
+        ref_weights = {}
+        for name, param in model.named_parameters():
+            if 'router' in name and 'weight' in name:
+                ref_weights[name] = param.data.clone().detach()
+        _kl_state['ref_router_weights'] = ref_weights
+        print_rank_0(f"[KL] Snapshotted {len(ref_weights)} router weight tensors")
     
-    # Register forward hook on output_layer to capture logits
+    # Always register forward hook on output_layer to capture logits (for output metrics)
     if hasattr(model, 'output_layer'):
         model.output_layer.register_forward_hook(_kl_capture_logits_hook)
-        print_rank_0(f"[KL] Registered logit capture hook on output_layer, "
-                     f"snapshotted {len(ref_weights)} router weight tensors")
+        print_rank_0(f"[KL] Registered logit capture hook on output_layer")
     elif hasattr(model, 'module') and hasattr(model.module, 'output_layer'):
-        # Handle DDP/wrapped models
         model.module.output_layer.register_forward_hook(_kl_capture_logits_hook)
-        print_rank_0(f"[KL] Registered logit capture hook on module.output_layer, "
-                     f"snapshotted {len(ref_weights)} router weight tensors")
+        print_rank_0(f"[KL] Registered logit capture hook on module.output_layer")
     else:
-        print_rank_0("[KL] WARNING: Could not find output_layer on model, KL constraint disabled")
+        print_rank_0("[KL] WARNING: Could not find output_layer on model")
     
     _kl_state['initialized'] = True
 
@@ -573,9 +616,10 @@ def forward_step(data_iterator, model):
 
     kl_loss_coeff = getattr(args, 'kl_loss_coeff', 0.0)
 
-    # One-time KL initialization (snapshot reference weights, register hook)
-    if kl_loss_coeff > 0 and not _kl_state['initialized']:
-        _init_kl_state(model)
+    # One-time initialization: always register logit capture hook (for output metrics),
+    # only snapshot router weights when KL loss is enabled
+    if not _kl_state['initialized']:
+        _init_kl_state(model, snapshot_weights=(kl_loss_coeff > 0))
 
     # Get the batch.
     timers("batch-generator", log_level=2).start()
