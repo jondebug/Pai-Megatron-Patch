@@ -185,6 +185,7 @@ class RouterTrajectoryTracker:
         self.replay_buffer_size = 0  # 0 = disabled; >0 stores past trajectories for replay
         self._replay_buffer = []  # List of past trajectory dicts (stored on CPU)
         self.reset()
+        self.paused = False  # When True, add_layer_decision() calls are skipped (used during KL reference forward)
         self.per_token_rewards = False  # Default False; topn_load, critical_path, entropy are batch-level
         self.ppo_entropy_coeff = 0.01
         self.reward_type = "topn_load"  # "expert0", "entropy", "topn_load", or "critical_path"

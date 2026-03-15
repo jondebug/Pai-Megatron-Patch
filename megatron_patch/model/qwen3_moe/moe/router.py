@@ -185,7 +185,7 @@ class TopKRouter(_TopKRuter):
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
         # Prevent extra local tokens accumulation on evaluation or activation recomputation
         # Track trajectory if enabled
-        if self._use_trajectory_tracking and self._trajectory_tracker is not None:
+        if self._use_trajectory_tracking and self._trajectory_tracker is not None and not getattr(self._trajectory_tracker, 'paused', False):
             # Store logits and routing decisions for trajectory tracking
             original_logits = logits.view(seq_length, bsz, -1)
             self._trajectory_tracker.add_layer_decision(

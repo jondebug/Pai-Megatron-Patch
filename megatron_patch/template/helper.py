@@ -587,6 +587,15 @@ def _run_reference_forward(model, tokens, position_ids, attention_mask, packed_s
             saved_weights[name] = param.data.clone()
             param.data.copy_(ref_weights[name])
     
+    # Disable trajectory tracking during reference forward to avoid
+    # polluting routing statistics with decisions from frozen router weights
+    try:
+        from megatron_patch.model.qwen3_moe.moe.rl_trajectory import get_trajectory_tracker
+        tracker = get_trajectory_tracker()
+        tracker.paused = True
+    except Exception:
+        tracker = None
+
     # Reference forward (no grad, labels=None to get logits)
     try:
         with torch.no_grad():
@@ -602,6 +611,9 @@ def _run_reference_forward(model, tokens, position_ids, attention_mask, packed_s
         for name, param in model.named_parameters():
             if name in saved_weights:
                 param.data.copy_(saved_weights[name])
+        # Re-enable trajectory tracking
+        if tracker is not None:
+            tracker.paused = False
 
 
 def forward_step(data_iterator, model):

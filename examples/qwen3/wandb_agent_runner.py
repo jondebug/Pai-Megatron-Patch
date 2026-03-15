@@ -25,10 +25,13 @@ def load_combinations(combos_path: str):
     return data['combinations'], data['fixed_params'], data.get('sweep_dir', None), data.get('sweep_summary', None)
 
 
-def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None) -> str:
+def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None,
+                   sweep_name_prefix: str = None) -> str:
     """Build a descriptive run name from ONLY the sweep-varying parameters.
     
     Fixed params shared across all runs are omitted — they belong in the sweep name.
+    If sweep_name_prefix is provided, it is prepended to avoid output directory collisions
+    across sweeps (used when fresh_start=true).
     """
     all_params = {}
     if fixed_params:
@@ -156,7 +159,10 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
     
     parts.append(f'r{run_index:02d}')
     
-    return '_'.join(parts)
+    name = '_'.join(parts)
+    if sweep_name_prefix:
+        name = f'{sweep_name_prefix}_{name}'
+    return name
 
 
 def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list:
@@ -313,7 +319,13 @@ def main():
         return 1
     
     sweep_params = combinations[args.run_index]
-    run_name = build_run_name(sweep_params, args.run_index, fixed_params)
+    
+    sweep_name_prefix = None
+    if fixed_params.get('fresh_start', False):
+        sweep_name_prefix = fixed_params.get('wandb_run_name_base') or fixed_params.get('sweep_name')
+    
+    run_name = build_run_name(sweep_params, args.run_index, fixed_params,
+                              sweep_name_prefix=sweep_name_prefix)
     
     # WandB resume: if this run was previously started, resume the same wandb run
     # instead of creating a new one. This enables multi-allocation training.
