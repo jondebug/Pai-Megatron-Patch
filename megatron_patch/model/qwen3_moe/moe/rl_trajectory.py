@@ -1389,15 +1389,14 @@ class RouterTrajectoryTracker:
                 adv = advantages if isinstance(advantages, torch.Tensor) else torch.tensor(advantages, device=device)
                 if adv.dim() > 0:
                     adv = adv.mean()
-                n = old_rm.sum().clamp_min(1)
-                new_lp_scalar = (new_lp * old_rm).sum() / n
-                orig_lp_scalar = (orig_lp * old_rm).sum() / n
-                log_ratio = torch.clamp(new_lp_scalar - orig_lp_scalar, -10.0, 10.0)
-                ratio = torch.exp(log_ratio)
-
-                pg1 = ratio * adv
-                pg2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv
-                total_loss += -torch.min(pg1, pg2)
+                per_token_log_ratio = torch.clamp(
+                    (new_lp * old_rm).sum(dim=-1) - (orig_lp * old_rm).sum(dim=-1), -10.0, 10.0)
+                per_token_ratio = torch.exp(per_token_log_ratio)
+                pg1 = per_token_ratio * adv
+                pg2 = torch.clamp(per_token_ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv
+                per_token_loss = -torch.min(pg1, pg2)
+                num_routed = old_rm.sum(dim=-1).clamp_min(1).bool().float().sum().clamp_min(1)
+                total_loss += per_token_loss.sum() / num_routed
                 total_tokens += 1
 
         return total_loss / max(1, total_tokens) * rl_loss_coeff, total_tokens
@@ -1442,7 +1441,7 @@ class RouterTrajectoryTracker:
         if not router_params:
             return
         if self._ppo_optimizer is None:
-            self._ppo_optimizer = torch.optim.Adam(router_params, lr=extra_lr, eps=1e-5)
+            self._ppo_optimizer = torch.optim.SGD(router_params, lr=extra_lr)
         else:
             for pg in self._ppo_optimizer.param_groups:
                 pg['lr'] = extra_lr
@@ -1457,10 +1456,11 @@ class RouterTrajectoryTracker:
                 rp_orig = {ln: data[2].detach() for ln, data in gpu_traj.items()}
                 replay_orig_logits.append(rp_orig)
 
+        # Cache advantages once — routing_map is fixed so rewards don't change across epochs
+        layer_advantages = self._recompute_rollout_advantages(discount_factor)
+
         # Run K-1 extra epochs
         for epoch in range(self.ppo_epochs - 1):
-            # Recompute advantages each epoch using current router weights
-            layer_advantages = self._recompute_rollout_advantages(discount_factor)
 
             # Loss from current trajectory
             total_loss, total_tokens = self._compute_ppo_epoch_loss(
