@@ -655,8 +655,14 @@ def forward_step(data_iterator, model):
     # Periodic HellaSwag benchmark (during training only)
     hellaswag_interval = getattr(args, 'hellaswag_eval_interval', 0)
     if hellaswag_interval > 0 and torch.is_grad_enabled():
-        iteration = getattr(args, 'iteration', 0)
-        if iteration > 0 and iteration % hellaswag_interval == 0:
+        if not hasattr(forward_step, '_hellaswag_microbatch_count'):
+            forward_step._hellaswag_microbatch_count = 0
+            forward_step._hellaswag_last_fired = -1
+        forward_step._hellaswag_microbatch_count += 1
+        num_microbatches = getattr(args, 'global_batch_size', 8) // max(1, getattr(args, 'micro_batch_size', 1))
+        current_iter = forward_step._hellaswag_microbatch_count // max(1, num_microbatches)
+        if current_iter > 0 and current_iter % hellaswag_interval == 0 and current_iter != forward_step._hellaswag_last_fired:
+            forward_step._hellaswag_last_fired = current_iter
             try:
                 from megatron_patch.hellaswag_eval import run_hellaswag_eval
                 hellaswag_limit = getattr(args, 'hellaswag_eval_limit', 100)
