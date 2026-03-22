@@ -223,6 +223,8 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('rl_ppo_reeval', '--rl-ppo-reeval'),
         ('moe_router_topology_aware', '--moe-router-topology-aware'),
         ('moe_router_critical_path_bias', '--moe-router-critical-path-bias'),
+        ('eval_kl_tracking', '--eval-kl-tracking'),
+        ('log_expert_heatmap', '--log-expert-heatmap'),
     ]
     
     for config_key, flag in bool_flags:
@@ -255,6 +257,8 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('train_iters', '--train-iters'),
         ('eval_interval', '--eval-interval'),
         ('eval_iters', '--eval-iters'),
+        ('hellaswag_eval_interval', '--hellaswag-eval-interval'),
+        ('hellaswag_eval_limit', '--hellaswag-eval-limit'),
     ]
     
     for config_key, flag in value_args:
@@ -320,23 +324,44 @@ def main():
     
     sweep_params = combinations[args.run_index]
     
-    sweep_name_prefix = None
-    if fixed_params.get('fresh_start', False):
-        sweep_name_prefix = fixed_params.get('wandb_run_name_base') or fixed_params.get('sweep_name')
+    # Always apply prefix from wandb_run_name_base to ensure consistent naming across sweeps
+    sweep_name_prefix = fixed_params.get('wandb_run_name_base') or fixed_params.get('sweep_name')
     
     run_name = build_run_name(sweep_params, args.run_index, fixed_params,
                               sweep_name_prefix=sweep_name_prefix)
     
-    # WandB resume: if this run was previously started, resume the same wandb run
-    # instead of creating a new one. This enables multi-allocation training.
+    # WandB resume: if this run was previously started, resume the same wandb run.
+    # Only attempt resume when fresh_start is NOT set.
     all_params_for_resume = {**fixed_params, **sweep_params}
     base_output = all_params_for_resume.get('output_basepath', '/tmp/output')
-    run_output_dir = os.path.join(base_output, 'checkpoint', run_name)
+    run_output_dir = os.path.join(base_output, run_name)
     wandb_id_file = os.path.join(run_output_dir, 'wandb_run_id.txt')
     
+    fresh_start = fixed_params.get('fresh_start', False)
+    
+    # Cross-sweep resume: if exact run_name dir doesn't exist, search for a dir
+    # with the same config content but a different r## index (from a previous sweep).
+    if not fresh_start and not os.path.exists(wandb_id_file):
+        import re
+        config_part = re.sub(r'_r\d+$', '', run_name)
+        if os.path.isdir(base_output):
+            for d in os.listdir(base_output):
+                if d == run_name:
+                    continue
+                d_config = re.sub(r'_r\d+$', '', d)
+                if d_config == config_part:
+                    candidate_id_file = os.path.join(base_output, d, 'wandb_run_id.txt')
+                    candidate_ckpt = os.path.join(base_output, d, 'checkpoint')
+                    if os.path.exists(candidate_id_file) or os.path.isdir(candidate_ckpt):
+                        print(f"CROSS-SWEEP RESUME: matched {d} -> {run_name} (same config, different index)")
+                        run_output_dir = os.path.join(base_output, d)
+                        wandb_id_file = os.path.join(run_output_dir, 'wandb_run_id.txt')
+                        run_name = d
+                        break
+
     try:
         import wandb
-        if os.path.exists(wandb_id_file):
+        if not fresh_start and os.path.exists(wandb_id_file):
             saved_id = open(wandb_id_file).read().strip()
             print(f"RESUME: Found previous wandb run ID: {saved_id}")
             if wandb.run is not None:
@@ -484,6 +509,42 @@ def main():
     else:
         result = subprocess.run(cmd, cwd=script_dir)
     
+    # Save wandb run ID after training so the next allocation can resume the same wandb run.
+    # The training script (Megatron) initializes wandb internally, so wandb.run may not be
+    # available here. Instead, find the wandb run ID from the wandb output directory.
+    try:
+        wandb_data_dir = os.path.join(script_dir, '..', '..', '..', 'wandb_data', 'wandb')
+        if os.path.isdir(wandb_data_dir):
+            run_dirs = sorted(
+                [d for d in os.listdir(wandb_data_dir) if d.startswith('run-') and run_name in os.listdir(os.path.join(wandb_data_dir, d)) == False],
+                reverse=True
+            )
+        # Simpler approach: scan for the run ID file that Megatron's wandb created
+        # by looking for the most recent wandb run directory
+        import glob
+        wandb_run_files = sorted(glob.glob(os.path.join(wandb_data_dir, 'run-*', 'run-*.wandb')), reverse=True)
+        for wrf in wandb_run_files[:5]:
+            run_dir_name = os.path.basename(os.path.dirname(wrf))
+            # run dir format: run-YYYYMMDD_HHMMSS-RUNID
+            parts = run_dir_name.split('-')
+            if len(parts) >= 3:
+                found_id = parts[-1]
+                # Verify this wandb run matches our run_name by checking the wandb config
+                config_file = os.path.join(os.path.dirname(wrf), 'files', 'config.yaml')
+                if os.path.exists(config_file):
+                    import yaml
+                    with open(config_file) as cf:
+                        wconfig = yaml.safe_load(cf)
+                    if wconfig.get('run_name', {}).get('value', '') == run_name:
+                        os.makedirs(run_output_dir, exist_ok=True)
+                        with open(wandb_id_file, 'w') as f:
+                            f.write(found_id)
+                        print(f"POST-TRAINING: Saved wandb run ID {found_id} to {wandb_id_file}")
+                        wandb_run_id = found_id
+                        break
+    except Exception as e:
+        print(f"Note: Could not save wandb run ID post-training: {e}")
+
     # Submit post-training benchmark if enabled and training succeeded
     all_params = {**fixed_params, **sweep_params}
     if result.returncode == 0 and all_params.get('run_benchmarks', False):

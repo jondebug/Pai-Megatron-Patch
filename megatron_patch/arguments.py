@@ -594,6 +594,14 @@ def get_patch_args(parser):
                            'N=1 targets only the single bottleneck expert.')
     group.add_argument('--moe-router-critical-path-alpha', type=float, default=0.001,
                       help='Bias update rate for critical-path bias (default: 0.001).')
+    group.add_argument('--hellaswag-eval-interval', type=int, default=0,
+                      help='Run HellaSwag accuracy check every N steps (0=disabled). Detects benchmark collapse during training.')
+    group.add_argument('--hellaswag-eval-limit', type=int, default=100,
+                      help='Number of HellaSwag samples per evaluation (default: 100). More samples = more accurate but slower.')
+    group.add_argument('--eval-kl-tracking', action='store_true', default=False,
+                      help='Track KL divergence from pretrained reference during eval.')
+    group.add_argument('--log-expert-heatmap', action='store_true', default=False,
+                      help='Log per-expert token load heatmaps to wandb every 50 steps.')
     group.add_argument('--enable-wandb-logging', action='store_true', default=False,
                       help='Enable wandb logging for training metrics')
     group.add_argument('--wandb-project-name', type=str, default='qwen3-moe-training',

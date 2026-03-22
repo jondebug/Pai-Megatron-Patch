@@ -652,8 +652,31 @@ def forward_step(data_iterator, model):
     if kl_loss_coeff > 0 and torch.is_grad_enabled():
         _run_reference_forward(model, tokens, position_ids, attention_mask, packed_seq_params)
 
+    # Periodic HellaSwag benchmark (during training only)
+    hellaswag_interval = getattr(args, 'hellaswag_eval_interval', 0)
+    if hellaswag_interval > 0 and torch.is_grad_enabled():
+        iteration = getattr(args, 'iteration', 0)
+        if iteration > 0 and iteration % hellaswag_interval == 0:
+            try:
+                from megatron_patch.hellaswag_eval import run_hellaswag_eval
+                hellaswag_limit = getattr(args, 'hellaswag_eval_limit', 100)
+                result = run_hellaswag_eval(model, limit=hellaswag_limit)
+                if result is not None:
+                    try:
+                        from megatron.core import parallel_state as mpu
+                        if mpu.get_data_parallel_rank() == 0:
+                            import wandb
+                            if wandb.run is not None:
+                                wandb.log({
+                                    'benchmark/hellaswag_accuracy': result['hellaswag_accuracy'],
+                                    'benchmark/hellaswag_time_sec': result['hellaswag_time_sec'],
+                                }, commit=False)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[HELLASWAG] WARNING: eval failed: {e}", flush=True)
+
     # Choose loss function based on CLI arg parsed by Megatron
-    # During eval (no grad), skip RL loss to avoid trajectory tracker issues and wasted compute
     use_rl_loss = getattr(args, 'use_rl_loss', False) and torch.is_grad_enabled()
     selected_loss_func = loss_func_with_rl if use_rl_loss else loss_func
     return output_tensor, partial(selected_loss_func, loss_mask, num_seqs)
