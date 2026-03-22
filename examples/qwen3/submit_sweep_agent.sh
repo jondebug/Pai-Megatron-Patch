@@ -66,14 +66,18 @@ srun --container-image="$CONTAINER_IMAGE" \
          export WANDB_RESUME=allow
          cd $WORKDIR
          
-         # Phase 1: Resume incomplete runs from previous allocations.
-         # Use the sweep dir passed as argument, or fall back to latest symlink.
+         # Phase 1: Resume ONE incomplete run from a previous allocation.
+         # Skipped entirely when fresh_start=true.
          if [ -n \"$SWEEP_DIR_ARG\" ]; then
              SWEEP_DIR=\"$SWEEP_DIR_ARG\"
          else
              SWEEP_DIR=\$(readlink -f sweep_logs/latest 2>/dev/null)
          fi
-         if [ -n \"\$SWEEP_DIR\" ] && [ -f \"\$SWEEP_DIR/sweep_combinations.json\" ]; then
+         FRESH_START=\$(python3 -c \"import json; print(json.load(open('\$SWEEP_DIR/sweep_config.json')).get('fresh_start', False))\" 2>/dev/null)
+         
+         if [ \"\$FRESH_START\" = \"True\" ]; then
+             echo \"fresh_start=true: skipping Phase 1 (no checkpoint resume)\"
+         elif [ -n \"\$SWEEP_DIR\" ] && [ -f \"\$SWEEP_DIR/sweep_combinations.json\" ]; then
              COMBOS=\$SWEEP_DIR/sweep_combinations.json
              CONFIG=\$SWEEP_DIR/sweep_config.json
              OUTPUT_BASE=\$(python3 -c \"import json; print(json.load(open('\$CONFIG')).get('output_basepath',''))\" 2>/dev/null)
@@ -82,30 +86,31 @@ srun --container-image="$CONTAINER_IMAGE" \
              
              if [ -n \"\$OUTPUT_BASE\" ] && [ \"\$TRAIN_ITERS\" -gt 0 ] 2>/dev/null; then
                  echo \"Checking for incomplete runs (target: \$TRAIN_ITERS steps)...\"
+                 RESUMED=0
                  for IDX in \$(seq 0 \$((N_COMBOS - 1))); do
-                     # Build the run name to find its checkpoint directory
+                     [ \$RESUMED -ge 1 ] && break
                      RUN_NAME=\$(python3 -c \"
 import sys; sys.path.insert(0,'.')
 from wandb_agent_runner import build_run_name, load_combinations
 combos, fixed, _, _ = load_combinations('\$COMBOS')
 if \$IDX < len(combos):
-    print(build_run_name(combos[\$IDX], \$IDX, fixed))
+    prefix = fixed.get('wandb_run_name_base') or fixed.get('sweep_name')
+    print(build_run_name(combos[\$IDX], \$IDX, fixed, sweep_name_prefix=prefix))
 \" 2>/dev/null)
                      [ -z \"\$RUN_NAME\" ] && continue
                      
-                     # Checkpoint lives under: output_base/RUN_NAME/checkpoint/MEGATRON_NAME/
                      ITER_FILE=\$(find \"\$OUTPUT_BASE/\$RUN_NAME/checkpoint\" -name \"latest_checkpointed_iteration.txt\" 2>/dev/null | head -1)
                      if [ -n \"\$ITER_FILE\" ]; then
                          SAVED_ITER=\$(cat \"\$ITER_FILE\" | tr -d '[:space:]')
                          if [ \"\$SAVED_ITER\" -lt \"\$TRAIN_ITERS\" ] 2>/dev/null; then
                              echo \"RESUME: \$RUN_NAME at iter \$SAVED_ITER/\$TRAIN_ITERS\"
-                             python3 wandb_agent_runner.py --run_index \$IDX --sweep-dir \"\$SWEEP_DIR\" &
-                             RESUME_PID=\$!
-                             wait \$RESUME_PID
+                             python3 wandb_agent_runner.py --run_index \$IDX --sweep-dir \"\$SWEEP_DIR\"
                              echo \"Resume of \$RUN_NAME completed (exit \$?)\"
+                             RESUMED=1
                          fi
                      fi
                  done
+                 [ \$RESUMED -eq 0 ] && echo \"No incomplete runs found to resume.\"
              fi
          fi
          
