@@ -340,7 +340,7 @@ class RouterTrajectoryTracker:
             routing_map (torch.Tensor): Token routing assignments - action space
         """
         # CRITICAL: Check gradient flow - if routing_logits doesn't require grad, policy gradient will be zero!
-        if layer_num == 1 and not routing_logits.requires_grad:
+        if layer_num == 1 and not routing_logits.requires_grad and torch.is_grad_enabled():
             import warnings
             warnings.warn(
                 "[RL WARNING] routing_logits.requires_grad=False! "

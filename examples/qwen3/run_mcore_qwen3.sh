@@ -588,4 +588,88 @@ run_cmd="torchrun $DISTRIBUTED_ARGS pretrain_qwen.py \
 
 echo ${run_cmd}
 eval ${run_cmd}
+TRAIN_EXIT_CODE=$?
 set +x
+
+# Post-training inline HellaSwag benchmark (if checkpoint exists)
+if [ -f "${SAVED_PRETRAIN_CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" ]; then
+    BENCH_ITER=$(cat "${SAVED_PRETRAIN_CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" | tr -d '[:space:]')
+    HF_OUTPUT="${SAVED_PRETRAIN_CHECKPOINT_PATH}/hf_converted"
+    BENCH_RESULTS="${SAVED_PRETRAIN_CHECKPOINT_PATH}/benchmark_results"
+    ORIGINAL_HF="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-ckpts/Qwen3-30B-A3B-complete"
+    CONVERTOR_DIR="$(cd "$(dirname "$0")/../../toolkits/distributed_checkpoints_convertor" && pwd)"
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+    # Skip if already benchmarked at this iteration
+    if [ -f "${BENCH_RESULTS}/accuracy_summary.json" ]; then
+        echo "BENCHMARK: Already benchmarked at iter ${BENCH_ITER}, skipping"
+    else
+        echo "============================================================"
+        echo "INLINE BENCHMARK: HellaSwag at iter ${BENCH_ITER}"
+        echo "============================================================"
+
+        # Step 1: Convert checkpoint to HF format
+        if ! ls "${HF_OUTPUT}"/*.safetensors 1>/dev/null 2>&1; then
+            echo "  Converting Megatron -> HF..."
+            export PYTHONPATH="${SCRIPT_DIR}/../../:${SCRIPT_DIR}/../../backends/megatron/Megatron-LM-250624:${CONVERTOR_DIR}/impl:${PYTHONPATH:-}"
+            export MODEL_PARALLEL_ARGS='--tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 --expert-model-parallel-size 4'
+            export KUBERNETES_CONTAINER_RESOURCE_GPU=4
+            cd "${CONVERTOR_DIR}"
+            bash scripts/qwen3/run_8xH20.sh A3B \
+                "${SAVED_PRETRAIN_CHECKPOINT_PATH}" "${HF_OUTPUT}" \
+                true true bf16 "${ORIGINAL_HF}" 2>&1 || echo "  WARNING: Conversion failed"
+            cd "${SCRIPT_DIR}"
+        fi
+
+        # Step 2: Run HellaSwag only
+        if ls "${HF_OUTPUT}"/*.safetensors 1>/dev/null 2>&1; then
+            mkdir -p "${BENCH_RESULTS}"
+            export HF_HOME=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/.hf_cache
+            export HF_DATASETS_CACHE="${HF_HOME}/datasets"
+            mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}"
+            pip install 'lm_eval' 'accelerate>=1.2.0' --quiet 2>/dev/null
+
+            echo "  Running HellaSwag (1000 samples)..."
+            BENCH_START=$(date +%s)
+            python3 -m lm_eval \
+                --model hf \
+                --model_args "pretrained=${HF_OUTPUT},trust_remote_code=True,dtype=bfloat16" \
+                --tasks hellaswag \
+                --batch_size 8 \
+                --output_path "${BENCH_RESULTS}" \
+                --device cuda:0 \
+                --limit 1000 2>&1 || echo "  WARNING: lm_eval failed"
+            BENCH_END=$(date +%s)
+            echo "{\"total_seconds\": $((BENCH_END - BENCH_START))}" > "${BENCH_RESULTS}/timing.json"
+
+            # Parse results
+            python3 "${SCRIPT_DIR}/benchmarks/_parse_lm_eval_results.py" "${BENCH_RESULTS}" 2>&1 || true
+
+            # Upload to WandB
+            python3 -c "
+import json, os, glob
+results_files = glob.glob('${BENCH_RESULTS}/**/results.json', recursive=True)
+if results_files:
+    with open(max(results_files, key=os.path.getmtime)) as f:
+        data = json.load(f)
+    hs = data.get('results',{}).get('hellaswag',{})
+    acc = hs.get('acc_norm,none', hs.get('acc,none'))
+    if acc is not None:
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.log({'benchmark/hellaswag_accuracy': acc * 100, 'benchmark/hellaswag_iter': ${BENCH_ITER}})
+                print(f'  Logged to WandB: hellaswag={acc*100:.1f}% at iter ${BENCH_ITER}')
+        except Exception as e:
+            print(f'  WandB log failed: {e}')
+        print(f'  HellaSwag accuracy: {acc*100:.1f}%')
+" 2>&1 || true
+
+            echo "BENCHMARK COMPLETE: iter ${BENCH_ITER}"
+        else
+            echo "  WARNING: No HF checkpoint found, skipping benchmark"
+        fi
+    fi
+fi
+
+exit ${TRAIN_EXIT_CODE}

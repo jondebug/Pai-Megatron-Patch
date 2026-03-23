@@ -652,36 +652,51 @@ def forward_step(data_iterator, model):
     if kl_loss_coeff > 0 and torch.is_grad_enabled():
         _run_reference_forward(model, tokens, position_ids, attention_mask, packed_seq_params)
 
-    # Periodic HellaSwag benchmark (during training only)
+    # Periodic HellaSwag benchmark via subprocess after checkpoint saves
+    save_interval = getattr(args, 'save_interval', 0)
     hellaswag_interval = getattr(args, 'hellaswag_eval_interval', 0)
-    if hellaswag_interval > 0 and torch.is_grad_enabled():
-        if not hasattr(forward_step, '_hellaswag_microbatch_count'):
-            forward_step._hellaswag_microbatch_count = 0
-            forward_step._hellaswag_last_fired = -1
-        forward_step._hellaswag_microbatch_count += 1
+    if hellaswag_interval > 0 and save_interval > 0 and torch.is_grad_enabled():
+        if not hasattr(forward_step, '_bench_microbatch_count'):
+            forward_step._bench_microbatch_count = 0
+            forward_step._bench_last_fired = -1
+            forward_step._bench_process = None
+        forward_step._bench_microbatch_count += 1
         num_microbatches = getattr(args, 'global_batch_size', 8) // max(1, getattr(args, 'micro_batch_size', 1))
-        current_iter = forward_step._hellaswag_microbatch_count // max(1, num_microbatches)
-        if current_iter > 0 and current_iter % hellaswag_interval == 0 and current_iter != forward_step._hellaswag_last_fired:
-            forward_step._hellaswag_last_fired = current_iter
+        current_iter = forward_step._bench_microbatch_count // max(1, num_microbatches)
+
+        # Check if a previous async benchmark finished and collect results
+        if forward_step._bench_process is not None and forward_step._bench_process.poll() is not None:
             try:
-                from megatron_patch.hellaswag_eval import run_hellaswag_eval
-                hellaswag_limit = getattr(args, 'hellaswag_eval_limit', 100)
-                result = run_hellaswag_eval(model, limit=hellaswag_limit)
-                if result is not None:
-                    try:
-                        from megatron.core import parallel_state as mpu
-                        if mpu.get_data_parallel_rank() == 0:
-                            import wandb
-                            if wandb.run is not None:
-                                wandb.log({
-                                    'benchmark/hellaswag_accuracy': result['hellaswag_accuracy'],
-                                    'benchmark/hellaswag_time_sec': result['hellaswag_time_sec'],
-                                }, commit=False)
-                    except Exception:
-                        pass
+                from megatron.core import parallel_state as mpu
+                if mpu.get_data_parallel_rank() == 0:
+                    rc = forward_step._bench_process.returncode
+                    print(f"[BENCHMARK] Background benchmark finished (exit={rc})", flush=True)
+            except Exception:
+                pass
+            forward_step._bench_process = None
+
+        # Launch benchmark after a checkpoint save (first microbatch of the iteration after save)
+        if (current_iter > 0 and current_iter % save_interval == 1
+                and current_iter != forward_step._bench_last_fired
+                and forward_step._bench_process is None):
+            forward_step._bench_last_fired = current_iter
+            try:
+                from megatron.core import parallel_state as mpu
+                if mpu.get_data_parallel_rank() == 0:
+                    save_dir = getattr(args, 'save', None)
+                    if save_dir and os.path.isdir(save_dir):
+                        import subprocess
+                        script_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                                                  'examples', 'qwen3')
+                        bench_script = os.path.join(script_dir, 'run_inline_benchmark.sh')
+                        if os.path.exists(bench_script):
+                            bench_iter = current_iter - 1
+                            print(f"[BENCHMARK] Launching HellaSwag at iter {bench_iter} (async)", flush=True)
+                            forward_step._bench_process = subprocess.Popen(
+                                ['bash', bench_script, save_dir, str(bench_iter)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             except Exception as e:
-                import traceback
-                print(f"[HELLASWAG] WARNING: eval failed: {e}\n{traceback.format_exc()}", flush=True)
+                print(f"[BENCHMARK] WARNING: failed to launch: {e}", flush=True)
 
     # Choose loss function based on CLI arg parsed by Megatron
     use_rl_loss = getattr(args, 'use_rl_loss', False) and torch.is_grad_enabled()
