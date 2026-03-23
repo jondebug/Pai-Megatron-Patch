@@ -62,59 +62,15 @@ srun --container-image="$CONTAINER_IMAGE" \
      --container-mounts="$HOME:$HOME,/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing:/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing" \
      --container-workdir="$WORKDIR" \
      bash -c "
-         pip install wandb --quiet
+         pip install wandb datasets --quiet
          export WANDB_RESUME=allow
          cd $WORKDIR
          
-         # Phase 1: Resume ONE incomplete run from a previous allocation.
-         # Skipped entirely when fresh_start=true.
-         if [ -n \"$SWEEP_DIR_ARG\" ]; then
-             SWEEP_DIR=\"$SWEEP_DIR_ARG\"
-         else
-             SWEEP_DIR=\$(readlink -f sweep_logs/latest 2>/dev/null)
-         fi
-         FRESH_START=\$(python3 -c \"import json; print(json.load(open('\$SWEEP_DIR/sweep_config.json')).get('fresh_start', False))\" 2>/dev/null)
+         # Phase 1 DISABLED: checkpoint resume is now handled by wandb_agent_runner.py
+         # via cross-sweep directory matching. Phase 1 was blocking Phase 2 by consuming
+         # the entire 4-hour allocation on a single resumed run.
          
-         if [ \"\$FRESH_START\" = \"True\" ]; then
-             echo \"fresh_start=true: skipping Phase 1 (no checkpoint resume)\"
-         elif [ -n \"\$SWEEP_DIR\" ] && [ -f \"\$SWEEP_DIR/sweep_combinations.json\" ]; then
-             COMBOS=\$SWEEP_DIR/sweep_combinations.json
-             CONFIG=\$SWEEP_DIR/sweep_config.json
-             OUTPUT_BASE=\$(python3 -c \"import json; print(json.load(open('\$CONFIG')).get('output_basepath',''))\" 2>/dev/null)
-             TRAIN_ITERS=\$(python3 -c \"import json; c=json.load(open('\$CONFIG')); print(c.get('train_iters', c.get('fixed_params',{}).get('train_iters',0)))\" 2>/dev/null)
-             N_COMBOS=\$(python3 -c \"import json; print(len(json.load(open('\$COMBOS')).get('combinations',[])))\" 2>/dev/null)
-             
-             if [ -n \"\$OUTPUT_BASE\" ] && [ \"\$TRAIN_ITERS\" -gt 0 ] 2>/dev/null; then
-                 echo \"Checking for incomplete runs (target: \$TRAIN_ITERS steps)...\"
-                 RESUMED=0
-                 for IDX in \$(seq 0 \$((N_COMBOS - 1))); do
-                     [ \$RESUMED -ge 1 ] && break
-                     RUN_NAME=\$(python3 -c \"
-import sys; sys.path.insert(0,'.')
-from wandb_agent_runner import build_run_name, load_combinations
-combos, fixed, _, _ = load_combinations('\$COMBOS')
-if \$IDX < len(combos):
-    prefix = fixed.get('wandb_run_name_base') or fixed.get('sweep_name')
-    print(build_run_name(combos[\$IDX], \$IDX, fixed, sweep_name_prefix=prefix))
-\" 2>/dev/null)
-                     [ -z \"\$RUN_NAME\" ] && continue
-                     
-                     ITER_FILE=\$(find \"\$OUTPUT_BASE/\$RUN_NAME/checkpoint\" -name \"latest_checkpointed_iteration.txt\" 2>/dev/null | head -1)
-                     if [ -n \"\$ITER_FILE\" ]; then
-                         SAVED_ITER=\$(cat \"\$ITER_FILE\" | tr -d '[:space:]')
-                         if [ \"\$SAVED_ITER\" -lt \"\$TRAIN_ITERS\" ] 2>/dev/null; then
-                             echo \"RESUME: \$RUN_NAME at iter \$SAVED_ITER/\$TRAIN_ITERS\"
-                             python3 wandb_agent_runner.py --run_index \$IDX --sweep-dir \"\$SWEEP_DIR\"
-                             echo \"Resume of \$RUN_NAME completed (exit \$?)\"
-                             RESUMED=1
-                         fi
-                     fi
-                 done
-                 [ \$RESUMED -eq 0 ] && echo \"No incomplete runs found to resume.\"
-             fi
-         fi
-         
-         # Phase 2: Launch wandb agents for new (unstarted) configs
+         # Phase 2: Launch wandb agents for configs (resume handled by agent runner)
          PIDS=()
          for i in \$(seq 1 $AGENTS_PER_JOB); do
              echo \"Starting agent \$i of $AGENTS_PER_JOB\"

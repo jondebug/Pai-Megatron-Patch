@@ -340,15 +340,22 @@ def main():
     fresh_start = fixed_params.get('fresh_start', False)
     
     # Cross-sweep resume: if exact run_name dir doesn't exist, search for a dir
-    # with the same config content but a different r## index (from a previous sweep).
+    # with the same config content but a different r## index or prefix (from a previous sweep).
     if not fresh_start and not os.path.exists(wandb_id_file):
         import re
-        config_part = re.sub(r'_r\d+$', '', run_name)
+        def _strip_for_match(name):
+            """Strip r## index and known prefixes for config-based matching."""
+            s = re.sub(r'_r\d+$', '', name)
+            prefix = sweep_name_prefix + '_' if sweep_name_prefix else ''
+            if prefix and s.startswith(prefix):
+                s = s[len(prefix):]
+            return s
+        config_part = _strip_for_match(run_name)
         if os.path.isdir(base_output):
             for d in os.listdir(base_output):
                 if d == run_name:
                     continue
-                d_config = re.sub(r'_r\d+$', '', d)
+                d_config = _strip_for_match(d)
                 if d_config == config_part:
                     candidate_id_file = os.path.join(base_output, d, 'wandb_run_id.txt')
                     candidate_ckpt = os.path.join(base_output, d, 'checkpoint')

@@ -418,19 +418,6 @@ class RouterTrajectoryTracker:
             else:
                 self._heatmap_accum[layer_num] += loads
 
-        # #region agent log
-        if layer_num == 1:
-            import json, time as _t
-            _dbg = {"sessionId":"63a0ae","hypothesisId":"H2_H5","location":"rl_trajectory.py:add_layer_decision","timestamp":int(_t.time()*1000),
-                    "message":"layer_decision_stored",
-                    "data":{"layer":layer_num,"logits_requires_grad":bool(routing_logits.requires_grad),
-                            "logits_shape":list(routing_logits.shape),"routing_map_shape":list(routing_map.shape),
-                            "reward_shape":list(reward.shape) if reward.dim()>0 else "scalar",
-                            "reward_val":float(reward.mean().item()) if reward.dim()>0 else float(reward.item()),
-                            "routing_map_sum_per_token":float(routing_map.float().sum(dim=-1).mean().item()),
-                            "num_experts":int(routing_map.shape[-1])}}
-            with open("/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/.cursor/debug-63a0ae.log","a") as _f: _f.write(json.dumps(_dbg)+"\n")
-        # #endregion
 
     def inject_lm_reward(self, per_token_losses: torch.Tensor, lm_reward_coeff: float):
         """Add per-token LM cross-entropy as an additional reward component to all layers.
@@ -1105,29 +1092,6 @@ class RouterTrajectoryTracker:
                           f"mean_reward={self.last_loss_components['mean_reward']:.4f}, "
                           f"routing_logits.requires_grad={routing_logits_first.requires_grad}")
 
-        # #region agent log
-        import json, time as _t
-        _l1 = sorted_layers[0]
-        _, _rm1, _rl1, _rw1 = trajectory_data[_l1]
-        _lp1 = torch.nn.functional.log_softmax(_rl1, dim=-1)
-        _clp1 = (_lp1 * _rm1.float()).sum(dim=-1)  # per-token log prob
-        _has_old = old_trajectory_data is not None and _l1 in old_trajectory_data
-        _old_eq = False
-        if _has_old:
-            _, _orm, _orl, _ = old_trajectory_data[_l1]
-            _old_eq = bool(torch.equal(_orl, _rl1))
-        _dbg = {"sessionId":"63a0ae","hypothesisId":"H2_H4","location":"rl_trajectory.py:ppo_scalar_end","timestamp":int(_t.time()*1000),
-                "message":"ppo_scalar_diagnostics",
-                "data":{"total_loss":float(total_loss.item()),"total_loss_requires_grad":bool(total_loss.requires_grad),
-                        "logits_requires_grad":bool(_rl1.requires_grad),
-                        "per_token_log_prob_mean":float(_clp1.mean().item()),
-                        "per_token_log_prob_std":float(_clp1.std().item()),
-                        "num_experts_per_token":float(_rm1.float().sum(dim=-1).mean().item()),
-                        "has_old_trajectory":_has_old,"old_logits_equal_current":_old_eq,
-                        "advantage_mean":float(self.last_loss_components['mean_advantage']),
-                        "advantage_std":float(self.last_loss_components['advantage_std']),
-                        "num_layers":num_layers}}
-        with open("/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/.cursor/debug-63a0ae.log","a") as _f: _f.write(json.dumps(_dbg)+"\n")
         # #endregion
 
         return total_loss
@@ -1267,31 +1231,6 @@ class RouterTrajectoryTracker:
         }
         wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}, critic_loss={logged_value_loss:.6f}, adv_std={self.last_loss_components['advantage_std']:.4f}, total_tokens={total_tokens}")
 
-        # #region agent log
-        import json, time as _t
-        _l1 = sorted_layers[0]
-        _, _rm1, _rl1, _rw1 = trajectory_data[_l1]
-        _has_old = old_trajectory_data is not None and _l1 in old_trajectory_data
-        _old_eq = False
-        if _has_old:
-            _, _orm, _orl, _ = old_trajectory_data[_l1]
-            _old_eq = bool(torch.equal(_orl, _rl1))
-        _lp1 = torch.nn.functional.log_softmax(_rl1, dim=-1)
-        _clp1 = (_lp1 * _rm1.float()).sum(dim=-1)
-        _dbg = {"sessionId":"63a0ae","hypothesisId":"H2_H4_pertoken","location":"rl_trajectory.py:ppo_pertoken_end","timestamp":int(_t.time()*1000),
-                "message":"ppo_pertoken_diagnostics",
-                "data":{"total_loss":float(total_loss.item()),"total_loss_requires_grad":bool(total_loss.requires_grad),
-                        "logits_requires_grad":bool(_rl1.requires_grad),
-                        "per_token_log_prob_mean":float(_clp1.mean().item()),
-                        "per_token_log_prob_std":float(_clp1.std().item()),
-                        "num_experts_per_token":float(_rm1.float().sum(dim=-1).mean().item()),
-                        "has_old_trajectory":_has_old,"old_logits_equal_current":_old_eq,
-                        "reward_mean":float(_rw1.mean().item()),"reward_std":float(_rw1.std().item()),
-                        "advantage_mean":float(self.last_loss_components['mean_advantage']),
-                        "advantage_std":float(self.last_loss_components['advantage_std']),
-                        "num_layers":len(sorted_layers),"total_tokens":total_tokens}}
-        with open("/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/.cursor/debug-63a0ae.log","a") as _f: _f.write(json.dumps(_dbg)+"\n")
-        # #endregion
 
         return total_loss
 
@@ -1534,17 +1473,16 @@ def get_trajectory_tracker() -> RouterTrajectoryTracker:
             _global_trajectory_tracker.critic_lr = getattr(args, 'rl_critic_lr', 1e-3)
             _global_trajectory_tracker.normalize_rewards = getattr(args, 'rl_normalize_rewards', False)
             _tracker_configured = True
-            # Always print configuration for verification (not gated by debug_mode)
-            import sys
-            print(f"[RL CONFIG] Tracker configured: baseline_type={_global_trajectory_tracker.baseline_type}, "
-                  f"reward_type={_global_trajectory_tracker.reward_type}, "
-                  f"reward_topn={_global_trajectory_tracker.reward_topn}, "
-                  f"per_token_rewards={_global_trajectory_tracker.per_token_rewards}, "
-                  f"ppo_entropy_coeff={_global_trajectory_tracker.ppo_entropy_coeff}, "
-                  f"critic_hidden_dims={_global_trajectory_tracker.critic_hidden_dims}, "
-                  f"critic_lr={_global_trajectory_tracker.critic_lr}, "
-                  f"normalize_rewards={_global_trajectory_tracker.normalize_rewards}", flush=True)
-            sys.stdout.flush()
+            try:
+                import torch.distributed as dist
+                if not dist.is_initialized() or dist.get_rank() == 0:
+                    print(f"[RL CONFIG] baseline={_global_trajectory_tracker.baseline_type}, "
+                          f"reward={_global_trajectory_tracker.reward_type}, "
+                          f"topn={_global_trajectory_tracker.reward_topn}, "
+                          f"per_token={_global_trajectory_tracker.per_token_rewards}, "
+                          f"normalize={_global_trajectory_tracker.normalize_rewards}", flush=True)
+            except Exception:
+                pass
         except (ImportError, AssertionError) as e:
             # Args not available yet, will retry on next call
             pass

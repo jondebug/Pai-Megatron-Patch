@@ -680,7 +680,8 @@ def forward_step(data_iterator, model):
                     except Exception:
                         pass
             except Exception as e:
-                print(f"[HELLASWAG] WARNING: eval failed: {e}", flush=True)
+                import traceback
+                print(f"[HELLASWAG] WARNING: eval failed: {e}\n{traceback.format_exc()}", flush=True)
 
     # Choose loss function based on CLI arg parsed by Megatron
     use_rl_loss = getattr(args, 'use_rl_loss', False) and torch.is_grad_enabled()
