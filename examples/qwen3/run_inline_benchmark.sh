@@ -1,11 +1,12 @@
 #!/bin/bash
 # Inline HellaSwag benchmark: converts checkpoint and runs lm-eval.
 # Called as a subprocess during training (async on rank 0).
-# Usage: bash run_inline_benchmark.sh <checkpoint_dir> <iteration>
+# Usage: bash run_inline_benchmark.sh <checkpoint_dir> <iteration> [hellaswag_limit]
 set -euo pipefail
 
 CKPT_DIR="$1"
 ITERATION="$2"
+BENCH_LIMIT="${3:-100}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -25,7 +26,7 @@ if [ -f "${RESULTS_DIR}/accuracy_summary.json" ]; then
     exit 0
 fi
 
-echo "[BENCHMARK] iter ${ITERATION}: starting conversion + HellaSwag"
+echo "[BENCHMARK] iter ${ITERATION}: starting conversion + HellaSwag (limit=${BENCH_LIMIT})"
 
 # Step 1: Convert Megatron checkpoint to HF
 if ! ls "${HF_OUTPUT}"/*.safetensors 1>/dev/null 2>&1; then
@@ -49,7 +50,7 @@ if ls "${HF_OUTPUT}"/*.safetensors 1>/dev/null 2>&1; then
         --batch_size 8 \
         --output_path "${RESULTS_DIR}" \
         --device cuda:0 \
-        --limit 1000 2>&1
+        --limit "${BENCH_LIMIT}" 2>&1
 
     python3 "${SCRIPT_DIR}/benchmarks/_parse_lm_eval_results.py" "${RESULTS_DIR}" 2>&1 || true
 

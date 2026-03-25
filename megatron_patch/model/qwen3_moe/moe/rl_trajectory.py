@@ -205,9 +205,11 @@ class RouterTrajectoryTracker:
         self.ppo_reeval = False  # Proper PPO: re-evaluate old states under current policy
         self.reeval_logits = {}  # Populated by router.forward() when ppo_reeval=True
         self.ppo_epochs = 1  # K: number of PPO epochs per training step
+        self.ppo_legacy_mode = False  # A/B switch: keep previous PPO behavior when True
         self._router_modules = {}  # layer_num -> router gating module (set by pretrain_qwen)
         self._ppo_optimizer = None  # Separate optimizer for multi-epoch PPO
         self.ppo_extra_lr = 1e-4  # LR for extra PPO epochs (scaled by 1/(K-1))
+        self._pending_post_step_ppo = None  # Deferred extra-epoch update payload (run post optimizer.step)
         self._heatmap_accum = {}  # layer_num -> accumulated expert loads [num_experts]
         self._heatmap_steps = 0  # Steps since last heatmap log
         self._heatmap_log_interval = 50  # Log heatmap every N steps
@@ -219,6 +221,8 @@ class RouterTrajectoryTracker:
             'mean_advantage': 0.0,
             'mean_reward': 0.0,
             'avg_topn_load': 0.0,  # Average top-N load across layers (only for topn_load reward)
+            'approx_kl': 0.0,
+            'clip_fraction': 0.0,
         }
 
     
@@ -243,6 +247,31 @@ class RouterTrajectoryTracker:
         
         self.layer_decisions = {}
         self.reeval_logits = {}  # layer_num -> re-evaluated logits (current weights, old states)
+
+    def schedule_extra_ppo_epochs(self, rl_loss_coeff: float, discount_factor: float, clip_ratio: float):
+        """Schedule deferred extra PPO epochs to run after optimizer.step().
+
+        We overwrite any previous pending payload because only the latest completed
+        rollout (the one associated with the just-finished backward/step) should run.
+        """
+        self._pending_post_step_ppo = {
+            'rl_loss_coeff': float(rl_loss_coeff),
+            'discount_factor': float(discount_factor),
+            'clip_ratio': float(clip_ratio),
+        }
+
+    def run_scheduled_extra_ppo_epochs(self):
+        """Run deferred extra PPO epochs once, if a payload is pending."""
+        if not self._pending_post_step_ppo:
+            return False
+        payload = self._pending_post_step_ppo
+        self._pending_post_step_ppo = None
+        self.run_extra_ppo_epochs(
+            rl_loss_coeff=payload['rl_loss_coeff'],
+            discount_factor=payload['discount_factor'],
+            clip_ratio=payload['clip_ratio'],
+        )
+        return True
     
     def get_critic(self, input_dim: int, device: torch.device) -> CriticNetwork:
         """Get or create the critic network.
@@ -1006,7 +1035,10 @@ class RouterTrajectoryTracker:
         total_entropy = torch.tensor(0.0, device=device)
         total_advantage = torch.tensor(0.0, device=device)
         total_reward = torch.tensor(0.0, device=device)
+        total_approx_kl = torch.tensor(0.0, device=device)
+        total_clip_fraction = torch.tensor(0.0, device=device)
         entropy_coeff = self.ppo_entropy_coeff
+        legacy_mode = getattr(self, 'ppo_legacy_mode', False)
         
         for layer_num in sorted_layers:
             _, routing_map, routing_logits, reward = trajectory_data[layer_num]
@@ -1019,11 +1051,27 @@ class RouterTrajectoryTracker:
             num_tokens_routed = routing_map.sum().clamp_min(1).float()
             current_log_prob = chosen_log_probs.sum() / num_tokens_routed
             
-            # Main step always uses ratio=1.0 (REINFORCE): data was just collected with
-            # current policy. PPO ratios only matter in extra epochs (run_extra_ppo_epochs)
-            # where weights have been updated since data collection.
-            ratio = torch.tensor(1.0, device=device)
-            policy_loss = -current_log_prob * advantage
+            if legacy_mode:
+                # Legacy behavior (REINFORCE-style main PPO update).
+                ratio = torch.tensor(1.0, device=device)
+                policy_loss = -current_log_prob * advantage
+                approx_kl = torch.tensor(0.0, device=device)
+                clip_fraction = torch.tensor(0.0, device=device)
+            else:
+                # True clipped PPO objective using behavior log-probs captured
+                # from the same rollout (detached from graph).
+                old_log_probs = torch.nn.functional.log_softmax(routing_logits.detach(), dim=-1)
+                old_chosen_log_probs = old_log_probs * routing_map.float()
+                old_log_prob = old_chosen_log_probs.sum() / num_tokens_routed
+
+                log_ratio = torch.clamp(current_log_prob - old_log_prob, -10.0, 10.0)
+                ratio = torch.exp(log_ratio)
+                pg1 = ratio * advantage
+                pg2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantage
+                policy_loss = -torch.min(pg1, pg2)
+
+                approx_kl = (old_log_prob - current_log_prob).detach()
+                clip_fraction = (torch.abs(ratio - 1.0) > clip_ratio).float().detach()
             
             # Value function loss for logging (critic already trained above)
             if self.baseline_type == "critic":
@@ -1049,6 +1097,8 @@ class RouterTrajectoryTracker:
             total_value_loss += value_loss
             total_entropy += entropy  # Now normalized per token
             total_advantage += advantage
+            total_approx_kl += approx_kl
+            total_clip_fraction += clip_fraction
             # Reduce reward to scalar if needed (for scalar mode)
             if isinstance(reward, torch.Tensor):
                 total_reward += reward.mean() if reward.numel() > 1 else reward
@@ -1080,6 +1130,8 @@ class RouterTrajectoryTracker:
             'advantage_std': all_advs_for_log.std().item(),
             'advantage_min': all_advs_for_log.min().item(),
             'advantage_max': all_advs_for_log.max().item(),
+            'approx_kl': (total_approx_kl / num_layers).item(),
+            'clip_fraction': (total_clip_fraction / num_layers).item(),
         }
         first_layer = sorted_layers[0]
         _, _, routing_logits_first, _ = trajectory_data[first_layer]
@@ -1168,8 +1220,11 @@ class RouterTrajectoryTracker:
         total_entropy = torch.tensor(0.0, device=device)
         total_advantage = torch.tensor(0.0, device=device)
         total_reward = torch.tensor(0.0, device=device)
+        total_approx_kl = torch.tensor(0.0, device=device)
+        total_clip_fraction = torch.tensor(0.0, device=device)
         total_tokens = 0
         entropy_coeff = self.ppo_entropy_coeff
+        legacy_mode = getattr(self, 'ppo_legacy_mode', False)
         
         for layer_num in sorted_layers:
             _, routing_map, routing_logits, reward = trajectory_data[layer_num]
@@ -1181,9 +1236,25 @@ class RouterTrajectoryTracker:
             chosen_log_probs = log_probs * routing_map.float()
             current_per_token_log_prob = chosen_log_probs.sum(dim=-1)
             
-            # Main step: ratio=1.0 (REINFORCE). PPO clipping only in extra epochs.
-            ratio = torch.ones_like(current_per_token_log_prob)
-            per_token_policy_loss = -current_per_token_log_prob * advantages
+            if legacy_mode:
+                # Legacy behavior (REINFORCE-style main PPO update).
+                ratio = torch.ones_like(current_per_token_log_prob)
+                per_token_policy_loss = -current_per_token_log_prob * advantages
+                approx_kl = torch.zeros_like(current_per_token_log_prob)
+                clip_fraction = torch.zeros_like(current_per_token_log_prob)
+            else:
+                old_log_probs = torch.nn.functional.log_softmax(routing_logits.detach(), dim=-1)
+                old_chosen_log_probs = old_log_probs * routing_map.float()
+                old_per_token_log_prob = old_chosen_log_probs.sum(dim=-1)
+
+                log_ratio = torch.clamp(current_per_token_log_prob - old_per_token_log_prob, -10.0, 10.0)
+                ratio = torch.exp(log_ratio)
+                pg1 = ratio * advantages
+                pg2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages
+                per_token_policy_loss = -torch.min(pg1, pg2)
+
+                approx_kl = (old_per_token_log_prob - current_per_token_log_prob).detach()
+                clip_fraction = (torch.abs(ratio - 1.0) > clip_ratio).float().detach()
             
             # Value function loss per token for logging (critic already trained above)
             baseline_for_layer = layer_baselines[layer_num]
@@ -1208,6 +1279,8 @@ class RouterTrajectoryTracker:
             total_entropy += per_token_entropy.sum()
             total_advantage += advantages.sum()
             total_reward += reward.sum()
+            total_approx_kl += approx_kl.sum()
+            total_clip_fraction += clip_fraction.sum()
             total_tokens += per_token_loss.numel()
             
             if layer_num == sorted_layers[0]:
@@ -1228,6 +1301,8 @@ class RouterTrajectoryTracker:
             'advantage_std': all_advs_log.std().item(),
             'advantage_min': all_advs_log.min().item(),
             'advantage_max': all_advs_log.max().item(),
+            'approx_kl': (total_approx_kl / max(1, total_tokens)).item(),
+            'clip_fraction': (total_clip_fraction / max(1, total_tokens)).item(),
         }
         wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}, critic_loss={logged_value_loss:.6f}, adv_std={self.last_loss_components['advantage_std']:.4f}, total_tokens={total_tokens}")
 
@@ -1372,6 +1447,8 @@ class RouterTrajectoryTracker:
             _, _, logits, _ = self.old_layer_decisions[layer_num]
             original_logits[layer_num] = logits.detach()
 
+        legacy_mode = getattr(self, 'ppo_legacy_mode', False)
+
         # Scale learning rate by 1/(K-1) to prevent compounding updates
         extra_lr = getattr(self, 'ppo_extra_lr', 1e-4) / max(1, self.ppo_epochs - 1)
 
@@ -1380,7 +1457,10 @@ class RouterTrajectoryTracker:
         if not router_params:
             return
         if self._ppo_optimizer is None:
-            self._ppo_optimizer = torch.optim.SGD(router_params, lr=extra_lr)
+            if legacy_mode:
+                self._ppo_optimizer = torch.optim.SGD(router_params, lr=extra_lr)
+            else:
+                self._ppo_optimizer = torch.optim.Adam(router_params, lr=extra_lr, eps=1e-5)
         else:
             for pg in self._ppo_optimizer.param_groups:
                 pg['lr'] = extra_lr
@@ -1395,11 +1475,13 @@ class RouterTrajectoryTracker:
                 rp_orig = {ln: data[2].detach() for ln, data in gpu_traj.items()}
                 replay_orig_logits.append(rp_orig)
 
-        # Cache advantages once — routing_map is fixed so rewards don't change across epochs
-        layer_advantages = self._recompute_rollout_advantages(discount_factor)
+        # Legacy mode keeps a single cached advantage tensor across all extra epochs.
+        # New mode recomputes each epoch to reduce stale-policy drift.
+        cached_advantages = self._recompute_rollout_advantages(discount_factor) if legacy_mode else None
 
         # Run K-1 extra epochs
         for epoch in range(self.ppo_epochs - 1):
+            layer_advantages = cached_advantages if legacy_mode else self._recompute_rollout_advantages(discount_factor)
 
             # Loss from current trajectory
             total_loss, total_tokens = self._compute_ppo_epoch_loss(
@@ -1442,8 +1524,9 @@ class RouterTrajectoryTracker:
             torch.nn.utils.clip_grad_norm_(router_params, 1.0)
             self._ppo_optimizer.step()
 
+        opt_name = self._ppo_optimizer.__class__.__name__ if self._ppo_optimizer is not None else "None"
         wrap_print_rank_0(f"[PPO MULTI-EPOCH] Ran {self.ppo_epochs - 1} extra epochs "
-                         f"(lr={extra_lr:.2e}, buf={len(replay_rollouts)}), "
+                         f"(lr={extra_lr:.2e}, opt={opt_name}, legacy={legacy_mode}, buf={len(replay_rollouts)}), "
                          f"last_loss={total_loss.item():.6f}")
 
 
@@ -1472,6 +1555,7 @@ def get_trajectory_tracker() -> RouterTrajectoryTracker:
             _global_trajectory_tracker.critic_hidden_dims = getattr(args, 'rl_critic_hidden_dims', [256])
             _global_trajectory_tracker.critic_lr = getattr(args, 'rl_critic_lr', 1e-3)
             _global_trajectory_tracker.normalize_rewards = getattr(args, 'rl_normalize_rewards', False)
+            _global_trajectory_tracker.ppo_legacy_mode = getattr(args, 'rl_ppo_legacy_mode', False)
             _tracker_configured = True
             try:
                 import torch.distributed as dist
@@ -1480,7 +1564,8 @@ def get_trajectory_tracker() -> RouterTrajectoryTracker:
                           f"reward={_global_trajectory_tracker.reward_type}, "
                           f"topn={_global_trajectory_tracker.reward_topn}, "
                           f"per_token={_global_trajectory_tracker.per_token_rewards}, "
-                          f"normalize={_global_trajectory_tracker.normalize_rewards}", flush=True)
+                          f"normalize={_global_trajectory_tracker.normalize_rewards}, "
+                          f"legacy={_global_trajectory_tracker.ppo_legacy_mode}", flush=True)
             except Exception:
                 pass
         except (ImportError, AssertionError) as e:
@@ -1499,3 +1584,11 @@ def reset_trajectory_tracker():
     global _global_trajectory_tracker
     if _global_trajectory_tracker is not None:
         _global_trajectory_tracker.reset()
+
+
+def run_post_step_ppo_if_pending():
+    """Run deferred extra PPO epochs after optimizer.step(), if scheduled."""
+    global _global_trajectory_tracker
+    if _global_trajectory_tracker is None:
+        return False
+    return _global_trajectory_tracker.run_scheduled_extra_ppo_epochs()

@@ -110,6 +110,14 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
         if sweep_params.get('rl_ppo_reeval', False) or all_params.get('rl_ppo_reeval', False):
             epochs = sweep_params.get('rl_ppo_epochs', all_params.get('rl_ppo_epochs', 1))
             parts.append(f'ppo_k{epochs}' if int(epochs) > 1 else 'ppo')
+            if 'rl_replay_buffer_size' in sweep_params and int(sweep_params['rl_replay_buffer_size']) > 0:
+                parts.append(f'buf{sweep_params["rl_replay_buffer_size"]}')
+            if 'rl_ppo_extra_lr' in sweep_params:
+                parts.append(f'exlr{sweep_params["rl_ppo_extra_lr"]}')
+
+        # Legacy/new PPO implementation switch (for A/B tests)
+        if sweep_params.get('rl_ppo_legacy_mode', False):
+            parts.append('legacy')
         
         # LM reward coefficient
         if 'rl_lm_reward_coeff' in sweep_params:
@@ -225,6 +233,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('moe_router_critical_path_bias', '--moe-router-critical-path-bias'),
         ('eval_kl_tracking', '--eval-kl-tracking'),
         ('log_expert_heatmap', '--log-expert-heatmap'),
+        ('rl_ppo_legacy_mode', '--rl-ppo-legacy-mode'),
     ]
     
     for config_key, flag in bool_flags:
@@ -248,6 +257,8 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('moe_router_bias_update_rate', '--moe-router-bias-update-rate'),
         ('moe_router_load_balancing_type', '--moe-router-load-balancing-type'),
         ('rl_ppo_epochs', '--rl-ppo-epochs'),
+        ('rl_replay_buffer_size', '--rl-replay-buffer-size'),
+        ('rl_ppo_extra_lr', '--rl-ppo-extra-lr'),
         ('rl_lm_reward_coeff', '--rl-lm-reward-coeff'),
         ('kl_loss_coeff', '--kl-loss-coeff'),
         ('moe_router_topology_lambda', '--moe-router-topology-lambda'),

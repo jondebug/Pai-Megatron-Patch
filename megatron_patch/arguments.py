@@ -574,6 +574,11 @@ def get_patch_args(parser):
     group.add_argument('--rl-ppo-extra-lr', type=float, default=1e-4,
                       help='Learning rate for the separate optimizer used in extra PPO epochs. '
                            'Automatically scaled by 1/(K-1) where K is rl_ppo_epochs.')
+    group.add_argument('--rl-ppo-legacy-mode', action='store_true', default=False,
+                      help='Enable legacy PPO behavior for A/B testing. '
+                           'Legacy mode keeps inline extra-epoch updates in loss construction, '
+                           'uses SGD for extra epochs, and uses REINFORCE-style main PPO update '
+                           '(ratio fixed to 1). Default: False (new implementation).')
     group.add_argument('--kl-loss-coeff', type=float, default=0.0,
                       help='KL divergence loss coefficient. 0 = disabled. '
                            'Penalizes deviation of LM output distribution from pretrained reference. '

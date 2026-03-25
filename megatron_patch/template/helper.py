@@ -338,6 +338,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.ppo_epochs = getattr(args, 'rl_ppo_epochs', 1)
     trajectory_tracker.replay_buffer_size = getattr(args, 'rl_replay_buffer_size', 0)
     trajectory_tracker.ppo_extra_lr = getattr(args, 'rl_ppo_extra_lr', 1e-4)
+    trajectory_tracker.ppo_legacy_mode = getattr(args, 'rl_ppo_legacy_mode', False)
     print(f"[RL CONFIG] reward_type={trajectory_tracker.reward_type}, "
           f"baseline_type={trajectory_tracker.baseline_type}, "
           f"per_token_rewards={trajectory_tracker.per_token_rewards}, "
@@ -345,7 +346,8 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
           f"normalize_rewards={trajectory_tracker.normalize_rewards}, "
           f"critic_hidden_dims={trajectory_tracker.critic_hidden_dims}, "
           f"clip_ratio={trajectory_tracker.ppo_clip_ratio}, "
-          f"use_ema_loads={trajectory_tracker.use_ema_loads}", flush=True)
+          f"use_ema_loads={trajectory_tracker.use_ema_loads}, "
+          f"legacy_mode={trajectory_tracker.ppo_legacy_mode}", flush=True)
     
     rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
     rl_algorithm = getattr(args, 'rl_algorithm', 'reinforce').lower()
@@ -389,11 +391,15 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         loss_dict["rl_advantage_std"] = torch.tensor(components.get('advantage_std', 0.0))
         loss_dict["rl_advantage_min"] = torch.tensor(components.get('advantage_min', 0.0))
         loss_dict["rl_advantage_max"] = torch.tensor(components.get('advantage_max', 0.0))
+        loss_dict["rl_approx_kl"] = torch.tensor(components.get('approx_kl', 0.0))
+        loss_dict["rl_clip_fraction"] = torch.tensor(components.get('clip_fraction', 0.0))
         
         # Critical metrics for policy and value loss
         critical_metrics['critical/policy_loss'] = policy_loss.item() if hasattr(policy_loss, 'item') else float(policy_loss)
         critical_metrics['critical/value_loss'] = value_loss.item() if hasattr(value_loss, 'item') else float(value_loss)
         critical_metrics['critical/advantage_std'] = float(components.get('advantage_std', 0.0))
+        critical_metrics['critical/approx_kl'] = float(components.get('approx_kl', 0.0))
+        critical_metrics['critical/clip_fraction'] = float(components.get('clip_fraction', 0.0))
         
         # Only log avg_topn_load when using topn_load reward
         avg_topn = components.get('avg_topn_load', 0.0)
@@ -515,13 +521,23 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     # Reset trajectory for next iteration (moves current layer_decisions → old_layer_decisions)
     reset_trajectory_tracker()
 
-    # Run extra PPO epochs on the just-stored trajectory (now in old_layer_decisions)
+    # Run extra PPO epochs.
+    # New path: defer to a strict post-optimizer-step hook in training.py.
+    # Legacy path: keep inline execution inside loss construction.
     if trajectory_tracker.ppo_epochs > 1 and trajectory_tracker.ppo_reeval:
-        trajectory_tracker.run_extra_ppo_epochs(
-            rl_loss_coeff=rl_loss_coeff,
-            discount_factor=rl_discount_factor,
-            clip_ratio=getattr(trajectory_tracker, 'ppo_clip_ratio', 0.2),
-        )
+        clip_ratio = getattr(trajectory_tracker, 'ppo_clip_ratio', 0.2)
+        if getattr(trajectory_tracker, 'ppo_legacy_mode', False):
+            trajectory_tracker.run_extra_ppo_epochs(
+                rl_loss_coeff=rl_loss_coeff,
+                discount_factor=rl_discount_factor,
+                clip_ratio=clip_ratio,
+            )
+        else:
+            trajectory_tracker.schedule_extra_ppo_epochs(
+                rl_loss_coeff=rl_loss_coeff,
+                discount_factor=rl_discount_factor,
+                clip_ratio=clip_ratio,
+            )
 
     # #region agent log
     import json, time as _t
@@ -596,6 +612,20 @@ def _run_reference_forward(model, tokens, position_ids, attention_mask, packed_s
     except Exception:
         tracker = None
 
+    # Save and clear the aux losses tracker so the reference forward's
+    # routing statistics (max_tokens_per_expert, tokens_routed_to_expert_0,
+    # etc.) don't contaminate training metrics via the += accumulator.
+    from megatron.core.transformer.moe.moe_utils import (
+        get_moe_layer_wise_logging_tracker,
+        clear_aux_losses_tracker,
+    )
+    aux_tracker = get_moe_layer_wise_logging_tracker()
+    saved_aux = {name: {k: v.clone() if isinstance(v, torch.Tensor) else v
+                        for k, v in entry.items()}
+                 for name, entry in aux_tracker.items()}
+
+    clear_aux_losses_tracker()
+
     # Reference forward (no grad, labels=None to get logits)
     try:
         with torch.no_grad():
@@ -614,6 +644,10 @@ def _run_reference_forward(model, tokens, position_ids, attention_mask, packed_s
         # Re-enable trajectory tracking
         if tracker is not None:
             tracker.paused = False
+        # Restore the aux losses tracker so training metrics are uncontaminated
+        clear_aux_losses_tracker()
+        for name, entry in saved_aux.items():
+            aux_tracker[name] = entry
 
 
 def forward_step(data_iterator, model):
@@ -652,19 +686,18 @@ def forward_step(data_iterator, model):
     if kl_loss_coeff > 0 and torch.is_grad_enabled():
         _run_reference_forward(model, tokens, position_ids, attention_mask, packed_seq_params)
 
-    # Periodic HellaSwag benchmark via subprocess after checkpoint saves
+    # Periodic HellaSwag benchmark via subprocess after checkpoint saves.
+    # Uses latest_checkpointed_iteration.txt so triggering is aligned with real saves.
     save_interval = getattr(args, 'save_interval', 0)
     hellaswag_interval = getattr(args, 'hellaswag_eval_interval', 0)
+    hellaswag_limit = max(1, int(getattr(args, 'hellaswag_eval_limit', 100)))
     if hellaswag_interval > 0 and save_interval > 0 and torch.is_grad_enabled():
-        if not hasattr(forward_step, '_bench_microbatch_count'):
-            forward_step._bench_microbatch_count = 0
-            forward_step._bench_last_fired = -1
+        if not hasattr(forward_step, '_bench_process'):
             forward_step._bench_process = None
-        forward_step._bench_microbatch_count += 1
-        num_microbatches = getattr(args, 'global_batch_size', 8) // max(1, getattr(args, 'micro_batch_size', 1))
-        current_iter = forward_step._bench_microbatch_count // max(1, num_microbatches)
+            forward_step._bench_log_fh = None
+            forward_step._bench_last_checkpoint_iter = -1
 
-        # Check if a previous async benchmark finished and collect results
+        # Check if a previous async benchmark finished and collect status.
         if forward_step._bench_process is not None and forward_step._bench_process.poll() is not None:
             try:
                 from megatron.core import parallel_state as mpu
@@ -673,30 +706,57 @@ def forward_step(data_iterator, model):
                     print(f"[BENCHMARK] Background benchmark finished (exit={rc})", flush=True)
             except Exception:
                 pass
+            if getattr(forward_step, '_bench_log_fh', None) is not None:
+                try:
+                    forward_step._bench_log_fh.close()
+                except Exception:
+                    pass
+                forward_step._bench_log_fh = None
             forward_step._bench_process = None
 
-        # Launch benchmark after a checkpoint save (first microbatch of the iteration after save)
-        if (current_iter > 0 and current_iter % save_interval == 1
-                and current_iter != forward_step._bench_last_fired
-                and forward_step._bench_process is None):
-            forward_step._bench_last_fired = current_iter
-            try:
-                from megatron.core import parallel_state as mpu
-                if mpu.get_data_parallel_rank() == 0:
-                    save_dir = getattr(args, 'save', None)
-                    if save_dir and os.path.isdir(save_dir):
-                        import subprocess
-                        script_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                                                  'examples', 'qwen3')
-                        bench_script = os.path.join(script_dir, 'run_inline_benchmark.sh')
-                        if os.path.exists(bench_script):
-                            bench_iter = current_iter - 1
-                            print(f"[BENCHMARK] Launching HellaSwag at iter {bench_iter} (async)", flush=True)
-                            forward_step._bench_process = subprocess.Popen(
-                                ['bash', bench_script, save_dir, str(bench_iter)],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except Exception as e:
-                print(f"[BENCHMARK] WARNING: failed to launch: {e}", flush=True)
+        try:
+            from megatron.core import parallel_state as mpu
+            if mpu.get_data_parallel_rank() == 0:
+                save_dir = getattr(args, 'save', None)
+                if save_dir and os.path.isdir(save_dir):
+                    latest_iter_file = os.path.join(save_dir, 'latest_checkpointed_iteration.txt')
+                    if os.path.isfile(latest_iter_file):
+                        with open(latest_iter_file, 'r') as f:
+                            latest_iter = int(f.read().strip() or '0')
+
+                        # Run benchmark once for each new saved checkpoint.
+                        should_launch = (
+                            latest_iter > 0
+                            and latest_iter != forward_step._bench_last_checkpoint_iter
+                            and latest_iter % save_interval == 0
+                            and forward_step._bench_process is None
+                        )
+                        if should_launch:
+                            import subprocess
+                            script_dir = os.path.join(
+                                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                                'examples',
+                                'qwen3',
+                            )
+                            bench_script = os.path.join(script_dir, 'run_inline_benchmark.sh')
+                            if os.path.exists(bench_script):
+                                bench_iter = latest_iter
+                                bench_log = os.path.join(save_dir, f'inline_benchmark_iter{bench_iter}.log')
+                                print(
+                                    f"[BENCHMARK] Launching HellaSwag at iter {bench_iter} "
+                                    f"(limit={hellaswag_limit}, async, log={bench_log})",
+                                    flush=True,
+                                )
+                                bench_log_fh = open(bench_log, 'a')
+                                forward_step._bench_log_fh = bench_log_fh
+                                forward_step._bench_process = subprocess.Popen(
+                                    ['bash', bench_script, save_dir, str(bench_iter), str(hellaswag_limit)],
+                                    stdout=bench_log_fh,
+                                    stderr=subprocess.STDOUT,
+                                )
+                                forward_step._bench_last_checkpoint_iter = bench_iter
+        except Exception as e:
+            print(f"[BENCHMARK] WARNING: failed to launch: {e}", flush=True)
 
     # Choose loss function based on CLI arg parsed by Megatron
     use_rl_loss = getattr(args, 'use_rl_loss', False) and torch.is_grad_enabled()
