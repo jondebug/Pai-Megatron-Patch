@@ -188,6 +188,7 @@ class RouterTrajectoryTracker:
         self.paused = False  # When True, add_layer_decision() calls are skipped (used during KL reference forward)
         self.per_token_rewards = False  # Default False; topn_load, critical_path, entropy are batch-level
         self.ppo_entropy_coeff = 0.01
+        self.gae_lambda = 1.0  # 1.0 = MC returns (current behavior), 0.95 = standard GAE
         self.reward_type = "topn_load"  # "expert0", "entropy", "topn_load", or "critical_path"
         self.reward_topn = 12  # Number of top experts for topn_load reward
         self.baseline_type = "mean"  # "mean" or "critic"
@@ -1011,16 +1012,39 @@ class RouterTrajectoryTracker:
             baseline_values = {ln: all_returns.mean() for ln in sorted_layers}
             self._last_critic_loss = 0.0
         
-        # Calculate advantages - ensure scalars for scalar loss mode
+        # Calculate advantages using GAE(lambda) or simple return-baseline
         advantages = {}
-        for layer_num in sorted_layers:
-            ret = returns[layer_num]
-            baseline = baseline_values[layer_num]
-            if ret.numel() > 1:
-                ret = ret.mean()
-            if baseline.numel() > 1:
-                baseline = baseline.mean()
-            advantages[layer_num] = (ret - baseline).detach()
+        gae_lambda = getattr(self, 'gae_lambda', 1.0)
+        if gae_lambda < 1.0 and len(sorted_layers) > 1:
+            # GAE: compute TD residuals then exponentially-weighted sum
+            td_residuals = {}
+            for i, layer_num in enumerate(sorted_layers):
+                r = layer_rewards[layer_num]
+                if r.dim() > 0:
+                    r = r.mean()
+                v = baseline_values[layer_num]
+                if v.numel() > 1:
+                    v = v.mean()
+                if i < len(sorted_layers) - 1:
+                    next_v = baseline_values[sorted_layers[i + 1]]
+                    if next_v.numel() > 1:
+                        next_v = next_v.mean()
+                    td_residuals[layer_num] = (r + discount_factor * next_v - v).detach()
+                else:
+                    td_residuals[layer_num] = (r - v).detach()
+            gae = torch.tensor(0.0, device=device)
+            for layer_num in reversed(sorted_layers):
+                gae = td_residuals[layer_num] + discount_factor * gae_lambda * gae
+                advantages[layer_num] = gae.clone().detach()
+        else:
+            for layer_num in sorted_layers:
+                ret = returns[layer_num]
+                baseline = baseline_values[layer_num]
+                if ret.numel() > 1:
+                    ret = ret.mean()
+                if baseline.numel() > 1:
+                    baseline = baseline.mean()
+                advantages[layer_num] = (ret - baseline).detach()
         
         # Normalize advantages across all layers to zero mean, unit variance
         all_advs = torch.stack(list(advantages.values()))
@@ -1202,10 +1226,26 @@ class RouterTrajectoryTracker:
             layer_baselines = {ln: all_returns.mean() for ln in sorted_layers}
             self._last_critic_loss = 0.0
         
-        # Compute per-token advantages
+        # Compute per-token advantages using GAE(lambda) or simple return-baseline
         layer_advantages = {}
-        for layer_num in sorted_layers:
-            layer_advantages[layer_num] = (layer_returns[layer_num] - layer_baselines[layer_num]).detach()
+        gae_lambda = getattr(self, 'gae_lambda', 1.0)
+        if gae_lambda < 1.0 and len(sorted_layers) > 1:
+            td_residuals = {}
+            for i, layer_num in enumerate(sorted_layers):
+                r = layer_rewards[layer_num]
+                v = layer_baselines[layer_num]
+                if i < len(sorted_layers) - 1:
+                    next_v = layer_baselines[sorted_layers[i + 1]]
+                    td_residuals[layer_num] = (r + discount_factor * next_v - v).detach()
+                else:
+                    td_residuals[layer_num] = (r - v).detach()
+            gae = torch.zeros_like(first_reward)
+            for layer_num in reversed(sorted_layers):
+                gae = td_residuals[layer_num] + discount_factor * gae_lambda * gae
+                layer_advantages[layer_num] = gae.clone().detach()
+        else:
+            for layer_num in sorted_layers:
+                layer_advantages[layer_num] = (layer_returns[layer_num] - layer_baselines[layer_num]).detach()
         
         # Normalize advantages across all tokens and layers to zero mean, unit variance
         all_advs = torch.cat([layer_advantages[ln].flatten() for ln in sorted_layers])

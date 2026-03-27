@@ -579,6 +579,21 @@ def get_patch_args(parser):
                            'Legacy mode keeps inline extra-epoch updates in loss construction, '
                            'uses SGD for extra epochs, and uses REINFORCE-style main PPO update '
                            '(ratio fixed to 1). Default: False (new implementation).')
+    group.add_argument('--rl-stochastic-routing', action='store_true', default=False,
+                      help='Enable Gumbel-noise exploration in router top-k selection during training. '
+                           'Adds Gumbel noise to logits before top-k, giving RL counterfactual '
+                           'signal from non-greedy routing. Eval stays deterministic.')
+    group.add_argument('--rl-stochastic-temperature', type=float, default=1.0,
+                      help='Temperature for Gumbel noise when --rl-stochastic-routing is enabled. '
+                           'Higher = more exploration. 0.3-1.0 recommended.')
+    group.add_argument('--rl-cosine-schedule', action='store_true', default=False,
+                      help='Apply cosine annealing to rl_loss_coeff: warmup over first 10%% of training, '
+                           'then cosine decay to 10%% of peak. Lets RL push routing early and backs off late.')
+    group.add_argument('--rl-gae-lambda', type=float, default=1.0,
+                      help='Lambda for Generalized Advantage Estimation. '
+                           '1.0 = Monte Carlo returns (current behavior). '
+                           '0.95 = standard GAE bias-variance tradeoff. '
+                           '0.0 = pure TD(0).')
     group.add_argument('--kl-loss-coeff', type=float, default=0.0,
                       help='KL divergence loss coefficient. 0 = disabled. '
                            'Penalizes deviation of LM output distribution from pretrained reference. '

@@ -118,7 +118,22 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
         # Legacy/new PPO implementation switch (for A/B tests)
         if sweep_params.get('rl_ppo_legacy_mode', False):
             parts.append('legacy')
-        
+
+        # Gumbel stochastic routing
+        if all_params.get('rl_stochastic_routing', False):
+            temp = sweep_params.get('rl_stochastic_temperature', all_params.get('rl_stochastic_temperature', 1.0))
+            parts.append(f'gumbel_t{temp}')
+
+        # Cosine RL coefficient schedule
+        if all_params.get('rl_cosine_schedule', False):
+            parts.append('cos')
+
+        # GAE lambda (only when not default 1.0)
+        if 'rl_gae_lambda' in sweep_params:
+            v = float(sweep_params['rl_gae_lambda'])
+            if v < 1.0:
+                parts.append(f'gae{v}')
+
         # LM reward coefficient
         if 'rl_lm_reward_coeff' in sweep_params:
             v = sweep_params['rl_lm_reward_coeff']
@@ -234,6 +249,8 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('eval_kl_tracking', '--eval-kl-tracking'),
         ('log_expert_heatmap', '--log-expert-heatmap'),
         ('rl_ppo_legacy_mode', '--rl-ppo-legacy-mode'),
+        ('rl_stochastic_routing', '--rl-stochastic-routing'),
+        ('rl_cosine_schedule', '--rl-cosine-schedule'),
     ]
     
     for config_key, flag in bool_flags:
@@ -270,6 +287,8 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('eval_iters', '--eval-iters'),
         ('hellaswag_eval_interval', '--hellaswag-eval-interval'),
         ('hellaswag_eval_limit', '--hellaswag-eval-limit'),
+        ('rl_stochastic_temperature', '--rl-stochastic-temperature'),
+        ('rl_gae_lambda', '--rl-gae-lambda'),
     ]
     
     for config_key, flag in value_args:

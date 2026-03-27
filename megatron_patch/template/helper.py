@@ -339,6 +339,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.replay_buffer_size = getattr(args, 'rl_replay_buffer_size', 0)
     trajectory_tracker.ppo_extra_lr = getattr(args, 'rl_ppo_extra_lr', 1e-4)
     trajectory_tracker.ppo_legacy_mode = getattr(args, 'rl_ppo_legacy_mode', False)
+    trajectory_tracker.gae_lambda = getattr(args, 'rl_gae_lambda', 1.0)
     print(f"[RL CONFIG] reward_type={trajectory_tracker.reward_type}, "
           f"baseline_type={trajectory_tracker.baseline_type}, "
           f"per_token_rewards={trajectory_tracker.per_token_rewards}, "
@@ -347,9 +348,22 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
           f"critic_hidden_dims={trajectory_tracker.critic_hidden_dims}, "
           f"clip_ratio={trajectory_tracker.ppo_clip_ratio}, "
           f"use_ema_loads={trajectory_tracker.use_ema_loads}, "
-          f"legacy_mode={trajectory_tracker.ppo_legacy_mode}", flush=True)
+          f"legacy_mode={trajectory_tracker.ppo_legacy_mode}, "
+          f"gae_lambda={trajectory_tracker.gae_lambda}", flush=True)
     
     rl_loss_coeff = getattr(args, 'rl_loss_coeff', 0.1)
+    if getattr(args, 'rl_cosine_schedule', False):
+        import math
+        iteration = getattr(args, 'iteration', 0) or 0
+        total_iters = max(1, getattr(args, 'train_iters', 5000))
+        warmup_frac = 0.1
+        min_coeff = rl_loss_coeff * 0.1
+        if iteration < total_iters * warmup_frac:
+            rl_loss_coeff = rl_loss_coeff * (iteration / max(1, total_iters * warmup_frac))
+        else:
+            progress = (iteration - total_iters * warmup_frac) / max(1, total_iters * (1 - warmup_frac))
+            rl_loss_coeff = min_coeff + 0.5 * (rl_loss_coeff - min_coeff) * (1 + math.cos(math.pi * progress))
+        critical_metrics['critical/rl_loss_coeff_scheduled'] = rl_loss_coeff
     rl_algorithm = getattr(args, 'rl_algorithm', 'reinforce').lower()
     rl_discount_factor = getattr(args, 'rl_discount_factor', 0.9)
     

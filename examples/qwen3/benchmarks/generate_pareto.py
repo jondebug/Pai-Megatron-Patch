@@ -21,7 +21,7 @@ DEFAULT_OUTPUT = SCRIPT_DIR.parent.parent.parent / "pareto_accuracy_vs_cp.html"
 BASELINE_CP = 4780
 
 
-def load_data(csv_path, min_accuracy=0):
+def load_data(csv_path, min_accuracy=0, limit_filter=None):
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(f))
 
@@ -31,6 +31,10 @@ def load_data(csv_path, min_accuracy=0):
         cp = float(r.get("eval_crit_path") or "0")
         if avg <= 0 or cp <= 0 or avg < min_accuracy:
             continue
+        if limit_filter is not None:
+            row_limit = r.get("limit", "")
+            if row_limit != str(limit_filter):
+                continue
 
         name = r.get("run_name", "")
         cat = r.get("category", "other")
@@ -53,8 +57,13 @@ def load_data(csv_path, min_accuracy=0):
             ppo_k = "20"
         elif "k5" in name:
             ppo_k = "5"
+        elif "k3" in name:
+            ppo_k = "3"
         has_lm = "lm1.0" in name
         has_buf = "buf" in name
+        has_gumbel = "gumbel" in name
+        has_cosine = "_cos_" in name or "_cos_" in name
+        has_gae = "gae" in name
 
         # Auto-classify degraded runs
         display_cat = cat
@@ -81,6 +90,12 @@ def load_data(csv_path, min_accuracy=0):
                 label = "RL+aux+LM rlc={}".format(rlc)
             if ppo_k:
                 label += " k={}".format(ppo_k)
+            if has_gumbel:
+                label += " gumbel"
+            if has_cosine:
+                label += " cos"
+            if has_gae:
+                label += " gae"
             if klc:
                 label += " KL={}".format(klc)
 
@@ -105,6 +120,9 @@ def load_data(csv_path, min_accuracy=0):
             "ppo_k": ppo_k,
             "lm_reward": has_lm,
             "klc": klc,
+            "gumbel": has_gumbel,
+            "cosine": has_cosine,
+            "gae": has_gae,
         })
 
     return points
@@ -292,6 +310,9 @@ new Chart(document.getElementById('pareto').getContext('2d'), {{
               ...(p.ppo_k ? ['PPO epochs:     ' + p.ppo_k] : []),
               ...(p.lm_reward ? ['LM reward:      yes'] : []),
               ...(p.klc ? ['KL coeff:       ' + p.klc] : []),
+              ...(p.gumbel ? ['Gumbel routing: yes'] : []),
+              ...(p.cosine ? ['Cosine sched:   yes'] : []),
+              ...(p.gae ? ['GAE:            yes'] : []),
             ];
           }}
         }}
@@ -352,9 +373,11 @@ def main():
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--min-accuracy", type=float, default=0,
                         help="Filter out runs below this accuracy %%")
+    parser.add_argument("--limit-filter", type=str, default=None,
+                        help="Only include runs with this limit value (e.g. '1000')")
     args = parser.parse_args()
 
-    points = load_data(args.csv, args.min_accuracy)
+    points = load_data(args.csv, args.min_accuracy, limit_filter=args.limit_filter)
     if not points:
         print("No data points found in {}".format(args.csv))
         return

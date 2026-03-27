@@ -420,6 +420,8 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
                 module.config.moe_router_use_trajectory_tracking = True
                 module._use_trajectory_tracking = True
                 module._trajectory_tracker = tracker
+                module._stochastic_routing = getattr(args, 'rl_stochastic_routing', False)
+                module._stochastic_temperature = getattr(args, 'rl_stochastic_temperature', 1.0)
                 # Store router module reference for multi-epoch PPO re-evaluation
                 if hasattr(module, 'layer_number') and hasattr(module, 'gating'):
                     tracker._router_modules[module.layer_number] = module
