@@ -94,6 +94,10 @@ def build_run_name(sweep_params: dict, run_index: int, fixed_params: dict = None
             dims_str = 'x'.join(str(d) for d in dims) if isinstance(dims, list) else str(dims)
             parts.append(f'c{dims_str}')
         
+        # Critic learning rate (only if it varies)
+        if 'rl_critic_lr' in sweep_params:
+            parts.append(f'clr{sweep_params["rl_critic_lr"]}')
+
         # PPO clip ratio (only if it varies)
         if 'rl_ppo_clip_ratio' in sweep_params:
             parts.append(f'clip{sweep_params["rl_ppo_clip_ratio"]}')
@@ -289,6 +293,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('hellaswag_eval_limit', '--hellaswag-eval-limit'),
         ('rl_stochastic_temperature', '--rl-stochastic-temperature'),
         ('rl_gae_lambda', '--rl-gae-lambda'),
+        ('rl_critic_lr', '--rl-critic-lr'),
     ]
     
     for config_key, flag in value_args:

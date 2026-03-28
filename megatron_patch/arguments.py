@@ -564,6 +564,8 @@ def get_patch_args(parser):
     group.add_argument('--rl-use-ema-loads', action='store_true', default=False,
                       help='Use exponential moving average of expert loads for reward computation. '
                            'More stable signal across batches, less sensitive to per-batch noise.')
+    group.add_argument('--rl-critic-lr', type=float, default=1e-3,
+                      help='Learning rate for the critic (value function) optimizer (default: 1e-3).')
     group.add_argument('--rl-critic-layer-aware', action='store_true', default=False,
                       help='Give the critic network the layer index as an input feature. '
                            'Enables layer-conditional value predictions.')
