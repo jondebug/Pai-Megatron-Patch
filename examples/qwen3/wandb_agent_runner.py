@@ -255,6 +255,8 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('rl_ppo_legacy_mode', '--rl-ppo-legacy-mode'),
         ('rl_stochastic_routing', '--rl-stochastic-routing'),
         ('rl_cosine_schedule', '--rl-cosine-schedule'),
+        ('ckpt_assume_constant_structure', '--ckpt-assume-constant-structure'),
+        ('ckpt_fully_parallel_save', '--ckpt-fully-parallel-save'),
     ]
     
     for config_key, flag in bool_flags:
@@ -294,6 +296,7 @@ def build_command(fixed_params: dict, sweep_params: dict, run_name: str) -> list
         ('rl_stochastic_temperature', '--rl-stochastic-temperature'),
         ('rl_gae_lambda', '--rl-gae-lambda'),
         ('rl_critic_lr', '--rl-critic-lr'),
+        ('empty_unused_memory_level', '--empty-unused-memory-level'),
     ]
     
     for config_key, flag in value_args:

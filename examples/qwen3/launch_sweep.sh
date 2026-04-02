@@ -42,6 +42,7 @@ show_help() {
 SWEEP_ID=""
 PARALLEL=3              # Default to 3 chains
 AGENTS_PER_JOB=2        # Default to 2 agents per job
+USE_8GPU=false           # Use 8-GPU agent script (for 235B models)
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -57,6 +58,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --single)
             PARALLEL=1
+            shift
+            ;;
+        --8gpu)
+            USE_8GPU=true
             shift
             ;;
         --help|-h)
@@ -105,6 +110,14 @@ if [ -z "$SWEEP_DIR" ]; then
 fi
 echo "Sweep dir:          $SWEEP_DIR"
 
+# Select agent script based on GPU config
+if [ "$USE_8GPU" = true ]; then
+    AGENT_SCRIPT="$SCRIPT_DIR/submit_sweep_agent_8gpu.sh"
+    echo "Using 8-GPU agent script (for large models)"
+else
+    AGENT_SCRIPT="$SCRIPT_DIR/submit_sweep_agent.sh"
+fi
+
 # Submit jobs
 SUBMITTED_JOBS=()
 for i in $(seq 1 $PARALLEL); do
@@ -116,7 +129,7 @@ for i in $(seq 1 $PARALLEL); do
         --job-name="$JOB_NAME" \
         --output="$LOG_DIR/${JOB_NAME}_%j.out" \
         --error="$LOG_DIR/${JOB_NAME}_%j.err" \
-        "$SCRIPT_DIR/submit_sweep_agent.sh" "$SWEEP_ID" 0 "$AGENTS_PER_JOB" "$SWEEP_DIR" 2>&1)
+        "$AGENT_SCRIPT" "$SWEEP_ID" 0 "$AGENTS_PER_JOB" "$SWEEP_DIR" 2>&1)
     
     JOB_ID=$(echo "$JOB_OUTPUT" | awk '{print $NF}')
     SUBMITTED_JOBS+=("$JOB_ID")

@@ -681,7 +681,11 @@ def main():
         save_hfmodel(args, hf_model)
     else:
         config = AutoConfig.from_pretrained(args.load, trust_remote_code=True)
-        hf_model = AutoModelForCausalLM.from_pretrained(args.load, trust_remote_code=True, torch_dtype=config.torch_dtype)
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            args.load, trust_remote_code=True,
+            torch_dtype=config.torch_dtype,
+            low_cpu_mem_usage=True,
+        )
         mg_model = model_provider()
         convert_checkpoint_from_transformers_to_megatron(hf_model, mg_model, args)
         del hf_model

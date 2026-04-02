@@ -40,6 +40,7 @@ RUN_NAME=""
 MODEL_SIZE="A3B"
 BATCH_SIZE=8
 TASKS="hellaswag,arc_challenge,winogrande"
+LIMIT=""
 
 # Parse arguments (passed after -- by sbatch, or directly)
 while [[ $# -gt 0 ]]; do
@@ -51,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --model-size)       MODEL_SIZE="$2"; shift 2 ;;
         --batch-size)       BATCH_SIZE="$2"; shift 2 ;;
         --tasks)            TASKS="$2"; shift 2 ;;
+        --limit)            LIMIT="$2"; shift 2 ;;
         *)                  shift ;;  # Skip unknown args (SLURM may pass extras)
     esac
 done
@@ -78,6 +80,7 @@ echo "WandB Run ID:    ${WANDB_RUN_ID:-none}"
 echo "WandB Project:   ${WANDB_PROJECT}"
 echo "Run Name:        ${RUN_NAME:-unknown}"
 echo "Tasks:           ${TASKS}"
+echo "Limit:           ${LIMIT:-full}"
 echo "Start Time:      $(date)"
 echo "============================================================"
 
@@ -130,6 +133,10 @@ srun --container-image="${CONTAINER_IMAGE}" \
 
          # Use single-process python (not accelerate launch) to avoid 4 ranks
          # all hitting HuggingFace Hub simultaneously and getting rate-limited (429)
+         LIMIT_FLAG=""
+         if [ -n "${LIMIT}" ]; then
+             LIMIT_FLAG="--limit ${LIMIT}"
+         fi
          python3 -m lm_eval \
              --model hf \
              --model_args 'pretrained=${HF_OUTPUT_DIR},trust_remote_code=True,dtype=bfloat16' \
@@ -137,7 +144,8 @@ srun --container-image="${CONTAINER_IMAGE}" \
              --tasks ${TASKS} \
              --batch_size '${BATCH_SIZE}' \
              --output_path '${RESULTS_DIR}' \
-             --log_samples
+             --log_samples \
+             \${LIMIT_FLAG}
 
          echo 'lm-eval complete. Results in: ${RESULTS_DIR}'
 
