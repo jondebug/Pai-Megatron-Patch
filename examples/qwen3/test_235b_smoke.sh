@@ -106,7 +106,7 @@ srun --container-image="${CONTAINER_IMAGE}" \
              --moe-aux-loss-coeff 0.01 \
              --train-iters 20 \
              --eval-interval 10 \
-             --eval-iters 2 \
+             --eval-iters 50 \
              --exit-duration-in-mins 230 \
              --ckpt-assume-constant-structure \
              --ckpt-fully-parallel-save \

@@ -186,7 +186,8 @@ def submit_batch_benchmark(entries, wandb_project, limit=None):
         print(f"  ERROR: {batch_script} not found")
         return None
 
-    manifest_path = script_dir / f"_manifest_{os.getpid()}.json"
+    import time
+    manifest_path = script_dir / f"_manifest_{os.getpid()}_{int(time.time()*1000)}.json"
     with open(manifest_path, "w") as f:
         json.dump(entries, f, indent=2)
 
@@ -340,6 +341,7 @@ def main():
         print(f"SUBMITTING BENCHMARK JOBS ({len(to_benchmark)} runs){limit_str}")
         print(f"{'='*100}")
 
+        bench_step = args.step
         pending = []
         for p in to_benchmark:
             ckpt_dir = find_checkpoint_dir(p["name"], args.output_base)
@@ -347,15 +349,31 @@ def main():
                 print(f"  SKIP {p['name']}: checkpoint not found")
                 continue
 
-            already_done = os.path.join(ckpt_dir, "benchmark_results", "accuracy_summary.json")
+            actual_iter = p.get("eval_step")
+            if bench_step == "final" or actual_iter is None:
+                results_subdir = "benchmark_results"
+                bench_iter = None
+            else:
+                results_subdir = f"benchmark_iter{actual_iter}"
+                bench_iter = actual_iter
+
+            already_done = os.path.join(ckpt_dir, results_subdir, "accuracy_summary.json")
             if os.path.exists(already_done):
                 print(f"  SKIP {p['name']}: already benchmarked")
                 continue
+
+            # Check that the iteration checkpoint actually exists on disk
+            if bench_iter is not None:
+                iter_dir = os.path.join(ckpt_dir, f"iter_{int(bench_iter):07d}")
+                if not os.path.isdir(iter_dir):
+                    print(f"  SKIP {p['name']}: iter {bench_iter} checkpoint not on disk")
+                    continue
 
             pending.append({
                 "checkpoint_dir": ckpt_dir,
                 "run_name": p["name"],
                 "wandb_run_id": p["run_id"],
+                "iteration": bench_iter,
             })
 
         if not pending:

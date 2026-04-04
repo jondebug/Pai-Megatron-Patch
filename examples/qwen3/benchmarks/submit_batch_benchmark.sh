@@ -86,20 +86,38 @@ for idx, entry in enumerate(manifest):
     ckpt_dir = entry['checkpoint_dir']
     run_name = entry.get('run_name', 'unknown')
     wandb_run_id = entry.get('wandb_run_id', '')
+    bench_iter = entry.get('iteration', None)
     
-    hf_output = os.path.join(ckpt_dir, 'hf_converted')
-    results_dir = os.path.join(ckpt_dir, 'benchmark_results')
+    if bench_iter and str(bench_iter) != 'final':
+        hf_output = os.path.join(ckpt_dir, f'hf_converted_iter{bench_iter}')
+        results_dir = os.path.join(ckpt_dir, f'benchmark_iter{bench_iter}')
+    else:
+        hf_output = os.path.join(ckpt_dir, 'hf_converted')
+        results_dir = os.path.join(ckpt_dir, 'benchmark_results')
     os.makedirs(results_dir, exist_ok=True)
     
     summary_file = os.path.join(results_dir, 'accuracy_summary.json')
     if os.path.exists(summary_file):
-        print(f'[{idx+1}/{total}] SKIP {run_name}: already benchmarked')
+        print(f'[{idx+1}/{total}] SKIP {run_name} (iter={bench_iter or \"latest\"}): already benchmarked')
         continue
     
     print(f'')
     print(f'============================================================')
-    print(f'[{idx+1}/{total}] {run_name}')
+    print(f'[{idx+1}/{total}] {run_name} (iter={bench_iter or \"latest\"})')
     print(f'============================================================')
+    
+    # Point converter at the right iteration by temporarily setting latest_checkpointed_iteration.txt
+    latest_iter_file = os.path.join(ckpt_dir, 'latest_checkpointed_iteration.txt')
+    original_latest = None
+    if bench_iter and str(bench_iter) != 'final':
+        iter_dir = os.path.join(ckpt_dir, f'iter_{int(bench_iter):07d}')
+        if not os.path.isdir(iter_dir):
+            print(f'  WARNING: iter dir {iter_dir} not found, skipping')
+            continue
+        if os.path.exists(latest_iter_file):
+            original_latest = open(latest_iter_file).read().strip()
+        with open(latest_iter_file, 'w') as f:
+            f.write(str(bench_iter))
     
     # Step 1: Convert if needed
     safetensors = glob.glob(os.path.join(hf_output, '*.safetensors'))
@@ -114,8 +132,16 @@ for idx, entry in enumerate(manifest):
         os.chdir('${SCRIPT_DIR}')
         if rc != 0:
             print(f'  WARNING: Conversion failed, skipping')
+            if original_latest is not None:
+                with open(latest_iter_file, 'w') as f:
+                    f.write(original_latest)
             continue
         safetensors = glob.glob(os.path.join(hf_output, '*.safetensors'))
+    
+    # Restore original latest_checkpointed_iteration.txt
+    if original_latest is not None:
+        with open(latest_iter_file, 'w') as f:
+            f.write(original_latest)
     
     if not safetensors:
         print(f'  WARNING: No HF checkpoint, skipping')
@@ -131,7 +157,6 @@ for idx, entry in enumerate(manifest):
         '--tasks', tasks,
         '--batch_size', str(batch_size),
         '--output_path', results_dir,
-        '--log_samples',
     ]
     if limit:
         cmd.extend(['--limit', str(limit)])
@@ -183,6 +208,10 @@ print(f'Batch benchmark complete.')
 print(f'============================================================')
 \"
      "
+
+echo ""
+echo "Collecting results into benchmark_results.csv..."
+python3 "${SCRIPT_DIR}/collect_benchmark_results.py" 2>&1 || echo "WARNING: collect_benchmark_results.py failed"
 
 echo ""
 echo "============================================================"

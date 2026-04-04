@@ -28,6 +28,7 @@ DEFAULT_CSV = SCRIPT_DIR / "benchmark_results.csv"
 
 CSV_COLUMNS = [
     "run_name",
+    "bench_iteration",
     "sweep_id",
     "category",
     "rl_enabled",
@@ -178,6 +179,11 @@ def find_benchmark_results(output_dir):
     results.extend(
         glob.glob(str(output_dir / "*/benchmark_results/accuracy_summary.json"))
     )
+    results.extend(
+        glob.glob(
+            str(output_dir / "*/checkpoint/*/benchmark_iter*/accuracy_summary.json")
+        )
+    )
     return results
 
 
@@ -193,11 +199,29 @@ def extract_checkpoint_path(summary_path):
     p = Path(summary_path)
     bench_idx = None
     for i, part in enumerate(p.parts):
-        if part == "benchmark_results":
+        if part == "benchmark_results" or part.startswith("benchmark_iter"):
             bench_idx = i
             break
     if bench_idx is not None:
         return str(Path(*p.parts[: bench_idx]))
+    return ""
+
+
+def extract_bench_iteration(summary_path):
+    """Extract benchmark iteration from path like .../benchmark_iter2000/accuracy_summary.json.
+    For benchmark_results/ (non-iteration-specific), reads latest_checkpointed_iteration.txt."""
+    p = Path(summary_path)
+    for part in p.parts:
+        if part.startswith("benchmark_iter"):
+            return part.replace("benchmark_iter", "")
+    ckpt_dir = extract_checkpoint_path(summary_path)
+    if ckpt_dir:
+        latest_file = os.path.join(ckpt_dir, "latest_checkpointed_iteration.txt")
+        if os.path.exists(latest_file):
+            try:
+                return open(latest_file).read().strip()
+            except Exception:
+                pass
     return ""
 
 
@@ -222,11 +246,23 @@ def load_eval_metrics_from_log(output_dir, run_name):
         if not os.path.exists(log_file):
             continue
 
-        sweep_dir_name = Path(log_dir).parent.name
-        for prefix, sid in SWEEP_ID_MAP.items():
-            if sweep_dir_name.startswith(prefix):
-                metrics["sweep_id"] = sid
-                break
+        sweep_dir_path = Path(log_dir).parent
+        sweep_dir_name = sweep_dir_path.name
+
+        # Try reading sweep_id.txt (written by wandb_sweep_config.py)
+        sweep_id_file = sweep_dir_path / "sweep_id.txt"
+        if sweep_id_file.exists():
+            try:
+                metrics["sweep_id"] = sweep_id_file.read_text().strip()
+            except Exception:
+                pass
+
+        # Fallback to hardcoded map for older sweeps
+        if not metrics["sweep_id"]:
+            for prefix, sid in SWEEP_ID_MAP.items():
+                if sweep_dir_name.startswith(prefix):
+                    metrics["sweep_id"] = sid
+                    break
 
         try:
             with open(log_file) as f:
@@ -275,6 +311,7 @@ def collect_results(output_dir, comments=None):
     rows = []
     for summary_path in sorted(summary_files):
         run_name = extract_run_name(summary_path)
+        bench_iteration = extract_bench_iteration(summary_path)
         benchmark_dir = os.path.dirname(summary_path)
 
         with open(summary_path) as f:
@@ -325,6 +362,7 @@ def collect_results(output_dir, comments=None):
 
         row = {
             "run_name": run_name,
+            "bench_iteration": bench_iteration,
             "sweep_id": eval_metrics.get("sweep_id", ""),
             "category": category,
             "rl_enabled": str(config["rl_enabled"]),
@@ -352,9 +390,13 @@ def collect_results(output_dir, comments=None):
         }
 
         rows.append(row)
-        print("  Collected: {} [{}] (avg={:.1f}%)".format(run_name, category, avg))
+        print("  Collected: {} [{}] iter={} (avg={:.1f}%)".format(run_name, category, bench_iteration, avg))
 
     return rows
+
+
+def _row_key(row):
+    return (row.get("run_name", ""), row.get("bench_iteration", "latest"))
 
 
 def write_csv(rows, csv_path):
@@ -363,12 +405,12 @@ def write_csv(rows, csv_path):
         with open(csv_path, newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                existing[row["run_name"]] = row
+                existing[_row_key(row)] = row
 
     for row in rows:
-        name = row["run_name"]
-        if name in existing:
-            old = existing[name]
+        key = _row_key(row)
+        if key in existing:
+            old = existing[key]
             if old.get("comments") and not row.get("comments"):
                 row["comments"] = old["comments"]
             if not row.get("eval_crit_path") and old.get("eval_crit_path"):
@@ -377,9 +419,9 @@ def write_csv(rows, csv_path):
                 row["eval_lm_loss"] = old["eval_lm_loss"]
             if not row.get("sweep_id") and old.get("sweep_id"):
                 row["sweep_id"] = old["sweep_id"]
-        existing[name] = row
+        existing[key] = row
 
-    all_rows = sorted(existing.values(), key=lambda r: r.get("run_name", ""))
+    all_rows = sorted(existing.values(), key=lambda r: (r.get("run_name", ""), r.get("bench_iteration", "")))
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")

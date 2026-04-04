@@ -144,7 +144,6 @@ srun --container-image="${CONTAINER_IMAGE}" \
              --tasks ${TASKS} \
              --batch_size '${BATCH_SIZE}' \
              --output_path '${RESULTS_DIR}' \
-             --log_samples \
              \${LIMIT_FLAG}
 
          echo 'lm-eval complete. Results in: ${RESULTS_DIR}'
@@ -253,6 +252,10 @@ except Exception as e:
     print(f"WandB logging failed: {e}")
 
 PYEOF
+
+echo ""
+echo "Collecting results into benchmark_results.csv..."
+python3 "${SCRIPT_DIR}/collect_benchmark_results.py" 2>&1 || echo "WARNING: collect_benchmark_results.py failed"
 
 echo ""
 echo "============================================================"
