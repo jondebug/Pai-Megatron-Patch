@@ -21,7 +21,7 @@ DEFAULT_OUTPUT = SCRIPT_DIR.parent.parent.parent / "pareto_accuracy_vs_cp.html"
 BASELINE_CP = 4780
 
 
-def load_data(csv_path, min_accuracy=0, limit_filter=None):
+def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None):
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(f))
 
@@ -35,6 +35,19 @@ def load_data(csv_path, min_accuracy=0, limit_filter=None):
             row_limit = r.get("limit", "")
             if row_limit != str(limit_filter):
                 continue
+        if max_train_iters is not None:
+            bench_iter = r.get("bench_iteration", "")
+            train_iters_val = r.get("train_iters", "")
+            try:
+                if bench_iter and int(bench_iter) > max_train_iters:
+                    continue
+            except ValueError:
+                pass
+            try:
+                if train_iters_val and int(train_iters_val) > max_train_iters:
+                    continue
+            except ValueError:
+                pass
 
         name = r.get("run_name", "")
         cat = r.get("category", "other")
@@ -143,7 +156,7 @@ def compute_pareto_frontier(points):
     return sorted(frontier, key=lambda p: p["x"])
 
 
-def generate_html(points, output_path):
+def generate_html(points, output_path, y_min_override=None, y_max_override=None):
     cats_for_frontier = ["aux_only", "rl_only", "rl+aux"]
     frontiers = {}
     for cat in cats_for_frontier:
@@ -152,7 +165,8 @@ def generate_html(points, output_path):
             frontiers[cat] = compute_pareto_frontier(cat_points)
 
     min_acc = min(p["y"] for p in points)
-    y_min = max(30, int(min_acc) - 2)
+    y_min = y_min_override if y_min_override is not None else max(30, int(min_acc) - 2)
+    y_max = y_max_override if y_max_override is not None else 66
 
     frontier_colors = {
         "aux_only": "rgba(46,125,50,0.45)",
@@ -280,7 +294,7 @@ new Chart(document.getElementById('pareto').getContext('2d'), {{
       }},
       y: {{
         title: {{ display: true, text: 'Benchmark Accuracy (%)', font: {{ size: 14, weight: 'bold' }} }},
-        min: {y_min}, max: 66, ticks: {{ callback: v => v.toFixed(0) + '%' }}, grid: {{ color: '#f0f0f0' }},
+        min: {y_min}, max: {y_max}, ticks: {{ callback: v => v.toFixed(0) + '%' }}, grid: {{ color: '#f0f0f0' }},
       }}
     }},
     plugins: {{
@@ -353,6 +367,7 @@ new Chart(document.getElementById('pareto').getContext('2d'), {{
         frontier_colors_json=json.dumps(frontier_colors),
         frontier_labels_json=json.dumps(frontier_labels),
         y_min=y_min,
+        y_max=y_max,
     )
 
     with open(output_path, "w") as f:
@@ -375,14 +390,35 @@ def main():
                         help="Filter out runs below this accuracy %%")
     parser.add_argument("--limit-filter", type=str, default=None,
                         help="Only include runs with this limit value (e.g. '1000')")
+    parser.add_argument("--clean", action="store_true",
+                        help="Only display points that are on a Pareto frontier (aux, rl, or rl+aux)")
+    parser.add_argument("--max-train-iters", type=int, default=8000,
+                        help="Only include runs benchmarked at or below this training iteration")
+    parser.add_argument("--y-min", type=float, default=61,
+                        help="Y-axis minimum (default: auto)")
+    parser.add_argument("--y-max", type=float, default=None,
+                        help="Y-axis maximum (default: 66)")
     args = parser.parse_args()
 
-    points = load_data(args.csv, args.min_accuracy, limit_filter=args.limit_filter)
+    points = load_data(args.csv, args.min_accuracy, limit_filter=args.limit_filter, max_train_iters=args.max_train_iters)
+    print(f"max train iters: {args.max_train_iters}")
+    print(f"y-min: {args.y_min}")
+    print(f"y-max: {args.y_max}")
     if not points:
         print("No data points found in {}".format(args.csv))
         return
 
-    generate_html(points, args.output)
+    if args.clean:
+        frontier_set = set()
+        for cat in ["aux_only", "rl_only", "rl+aux"]:
+            cat_points = [p for p in points if p["cat"] == cat]
+            if cat_points:
+                for p in compute_pareto_frontier(cat_points):
+                    frontier_set.add(id(p))
+        points = [p for p in points if id(p) in frontier_set or p["cat"] == "pretrained"]
+        print("Clean mode: {} Pareto-optimal points retained".format(len(points)))
+
+    generate_html(points, args.output, y_min_override=args.y_min, y_max_override=args.y_max)
 
 
 if __name__ == "__main__":

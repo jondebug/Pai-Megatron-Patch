@@ -184,6 +184,16 @@ def find_benchmark_results(output_dir):
             str(output_dir / "*/checkpoint/*/benchmark_iter*/accuracy_summary.json")
         )
     )
+    results.extend(
+        glob.glob(
+            str(output_dir / "*/checkpoint/*/benchmark_full*/accuracy_summary.json")
+        )
+    )
+    results.extend(
+        glob.glob(
+            str(output_dir / "*/checkpoint/*/benchmark_latest*/accuracy_summary.json")
+        )
+    )
     return results
 
 
@@ -199,7 +209,7 @@ def extract_checkpoint_path(summary_path):
     p = Path(summary_path)
     bench_idx = None
     for i, part in enumerate(p.parts):
-        if part == "benchmark_results" or part.startswith("benchmark_iter"):
+        if part.startswith("benchmark_") or part == "benchmark_results":
             bench_idx = i
             break
     if bench_idx is not None:
@@ -207,13 +217,42 @@ def extract_checkpoint_path(summary_path):
     return ""
 
 
+def _parse_benchmark_dir_name(dir_name):
+    """Parse iteration and limit from benchmark dir name.
+    
+    Examples:
+        benchmark_iter2000_limit1000 -> ('2000', '1000')
+        benchmark_iter2000_full -> ('2000', '')
+        benchmark_iter2000 -> ('2000', '')
+        benchmark_latest_full -> (None, '')
+        benchmark_latest_limit1000 -> (None, '1000')
+        benchmark_results -> (None, '')
+        benchmark_full_iter2000 -> ('2000', '')
+        benchmark_full -> (None, '')
+    """
+    iteration = None
+    limit = ""
+    
+    import re
+    iter_match = re.search(r"iter(\d+)", dir_name)
+    if iter_match:
+        iteration = iter_match.group(1)
+    
+    limit_match = re.search(r"limit(\d+)", dir_name)
+    if limit_match:
+        limit = limit_match.group(1)
+    
+    return iteration, limit
+
+
 def extract_bench_iteration(summary_path):
-    """Extract benchmark iteration from path like .../benchmark_iter2000/accuracy_summary.json.
-    For benchmark_results/ (non-iteration-specific), reads latest_checkpointed_iteration.txt."""
+    """Extract benchmark iteration from path."""
     p = Path(summary_path)
     for part in p.parts:
-        if part.startswith("benchmark_iter"):
-            return part.replace("benchmark_iter", "")
+        if part.startswith("benchmark_"):
+            iteration, _ = _parse_benchmark_dir_name(part)
+            if iteration:
+                return iteration
     ckpt_dir = extract_checkpoint_path(summary_path)
     if ckpt_dir:
         latest_file = os.path.join(ckpt_dir, "latest_checkpointed_iteration.txt")
@@ -332,20 +371,33 @@ def collect_results(output_dir, comments=None):
         ckpt_path = extract_checkpoint_path(summary_path)
 
         limit = ""
-        results_json = os.path.join(benchmark_dir, "results.json")
-        if os.path.exists(results_json):
-            try:
-                with open(results_json) as f:
-                    rj = json.load(f)
-                lim = rj.get("config", {}).get("limit")
-                if lim is not None:
-                    limit = (
-                        str(int(lim))
-                        if isinstance(lim, float) and lim == int(lim)
-                        else str(lim)
-                    )
-            except Exception:
-                pass
+        # First try to get limit from the dir name (most reliable)
+        bench_dir_name = Path(benchmark_dir).name
+        _, dir_limit = _parse_benchmark_dir_name(bench_dir_name)
+        if dir_limit:
+            limit = dir_limit
+        elif "_full" in bench_dir_name:
+            limit = ""
+        else:
+            # Fallback: read from lm_eval results.json
+            results_json = os.path.join(benchmark_dir, "results.json")
+            if not os.path.exists(results_json):
+                rj_files = glob.glob(os.path.join(benchmark_dir, "**", "results.json"), recursive=True)
+                if rj_files:
+                    results_json = max(rj_files, key=os.path.getmtime)
+            if os.path.exists(results_json):
+                try:
+                    with open(results_json) as f:
+                        rj = json.load(f)
+                    lim = rj.get("config", {}).get("limit")
+                    if lim is not None:
+                        limit = (
+                            str(int(lim))
+                            if isinstance(lim, float) and lim == int(lim)
+                            else str(lim)
+                        )
+                except Exception:
+                    pass
 
         ts = ""
         try:
@@ -396,7 +448,7 @@ def collect_results(output_dir, comments=None):
 
 
 def _row_key(row):
-    return (row.get("run_name", ""), row.get("bench_iteration", "latest"))
+    return (row.get("run_name", ""), row.get("bench_iteration", ""), row.get("limit", ""))
 
 
 def write_csv(rows, csv_path):

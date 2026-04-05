@@ -187,7 +187,7 @@ def submit_batch_benchmark(entries, wandb_project, limit=None):
         return None
 
     import time
-    manifest_path = script_dir / f"_manifest_{os.getpid()}_{int(time.time()*1000)}.json"
+    manifest_path = (script_dir / f"_manifest_{os.getpid()}_{int(time.time()*1000)}.json").resolve()
     with open(manifest_path, "w") as f:
         json.dump(entries, f, indent=2)
 
@@ -351,11 +351,15 @@ def main():
 
             actual_iter = p.get("eval_step")
             if bench_step == "final" or actual_iter is None:
-                results_subdir = "benchmark_results"
                 bench_iter = None
             else:
-                results_subdir = f"benchmark_iter{actual_iter}"
                 bench_iter = actual_iter
+
+            limit_tag = f"_limit{args.limit}" if args.limit else "_full"
+            if bench_iter is not None:
+                results_subdir = f"benchmark_iter{bench_iter}{limit_tag}"
+            else:
+                results_subdir = f"benchmark_latest{limit_tag}"
 
             already_done = os.path.join(ckpt_dir, results_subdir, "accuracy_summary.json")
             if os.path.exists(already_done):

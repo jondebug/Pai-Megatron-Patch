@@ -88,22 +88,25 @@ for idx, entry in enumerate(manifest):
     wandb_run_id = entry.get('wandb_run_id', '')
     bench_iter = entry.get('iteration', None)
     
+    limit_tag = f'_limit{limit}' if limit else '_full'
     if bench_iter and str(bench_iter) != 'final':
         hf_output = os.path.join(ckpt_dir, f'hf_converted_iter{bench_iter}')
-        results_dir = os.path.join(ckpt_dir, f'benchmark_iter{bench_iter}')
+        results_dir = os.path.join(ckpt_dir, f'benchmark_iter{bench_iter}{limit_tag}')
     else:
         hf_output = os.path.join(ckpt_dir, 'hf_converted')
-        results_dir = os.path.join(ckpt_dir, 'benchmark_results')
+        results_dir = os.path.join(ckpt_dir, f'benchmark_latest{limit_tag}')
     os.makedirs(results_dir, exist_ok=True)
     
     summary_file = os.path.join(results_dir, 'accuracy_summary.json')
     if os.path.exists(summary_file):
-        print(f'[{idx+1}/{total}] SKIP {run_name} (iter={bench_iter or \"latest\"}): already benchmarked')
+        iter_display = bench_iter if bench_iter else 'latest'
+        print(f'[{idx+1}/{total}] SKIP {run_name} (iter={iter_display}, {limit_tag}): already benchmarked')
         continue
     
     print(f'')
     print(f'============================================================')
-    print(f'[{idx+1}/{total}] {run_name} (iter={bench_iter or \"latest\"})')
+    iter_display = bench_iter if bench_iter else 'latest'
+    print(f'[{idx+1}/{total}] {run_name} (iter={iter_display})')
     print(f'============================================================')
     
     # Point converter at the right iteration by temporarily setting latest_checkpointed_iteration.txt
@@ -148,7 +151,8 @@ for idx, entry in enumerate(manifest):
         continue
     
     # Step 2: Run lm_eval
-    print(f'  Running lm_eval (tasks={tasks}, limit={limit or \"full\"})...')
+    limit_display = limit if limit else 'full'
+    print(f'  Running lm_eval (tasks={tasks}, limit={limit_display})...')
     cmd = [
         sys.executable, '-m', 'lm_eval',
         '--model', 'hf',
