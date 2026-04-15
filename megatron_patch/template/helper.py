@@ -504,6 +504,13 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
 
     # --- KL divergence constraint ---
     kl_loss_coeff = getattr(args, 'kl_loss_coeff', 0.0)
+    if kl_loss_coeff > 0:
+        _kl_cur = _kl_state['current_logits']
+        _kl_ref = _kl_state['ref_logits']
+        if _kl_cur is None or _kl_ref is None:
+            if not hasattr(loss_func_with_rl, '_kl_debug_printed'):
+                print(f"[KL DEBUG] KL skipped: coeff={kl_loss_coeff}, current_logits={'None' if _kl_cur is None else _kl_cur.shape}, ref_logits={'None' if _kl_ref is None else _kl_ref.shape}, initialized={_kl_state['initialized']}", flush=True)
+                loss_func_with_rl._kl_debug_printed = True
     if kl_loss_coeff > 0 and _kl_state['current_logits'] is not None and _kl_state['ref_logits'] is not None:
         try:
             import torch.nn.functional as F
@@ -527,8 +534,9 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
 
             loss_dict['kl_loss'] = kl_loss.detach()
             critical_metrics['critical/kl_loss'] = kl_loss.item()
-            print_rank_0(f"[KL] kl_loss={kl_loss.item():.4e}, scaled={scaled_kl.item():.4e}",
-                        override_debug_mode=False)
+            if not hasattr(loss_func_with_rl, '_kl_success_printed'):
+                print(f"[KL DEBUG] KL ACTIVE: kl_loss={kl_loss.item():.4e}, scaled={scaled_kl.item():.4e}, coeff={kl_loss_coeff}", flush=True)
+                loss_func_with_rl._kl_success_printed = True
         except Exception as e:
             print_rank_0(f"[KL] WARNING: KL computation failed: {e}")
 
@@ -582,6 +590,8 @@ def _init_kl_state(model, snapshot_weights=True):
     if _kl_state['initialized']:
         return
     
+    print(f"[KL DEBUG] _init_kl_state called, snapshot_weights={snapshot_weights}, model type={type(model).__name__}", flush=True)
+    
     # Snapshot all router weights (frozen reference) — only when KL loss is enabled
     if snapshot_weights:
         ref_weights = {}
@@ -589,17 +599,27 @@ def _init_kl_state(model, snapshot_weights=True):
             if 'router' in name and 'weight' in name:
                 ref_weights[name] = param.data.clone().detach()
         _kl_state['ref_router_weights'] = ref_weights
-        print_rank_0(f"[KL] Snapshotted {len(ref_weights)} router weight tensors")
+        print(f"[KL DEBUG] Snapshotted {len(ref_weights)} router weight tensors", flush=True)
     
-    # Always register forward hook on output_layer to capture logits (for output metrics)
-    if hasattr(model, 'output_layer'):
-        model.output_layer.register_forward_hook(_kl_capture_logits_hook)
-        print_rank_0(f"[KL] Registered logit capture hook on output_layer")
-    elif hasattr(model, 'module') and hasattr(model.module, 'output_layer'):
-        model.module.output_layer.register_forward_hook(_kl_capture_logits_hook)
-        print_rank_0(f"[KL] Registered logit capture hook on module.output_layer")
-    else:
-        print_rank_0("[KL] WARNING: Could not find output_layer on model")
+    # Walk model hierarchy to find output_layer.
+    # Megatron wraps: DistributedDataParallel -> Float16Module -> GPTModel
+    found = False
+    obj = model
+    path = 'model'
+    for depth in range(5):
+        if hasattr(obj, 'output_layer'):
+            obj.output_layer.register_forward_hook(_kl_capture_logits_hook)
+            print(f"[KL DEBUG] Registered logit capture hook on {path}.output_layer", flush=True)
+            found = True
+            break
+        if hasattr(obj, 'module'):
+            obj = obj.module
+            path += '.module'
+        else:
+            break
+    
+    if not found:
+        print(f"[KL DEBUG] WARNING: Could not find output_layer after {path}. Final obj type={type(obj).__name__}, attrs={[a for a in dir(obj) if not a.startswith('_')][:15]}", flush=True)
     
     _kl_state['initialized'] = True
 
@@ -647,8 +667,12 @@ def _run_reference_forward(model, tokens, position_ids, attention_mask, packed_s
                                labels=None, packed_seq_params=packed_seq_params)
             # ref_logits shape: [batch, seq, vocab] (transposed in _postprocess when labels=None)
             _kl_state['ref_logits'] = ref_logits.detach()
+            if not hasattr(_run_reference_forward, '_debug_printed'):
+                print(f"[KL DEBUG] Reference forward OK: ref_logits shape={ref_logits.shape}, current_logits={'None' if _kl_state['current_logits'] is None else _kl_state['current_logits'].shape}", flush=True)
+                _run_reference_forward._debug_printed = True
     except Exception as e:
-        print_rank_0(f"[KL] WARNING: Reference forward failed: {e}")
+        print(f"[KL DEBUG] Reference forward FAILED: {e}", flush=True)
+        import traceback; traceback.print_exc()
         _kl_state['ref_logits'] = None
     finally:
         # Restore current router weights

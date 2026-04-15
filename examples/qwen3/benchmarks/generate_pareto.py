@@ -31,7 +31,7 @@ def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None)
         cp = float(r.get("eval_crit_path") or "0")
         if avg <= 0 or cp <= 0 or avg < min_accuracy:
             continue
-        if limit_filter is not None:
+        if limit_filter is not None and limit_filter != "":
             row_limit = r.get("limit", "")
             if row_limit != str(limit_filter):
                 continue
@@ -84,7 +84,7 @@ def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None)
             display_cat = "degraded"
 
         # Build short label
-        if name == "pretrained_baseline":
+        if name.startswith("pretrained_baseline") or cat == "pretrained":
             label = "Pretrained"
         elif cat == "aux_only":
             label = "Aux {}s (c={})".format(iters, auxc)
@@ -138,7 +138,16 @@ def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None)
             "gae": has_gae,
         })
 
-    return points
+    # Deduplicate: keep one entry per (label, cat, cp) — prefer higher accuracy
+    seen = {}
+    deduped = []
+    for p in points:
+        key = (p["label"], p["cat"], round(p["cp"], 0))
+        if key not in seen or p["acc"] > seen[key]["acc"]:
+            seen[key] = p
+    deduped = list(seen.values())
+
+    return deduped
 
 
 def compute_pareto_frontier(points):
@@ -399,6 +408,9 @@ def main():
     parser.add_argument("--y-max", type=float, default=None,
                         help="Y-axis maximum (default: 66)")
     args = parser.parse_args()
+
+    if args.output.suffix != '.html':
+        args.output = args.output.with_suffix('.html')
 
     points = load_data(args.csv, args.min_accuracy, limit_filter=args.limit_filter, max_train_iters=args.max_train_iters)
     print(f"max train iters: {args.max_train_iters}")
