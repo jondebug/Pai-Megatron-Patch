@@ -44,10 +44,18 @@ _kl_state = {
     'current_logits': None,       # captured by output_layer hook (in grad graph)
     'ref_logits': None,           # from reference forward (detached)
     'initialized': False,
+    # When True, the output_layer hook does NOT overwrite current_logits.
+    # Used to protect the training-forward logits during the reference
+    # forward pass (which also calls output_layer and would otherwise
+    # clobber current_logits with the frozen-router outputs, making the
+    # subsequent KL computation collapse to ~0).
+    'capture_disabled': False,
 }
 
 def _kl_capture_logits_hook(module, input, output):
     """Forward hook on output_layer to capture logits from normal forward pass."""
+    if _kl_state.get('capture_disabled', False):
+        return
     # output is (logits, bias) tuple from ColumnParallelLinear
     logits = output[0] if isinstance(output, tuple) else output
     _kl_state['current_logits'] = logits
@@ -534,9 +542,22 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
 
             loss_dict['kl_loss'] = kl_loss.detach()
             critical_metrics['critical/kl_loss'] = kl_loss.item()
-            if not hasattr(loss_func_with_rl, '_kl_success_printed'):
-                print(f"[KL DEBUG] KL ACTIVE: kl_loss={kl_loss.item():.4e}, scaled={scaled_kl.item():.4e}, coeff={kl_loss_coeff}", flush=True)
-                loss_func_with_rl._kl_success_printed = True
+            # Print KL value for the first several calls + sparsely afterwards so we
+            # can confirm KL grows as router weights drift (cur vs ref divergence).
+            _kl_n = getattr(loss_func_with_rl, '_kl_print_count', 0)
+            if _kl_n < 10 or _kl_n % 100 == 0:
+                cur_mean = cur_logits.float().mean().item()
+                ref_mean = ref_logits.float().mean().item()
+                cur_ptr = cur_logits.data_ptr()
+                ref_ptr = ref_logits.data_ptr()
+                print(
+                    f"[KL DEBUG] call={_kl_n} kl_loss={kl_loss.item():.4e} "
+                    f"scaled={scaled_kl.item():.4e} coeff={kl_loss_coeff} "
+                    f"cur_mean={cur_mean:.4f} ref_mean={ref_mean:.4f} "
+                    f"same_ptr={cur_ptr == ref_ptr}",
+                    flush=True,
+                )
+            loss_func_with_rl._kl_print_count = _kl_n + 1
         except Exception as e:
             print_rank_0(f"[KL] WARNING: KL computation failed: {e}")
 
@@ -660,6 +681,12 @@ def _run_reference_forward(model, tokens, position_ids, attention_mask, packed_s
 
     clear_aux_losses_tracker()
 
+    # Disable the output_layer logit-capture hook so the reference forward
+    # does NOT overwrite current_logits (the training forward's logits, in
+    # the grad graph). Without this guard, current_logits and ref_logits
+    # both end up holding the frozen-router output and KL collapses to ~0.
+    _kl_state['capture_disabled'] = True
+
     # Reference forward (no grad, labels=None to get logits)
     try:
         with torch.no_grad():
@@ -668,13 +695,18 @@ def _run_reference_forward(model, tokens, position_ids, attention_mask, packed_s
             # ref_logits shape: [batch, seq, vocab] (transposed in _postprocess when labels=None)
             _kl_state['ref_logits'] = ref_logits.detach()
             if not hasattr(_run_reference_forward, '_debug_printed'):
-                print(f"[KL DEBUG] Reference forward OK: ref_logits shape={ref_logits.shape}, current_logits={'None' if _kl_state['current_logits'] is None else _kl_state['current_logits'].shape}", flush=True)
+                cur = _kl_state['current_logits']
+                cur_desc = 'None' if cur is None else f"shape={tuple(cur.shape)}, mean={cur.float().mean().item():.4f}"
+                ref_desc = f"shape={tuple(ref_logits.shape)}, mean={ref_logits.float().mean().item():.4f}"
+                print(f"[KL DEBUG] Reference forward OK: ref_logits {ref_desc}; current_logits {cur_desc}", flush=True)
                 _run_reference_forward._debug_printed = True
     except Exception as e:
         print(f"[KL DEBUG] Reference forward FAILED: {e}", flush=True)
         import traceback; traceback.print_exc()
         _kl_state['ref_logits'] = None
     finally:
+        # Re-enable logit capture before any subsequent forwards
+        _kl_state['capture_disabled'] = False
         # Restore current router weights
         for name, param in model.named_parameters():
             if name in saved_weights:
