@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=benchmark
 #SBATCH --partition=interactive
-#SBATCH --account=nvr_israel_scne
+#SBATCH --account=nvr_israel_rlop
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
 #SBATCH --time=04:00:00

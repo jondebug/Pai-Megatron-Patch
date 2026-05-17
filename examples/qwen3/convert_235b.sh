@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=convert_235b
 #SBATCH --partition=interactive
-#SBATCH --account=nvr_israel_scne
+#SBATCH --account=nvr_israel_rlop
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
 #SBATCH --mem=939368M

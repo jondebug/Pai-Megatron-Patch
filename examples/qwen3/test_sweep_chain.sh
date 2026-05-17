@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=test_sweep
 #SBATCH --partition=interactive
-#SBATCH --account=nvr_israel_scne
+#SBATCH --account=nvr_israel_rlop
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=1
 #SBATCH --time=0:10:00

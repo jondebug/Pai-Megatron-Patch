@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=baseline_benchmark
-#SBATCH --account=nvr_israel_scne
+#SBATCH --account=nvr_israel_rlop
 #SBATCH --partition=interactive
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4

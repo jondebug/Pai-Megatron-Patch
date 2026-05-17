@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=qwen3_235b_smoke
 #SBATCH --partition=interactive
-#SBATCH --account=nvr_israel_scne
+#SBATCH --account=nvr_israel_rlop
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
 #SBATCH --time=4:00:00
