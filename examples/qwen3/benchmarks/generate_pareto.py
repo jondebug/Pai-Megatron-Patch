@@ -19,9 +19,10 @@ SCRIPT_DIR = Path(__file__).parent
 DEFAULT_CSV = SCRIPT_DIR / "benchmark_results.csv"
 DEFAULT_OUTPUT = SCRIPT_DIR.parent.parent.parent / "pareto_accuracy_vs_cp.html"
 BASELINE_CP = 4780
+BASELINE_LABEL = "Qwen3-30B-A3B"
 
 
-def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None):
+def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None, run_name_prefix=None):
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(f))
 
@@ -29,6 +30,10 @@ def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None)
     for r in rows:
         avg = float(r.get("benchmark_avg") or "0")
         cp = float(r.get("eval_crit_path") or "0")
+        if run_name_prefix:
+            prefixes = [p.strip() for p in run_name_prefix.split(",")]
+            if not any(r.get("run_name","").startswith(p) for p in prefixes):
+                continue
         if avg <= 0 or cp <= 0 or avg < min_accuracy:
             continue
         if limit_filter is not None and limit_filter != "":
@@ -215,7 +220,7 @@ def generate_html(points, output_path, y_min_override=None, y_max_override=None)
   <p class="subtitle">Top-right = best. Hover for details. 3 Pareto frontiers: aux-only, RL-only, RL+aux.</p>
   <div class="chart-wrap"><canvas id="pareto"></canvas></div>
   <div class="notes">
-    <b>Baseline CP = {baseline_cp}</b> (pretrained Qwen3-30B-A3B, no training).<br>
+    <b>Baseline CP = {baseline_cp}</b> (pretrained {baseline_label}, no training).<br>
     <b>Dashed lines</b> = per-category Pareto frontiers (non-dominated points within each method).<br>
     <b>Gray star</b> = pretrained baseline (no training, no CP reduction).
     <b>{n_total}</b> total runs plotted.
@@ -231,7 +236,7 @@ const DATA = {data_json};
 const FRONTIERS = {frontiers_json};
 
 const STYLES = {{
-  pretrained: {{ bg: '#9e9e9e', border: '#616161', shape: 'star', r: 14 }},
+  pretrained: {{ bg: '#000000', border: '#000', shape: 'star', r: 22 }},
   aux_only:   {{ bg: '#4caf50', border: '#2e7d32', shape: 'rectRot', r: 10 }},
   rl_only:    {{ bg: 'rgba(229,57,53,0.85)', border: '#c62828', shape: 'triangle', r: 9 }},
   'rl+aux':   {{ bg: 'rgba(33,150,243,0.85)', border: '#1565c0', shape: 'circle', r: 9 }},
@@ -299,7 +304,7 @@ new Chart(document.getElementById('pareto').getContext('2d'), {{
     scales: {{
       x: {{
         title: {{ display: true, text: 'Critical Path Reduction (%)', font: {{ size: 14, weight: 'bold' }} }},
-        min: -3, max: 45, ticks: {{ callback: v => v + '%' }}, grid: {{ color: '#f0f0f0' }},
+        min: -10, max: 45, ticks: {{ callback: v => v + '%' }}, grid: {{ color: '#f0f0f0' }},
       }},
       y: {{
         title: {{ display: true, text: 'Benchmark Accuracy (%)', font: {{ size: 14, weight: 'bold' }} }},
@@ -370,6 +375,7 @@ new Chart(document.getElementById('pareto').getContext('2d'), {{
 
     html = html.format(
         baseline_cp=BASELINE_CP,
+        baseline_label=BASELINE_LABEL,
         n_total=len(points),
         data_json=json.dumps(points),
         frontiers_json=json.dumps(frontiers),
@@ -391,6 +397,50 @@ new Chart(document.getElementById('pareto').getContext('2d'), {{
     ))
 
 
+
+def ensure_baseline_point(points, csv_path, run_name_prefix=None):
+    """Guarantee the pretrained baseline is plotted, regardless of limit filter
+    or whether its CSV row has an eval_crit_path. The baseline CP is supplied via
+    --baseline-cp (BASELINE_CP); its accuracy is read from the highest-accuracy
+    pretrained row in the CSV. Any pre-existing pretrained points are replaced."""
+    import csv as _csv
+    # Find best pretrained accuracy in the CSV (full/inf eval wins via max).
+    best = None
+    with open(csv_path, newline="") as f:
+        for r in _csv.DictReader(f):
+            nm = r.get("run_name", "")
+            cat = r.get("category", "")
+            if not (nm.startswith("pretrained_235b") or (cat == "pretrained" and "235b" in nm.lower())):
+                continue
+            try:
+                acc = float(r.get("benchmark_avg") or 0)
+            except ValueError:
+                continue
+            if acc <= 0:
+                continue
+            h = r.get("hellaswag") or None
+            a = r.get("arc_challenge") or None
+            w = r.get("winogrande") or None
+            if best is None or acc > best["acc"]:
+                best = {"acc": acc, "h": float(h) if h else None,
+                        "a": float(a) if a else None, "w": float(w) if w else None}
+    if best is None:
+        return points  # no pretrained row at all; leave as-is
+    # Drop any existing pretrained points and inject one clean baseline point.
+    points = [p for p in points if p.get("cat") != "pretrained"]
+    points.append({
+        "label": "Pretrained", "cat": "pretrained", "sweep": "",
+        "rl": False, "aux": False, "iters": 0, "rlc": 0.0,
+        "cp": BASELINE_CP, "lm": 0.0,
+        "h": best["h"], "a": best["a"], "w": best["w"],
+        "acc": best["acc"], "x": 0.0, "y": best["acc"],
+        "ppo_k": "", "lm_reward": False, "klc": "",
+        "gumbel": False, "cosine": False, "gae": False,
+    })
+    print("Injected baseline point: cp={} acc={:.2f}".format(BASELINE_CP, best["acc"]))
+    return points
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate Pareto chart from benchmark CSV")
     parser.add_argument("--csv", type=Path, default=DEFAULT_CSV)
@@ -405,14 +455,23 @@ def main():
                         help="Only include runs benchmarked at or below this training iteration")
     parser.add_argument("--y-min", type=float, default=61,
                         help="Y-axis minimum (default: auto)")
+    parser.add_argument("--run-name-prefix", type=str, default=None,
+                        help="Only include rows whose run_name starts with this string (e.g. '235b' for 235B-only chart)")
+    parser.add_argument("--baseline-cp", type=float, default=4780,
+                        help="Reference baseline critical_path (default 4780 = 30B pretrained; use 8800 for 235B)")
+    parser.add_argument("--baseline-label", type=str, default="Qwen3-30B-A3B",
+                        help="Label for the baseline shown on the chart")
     parser.add_argument("--y-max", type=float, default=None,
                         help="Y-axis maximum (default: 66)")
     args = parser.parse_args()
+    global BASELINE_CP, BASELINE_LABEL
+    BASELINE_CP = args.baseline_cp
+    BASELINE_LABEL = args.baseline_label
 
     if args.output.suffix != '.html':
         args.output = args.output.with_suffix('.html')
 
-    points = load_data(args.csv, args.min_accuracy, limit_filter=args.limit_filter, max_train_iters=args.max_train_iters)
+    points = load_data(args.csv, args.min_accuracy, limit_filter=args.limit_filter, max_train_iters=args.max_train_iters, run_name_prefix=args.run_name_prefix)
     print(f"max train iters: {args.max_train_iters}")
     print(f"y-min: {args.y_min}")
     print(f"y-max: {args.y_max}")
@@ -430,6 +489,7 @@ def main():
         points = [p for p in points if id(p) in frontier_set or p["cat"] == "pretrained"]
         print("Clean mode: {} Pareto-optimal points retained".format(len(points)))
 
+    points = ensure_baseline_point(points, args.csv, run_name_prefix=args.run_name_prefix)
     generate_html(points, args.output, y_min_override=args.y_min, y_max_override=args.y_max)
 
 

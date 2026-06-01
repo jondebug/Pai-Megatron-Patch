@@ -3,7 +3,7 @@
 #SBATCH --partition=interactive
 #SBATCH --account=nvr_israel_rlop
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=2
+#SBATCH --gpus-per-node=8
 #SBATCH --time=01:30:00
 #SBATCH --output=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/cp_latency_logs/microbench_%j.out
 #SBATCH --error=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/cp_latency_logs/microbench_%j.err

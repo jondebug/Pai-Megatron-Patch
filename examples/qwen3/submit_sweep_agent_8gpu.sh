@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=wandb_sweep
-#SBATCH --partition=interactive
+#SBATCH --partition=interactive_singlenode
 #SBATCH --account=nvr_israel_rlop
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
-#SBATCH --time=4:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/sweep_logs/%x_%j.out
 #SBATCH --error=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/sweep_logs/%x_%j.err
 
@@ -22,7 +22,7 @@ WANDB_PROJECT="qwen3-router-training"
 CONTAINER_IMAGE="/lustre/fsw/portfolios/nvr/users/jonathanp/containers/pai-megatron-patch_25.04.sqsh"
 WORKDIR="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/examples/qwen3"
 SCRIPT_PATH="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/examples/qwen3/submit_sweep_agent_8gpu.sh"
-MAX_CHAIN_DEPTH=20
+MAX_CHAIN_DEPTH=30
 
 echo "============================================================"
 echo "SLURM Job ID: $SLURM_JOB_ID"
@@ -52,7 +52,7 @@ srun --container-image="$CONTAINER_IMAGE" \
      --container-mounts="$HOME:$HOME,/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing:/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing" \
      --container-workdir="$WORKDIR" \
      bash -c "
-         export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+         export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
          pip install wandb datasets --quiet
          export WANDB_RESUME=allow
          cd $WORKDIR

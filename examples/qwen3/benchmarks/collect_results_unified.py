@@ -26,6 +26,7 @@ COLS = [
     "eval_crit_path","eval_lm_loss",
     "hellaswag","arc_challenge","winogrande","benchmark_avg",
     "benchmark_time_sec","limit","timestamp","comments","checkpoint_path",
+    "wt_decode_tps","wt_ttft_ms","wt_e2e_ms",
 ]
 
 def parse_cell_hyperparams(name):
@@ -70,6 +71,12 @@ def parse_lmeval_log(path):
     for suffix in ("_v3", "_v2"):
         if name.endswith(suffix):
             name = name[:-len(suffix)]
+    # Strip trailing _iter<N> (used in limit=inf run names) so the cell maps to
+    # the same hyperparams + wandb CP as the base cell.
+    name = re.sub(r"_iter\d+$", "", name)
+    # Parse lm-eval limit from header ("Limit:   1000" or "Limit:   inf").
+    ml = re.search(r"Limit:\s+(\S+)", txt)
+    limit = ml.group(1) if ml else "1000"
     m = re.search(r"hf_converted_iter(\d+)_cp", txt)
     bench_iter = int(m.group(1)) if m else None
     r = {}
@@ -80,7 +87,7 @@ def parse_lmeval_log(path):
     m = re.search(r"\|winogrande\s*\|\s*\d+\s*\|none\s*\|\s*\d+\|acc\s*\|.*?\|\s*([\d.]+)\s*\|", txt)
     if m: r["wino"] = float(m.group(1))
     if all(k in r for k in ["arc_n","hella_n","wino"]):
-        return name, bench_iter, r
+        return name, bench_iter, limit, r
     return None
 
 def pull_wandb_metrics():
@@ -93,7 +100,7 @@ def pull_wandb_metrics():
     out = {}
     runs = list(api.runs("nvr-israel/qwen3-router-training", per_page=500))
     for r in runs:
-        if not r.name or not (r.name.startswith("235bv5") or r.name.startswith("235bv6")):
+        if not r.name or not r.name.startswith("235b"):
             continue
         try:
             h = r.history(keys=["iteration","critical_eval/lm_loss","critical_eval/critical_path"], pandas=False)
@@ -134,35 +141,114 @@ def find_checkpoint_path(cell, iter_=None, is_hf=False):
     # Fallback: cell-level dir if specific iter dir not found
     return str(cks[0])
 
+
+def scan_all_distcp():
+    """Every distcp checkpoint on disk: (cell, iter) -> checkpoint_path. This makes
+    the CSV a complete registry — even cells never benchmarked appear with their path."""
+    out = {}
+    if not OUTPUT_BASE.is_dir():
+        return out
+    for cell_dir in sorted(OUTPUT_BASE.iterdir()):
+        if not cell_dir.is_dir() or not cell_dir.name.startswith("235b"):
+            continue
+        ck = cell_dir / "checkpoint"
+        if not ck.is_dir():
+            continue
+        for sub in ck.iterdir():
+            if not sub.is_dir():
+                continue
+            for d in sub.iterdir():
+                m = re.match(r"iter_(\d+)$", d.name)
+                if m and any(d.glob("*.distcp")):
+                    out[(cell_dir.name, int(m.group(1)))] = str(d)
+    return out
+
+
+def pull_walltime():
+    """(cell, iter) -> {wt_decode_tps, wt_ttft_ms, wt_e2e_ms} from cp_latency_results JSONs."""
+    wtdir = Path("/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/cp_latency_results")
+    out = {}
+    if not wtdir.is_dir():
+        return out
+    for f in sorted(wtdir.glob("vllm_pretrained_235b_vs_*.json")):
+        m = re.search(r"_vs_(.+?)_iter(\d+)", f.name)
+        if not m:
+            continue
+        cell, it = m.group(1), int(m.group(2))
+        try:
+            d = json.load(open(f))
+        except Exception:
+            continue
+        for mdl in d.get("models", []):
+            if mdl.get("name", "").startswith("pretrained"):
+                continue
+            cells = mdl.get("cells", {})
+            c = cells.get("plen256_bs8") or (next(iter(cells.values())) if cells else None)
+            if c:
+                out[(cell, it)] = {
+                    "wt_decode_tps": round(c.get("decode_tps", 0), 2),
+                    "wt_ttft_ms": round(c.get("ttft_ms_mean", 0), 1),
+                    "wt_e2e_ms": round(c.get("end_to_end_ms_mean", 0), 1),
+                }
+    return out
+
+
+
+import glob as _glob
+_SWEEPLOGS="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/examples/qwen3/sweep_logs"
+_LOGMAP=None
+def scrape_cp_from_logs(cell, target_iter):
+    """Recover num_tokens_on_critical_path from training logs for cells whose
+    wandb run lacks critical_eval/critical_path (e.g. old 235b-rladv/pareto/klv)."""
+    global _LOGMAP
+    if _LOGMAP is None:
+        _LOGMAP={}
+        for lg in _glob.glob(f"{_SWEEPLOGS}/*/logs/*.log"):
+            import os as _os
+            _LOGMAP.setdefault(_os.path.basename(lg)[:-4], []).append(lg)
+    best=None; bestd=1e9
+    for lg in _LOGMAP.get(cell, []):
+        try: txt=open(lg, errors="ignore").read()
+        except Exception: continue
+        for m in re.finditer(r"iteration\s+(\d+)/.*?num_tokens_on_critical_path:\s*([0-9.E+]+)", txt):
+            it=int(m.group(1)); d=abs(it-target_iter)
+            if d<bestd: bestd=d; best=float(m.group(2))
+    return (best, bestd) if best is not None else (None, None)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=1000)
-    ap.add_argument("--cells", default=r"^(235bv[56]|pretrained_235b)", help="cell name regex")
+    ap.add_argument("--cells", default=r"^(235b)", help="cell name regex")
     ap.add_argument("--out", default=str(CSV_PATH))
     args = ap.parse_args()
     cell_re = re.compile(args.cells)
 
     # 1) Scrape all lm-eval logs
     print(f"Scraping {len(list(BENCH_LOG_DIR.glob('baseline_vllm_*.out')))} lm-eval logs ...")
-    bench_results = {}  # (cell, iter) -> {arc_n, hella_n, wino}
+    bench_results = {}  # (cell, iter, limit) -> {arc_n, hella_n, wino}
     for log in sorted(BENCH_LOG_DIR.glob("baseline_vllm_*.out")):
         parsed = parse_lmeval_log(log)
         if parsed is None: continue
-        cell, it, r = parsed
+        cell, it, limit, r = parsed
         if not cell_re.match(cell): continue
-        bench_results[(cell, it)] = r
+        bench_results[(cell, it, limit)] = r
 
     # 2) Pull W&B history
     print("Pulling W&B history (lm_loss, critical_path)...")
     wb = pull_wandb_metrics()
     print(f"  {len(wb)} cells with wandb metrics")
+    all_distcp = scan_all_distcp()
+    print(f"  {len(all_distcp)} distcp checkpoints on disk")
+    walltime = pull_walltime()
+    print(f"  {len(walltime)} checkpoints with vLLM walltime")
 
     # 3) Build output rows
     rows = []
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # 3a. Rows for each lm-eval'd cell at the eval iter
-    for (cell, it), r in bench_results.items():
+    for (cell, it, limit), r in bench_results.items():
         cfg = parse_cell_hyperparams(cell)
         # Find closest wandb metric to bench_iter
         eval_lm, eval_cp = None, None
@@ -170,14 +256,25 @@ def main():
             if it is None or abs(pt_it - it) <= 50:  # within 50 iters
                 eval_lm = pt_lm if pt_lm is not None else eval_lm
                 eval_cp = pt_cp if pt_cp is not None else eval_cp
-        bavg = round((r["arc_n"]+r["hella_n"]+r["wino"])/3, 4)
+        # Pretrained baseline has no wandb run; pin its critical path to the
+        # established 235B baseline value so it always plots.
+        if eval_cp is None and cell.startswith("pretrained_235b"):
+            eval_cp = 8800.0
+        # Fallback: recover CP from training logs for cells lacking wandb critical_path
+        if eval_cp is None and it is not None:
+            lcp, ld = scrape_cp_from_logs(cell, it)
+            if lcp is not None and ld <= 100:
+                eval_cp = lcp
+        # Store as percentages (0-100) to match the existing 30B format used by generate_pareto.py
+        bavg_pct = round((r["arc_n"]+r["hella_n"]+r["wino"])/3 * 100, 2)
         rows.append({
             "run_name": cell, "bench_iteration": it,
             **cfg,
             "eval_crit_path": round(eval_cp,1) if eval_cp is not None else "",
             "eval_lm_loss": round(eval_lm,4) if eval_lm is not None else "",
-            "hellaswag": r["hella_n"], "arc_challenge": r["arc_n"], "winogrande": r["wino"],
-            "benchmark_avg": bavg, "limit": args.limit, "timestamp": timestamp,
+            "hellaswag": round(r["hella_n"]*100, 2), "arc_challenge": round(r["arc_n"]*100, 2),
+            "winogrande": round(r["wino"]*100, 2),
+            "benchmark_avg": bavg_pct, "limit": limit, "timestamp": timestamp,
             "comments": "vLLM TP=8, acc_norm for arc/hella",
             "checkpoint_path": find_checkpoint_path(cell, it, is_hf=True),
         })
@@ -189,7 +286,7 @@ def main():
         latest = pts[-1]
         it, lm, cp = latest
         # Skip if we already have a benchmark row at this iter
-        if (cell, it) in bench_results: continue
+        if any((cell, it, L) in bench_results for L in ("1000", "inf")): continue
         cfg = parse_cell_hyperparams(cell)
         rows.append({
             "run_name": cell, "bench_iteration": it,
@@ -202,10 +299,41 @@ def main():
             "checkpoint_path": find_checkpoint_path(cell, it, is_hf=False),
         })
 
+    # 3c) Registry rows: ensure EVERY distcp checkpoint has a row (path + hyperparams),
+    #     even if never benchmarked and no wandb metric.
+    have = {(r["run_name"], r["bench_iteration"]) for r in rows}
+    for (cell, it), path in all_distcp.items():
+        if not cell_re.match(cell): continue
+        if (cell, it) in have: continue
+        cfg = parse_cell_hyperparams(cell)
+        # attach wandb metric if available near this iter
+        lm_v = cp_v = None
+        for pt_it, pt_lm, pt_cp in wb.get(cell, []):
+            if abs(pt_it - it) <= 50:
+                lm_v = pt_lm if pt_lm is not None else lm_v
+                cp_v = pt_cp if pt_cp is not None else cp_v
+        rows.append({
+            "run_name": cell, "bench_iteration": it, **cfg,
+            "eval_crit_path": round(cp_v,1) if cp_v is not None else "",
+            "eval_lm_loss": round(lm_v,4) if lm_v is not None else "",
+            "hellaswag": "", "arc_challenge": "", "winogrande": "",
+            "benchmark_avg": "", "limit": "", "timestamp": timestamp,
+            "comments": "registry (distcp on disk, not yet benchmarked)",
+            "checkpoint_path": path,
+        })
+
+    # 3d) Attach vLLM walltime to every row that has a matching checkpoint
+    for r in rows:
+        try: it = int(r["bench_iteration"])
+        except (ValueError, TypeError): continue
+        wt = walltime.get((r["run_name"], it))
+        if wt:
+            r.update(wt)
+
     # 4) Dedupe by (run_name, bench_iteration)
     seen = {}
     for row in rows:
-        key = (row["run_name"], row["bench_iteration"])
+        key = (row["run_name"], row["bench_iteration"], row.get("limit", ""))
         # Prefer rows with lm-eval results
         if key not in seen or (row.get("benchmark_avg") and not seen[key].get("benchmark_avg")):
             seen[key] = row

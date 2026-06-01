@@ -65,15 +65,7 @@ fi
 mkdir -p "${BENCHMARK_LOG_DIR}"
 
 # Derive output paths
-# If input is already an HF dir (has *.safetensors), point at it directly and
-# skip the Megatron-to-HF conversion step. Used for the pretrained baseline.
-if ls "${CHECKPOINT_DIR}"/*.safetensors 1>/dev/null 2>&1; then
-    HF_OUTPUT_DIR="${CHECKPOINT_DIR}"
-    INPUT_IS_HF=1
-else
-    HF_OUTPUT_DIR="${CHECKPOINT_DIR}/hf_converted"
-    INPUT_IS_HF=0
-fi
+HF_OUTPUT_DIR="${CHECKPOINT_DIR}/hf_converted"
 RESULTS_DIR="${CHECKPOINT_DIR}/benchmark_results"
 mkdir -p "${RESULTS_DIR}"
 

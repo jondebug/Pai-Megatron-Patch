@@ -271,12 +271,20 @@ def capture_routing_traces(model_path: str, args) -> List[Dict[int, np.ndarray]]
 
     print(f"\n→ Loading {model_path}")
     tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    import torch as _t
+    ngpu = _t.cuda.device_count()
+    # Balance shards across ALL visible GPUs (device_map="auto" overloads GPU 0
+    # and OOMs on 235B). Cap per-GPU so activations fit.
+    per_gpu = os.environ.get("MAX_MEM_PER_GPU", "70GiB")
+    max_memory = {i: per_gpu for i in range(ngpu)}
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=DTYPE,
         device_map="auto",
+        max_memory=max_memory,
         trust_remote_code=True,
     ).eval()
+    print(f"  loaded across {ngpu} GPUs, max_memory={per_gpu}/gpu")
 
     chunks = _build_dataloader(tok, args)
 

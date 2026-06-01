@@ -1,12 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=cp_vllm_bench
+#SBATCH --job-name=cp_vllm_bench_ep16
 #SBATCH --partition=interactive
 #SBATCH --account=nvr_israel_rlop
-#SBATCH --nodes=1
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
 #SBATCH --time=03:30:00
-#SBATCH --output=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/cp_latency_logs/vllm_bench_%j.out
-#SBATCH --error=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/cp_latency_logs/vllm_bench_%j.err
+#SBATCH --output=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/cp_latency_logs/vllm_bench_ep16_%j.out
+#SBATCH --error=/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/cp_latency_logs/vllm_bench_ep16_%j.err
 
 # =============================================================================
 # CP→Latency End-to-End vLLM Benchmark
@@ -26,7 +27,7 @@ BASELINE_MODEL="${BASELINE_MODEL:-/lustre/fsw/portfolios/nvr/users/jonathanp/rl_
 TRAINED_MODEL="${TRAINED_MODEL:-/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/output_router_finetuning/pareto_g0_c256_ppo_aux0.01_cpb_n1_a0.01_r80/checkpoint/pretrain-mcore-qwen3-moe-megatron-A3B-lr-1e-4-minlr-1e-6-bs-1-gbs-8-seqlen-128-pr-bf16-tp-1-pp-1-cp-1-ac-sel-do-true-sp-true-ti-5000-wi-10/hf_converted_iter2000}"
 BASELINE_NAME="${BASELINE_NAME:-pretrained_cp4780}"
 TRAINED_NAME="${TRAINED_NAME:-r80_iter2000_cp2659}"
-TP_SIZE="${TP_SIZE:-8}"
+TP_SIZE="${TP_SIZE:-16}"
 PROMPT_LENGTHS="${PROMPT_LENGTHS:-256,1024}"
 BATCH_SIZES="${BATCH_SIZES:-1,8,32}"
 MAX_TOKENS="${MAX_TOKENS:-256}"
@@ -51,11 +52,26 @@ echo "Output:         ${OUTPUT_PATH}"
 echo "Start: $(date)"
 echo "============================================================"
 
+# Multi-node coordination (TP=16 spans 2 nodes)
+MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+MASTER_PORT=$(shuf -n 1 -i 30000-50000)
+export MASTER_ADDR MASTER_PORT
+echo "Master: $MASTER_ADDR:$MASTER_PORT"
+
 srun --container-image="${CONTAINER_IMAGE}" \
      --container-mounts="$HOME:$HOME,/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing:/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing" \
      --container-workdir="${SCRIPT_DIR}" \
+     --nodes=2 --ntasks-per-node=1 \
      bash -c "
          set -euo pipefail
+         # Multi-node coords (inner shell needs them)
+         export MASTER_ADDR=\$MASTER_ADDR
+         export MASTER_PORT=\$MASTER_PORT
+         # vLLM Ray multi-node backend
+         export VLLM_USE_RAY_SPMD_WORKER=1
+         # NCCL / RDMA tuning
+         export NCCL_SOCKET_IFNAME=^docker,lo
+         export NCCL_DEBUG=WARN
 
          # Install vLLM if not present. Pin to a Qwen3-MoE-friendly version.
          python3 -c 'import vllm' 2>/dev/null || pip install --quiet 'vllm>=0.7,<0.9' 'transformers>=4.51'

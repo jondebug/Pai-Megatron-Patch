@@ -96,7 +96,7 @@ def _build_engine(model_path: str, args):
         "tensor_parallel_size": args.tp_size,
         "trust_remote_code": True,
         "dtype": "bfloat16",
-        "enforce_eager": False,
+        "enforce_eager": True,
         "max_model_len": max(2048, max(int(s) for s in args.prompt_lengths.split(",")) + args.max_tokens + 64),
         "gpu_memory_utilization": 0.85,
         "seed": args.seed,
