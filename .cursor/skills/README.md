@@ -29,6 +29,23 @@ Hard infrastructure facts the agent must respect:
 - **Always set** `#SBATCH --cpus-per-gpu=2` on new submit scripts (default is ~31 CPUs/GPU which hogs the cluster).
 - **W&B**: entity `nvr-israel`, project `qwen3-router-training`.
 
+### Lustre symlink trap (causes silent job failures)
+
+`/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing` (mounted in
+all containers) is a **symlink** to
+`/lustre/fs12/portfolios/nvr/projects/nvr_israel_scne/users/jonathanp/rl_token_routing`
+(NOT mounted in containers).
+
+Any Python code that writes a manifest/checkpoint/log path with
+`Path(...).resolve()`, `os.path.realpath`, or `Path(...).absolute()` on a
+path under this tree will produce a `/lustre/fs12/...` string. SLURM jobs
+that receive that path will die at start with `FileNotFoundError`.
+
+**Always pass `/lustre/fsw/...` to `sbatch` and into manifests.** Never
+resolve the symlink. The user's shell `pwd` often shows the `/lustre/fs12`
+realpath — use the `/lustre/fsw` form anyway when constructing paths for
+container-bound code.
+
 ## Skill index
 
 | Skill | When to use |
@@ -49,6 +66,7 @@ Hard infrastructure facts the agent must respect:
 | [`training-log-forensics`](training-log-forensics/SKILL.md) | Parse Megatron training logs into per-run comparison tables. |
 | [`training-bug-investigation`](training-bug-investigation/SKILL.md) | Diagnose suspected silent training bugs (5-layer mechanism-vs-outcome checklist). |
 | [`hypothesis-reassessment`](hypothesis-reassessment/SKILL.md) | Re-examine an earlier conclusion when challenged or invalidated by a bug fix. |
+| [`publish-numbers`](publish-numbers/SKILL.md) | Audit + label numbers before putting them in any stakeholder-facing table (doc, slide, chat summary). Catches training-eval-CP-cited-as-inference-CP, limit=1000-vs-full-baseline mismatches, "best cell" cited as average, and projections cited as measurements. |
 
 ## Standard SLURM monitoring pattern
 
@@ -69,3 +87,32 @@ tail -n 200 /lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/<log_dir
 
 If `squeue` / `sacct` hangs (cluster congestion), fall back to tailing the
 `.out` log file directly.
+
+## Cross-cutting lessons learned
+
+- **Do not confuse projections with measurements.** `cp-microbench` projects
+  EP step time from real routing traces + FFN timing, but it is not wall-clock
+  and ignores all-to-all comms. Use `vllm-latency-bench` for measured e2e /
+  TTFT / decode numbers.
+- **For vLLM, inspect the `.out` log even if JSON exists.** One validated run
+  wrote JSON with zeroed e2e/decode fields while the stdout summary contained
+  correct speedups. The `.out` log is authoritative until the serialization
+  path is fixed.
+- **For method comparison plots, draw separate frontiers.** Use CP reduction
+  (%) on x (higher is better), accuracy on y, and separate RL
+  (`rl+aux`/`rl_only`) from non-RL (`aux_only`). Filter out long-horizon
+  outliers (`train_iters > 8000`) unless the plot is explicitly about
+  long training.
+- **235B conversion/training depends on the Megatron checkpoint-load OOM fix.**
+  If 235B OOMs during distributed checkpoint load, don't keep retrying launch
+  flags; verify the submodule contains the SwiGLU/factory-merge
+  `empty_cache()` patch described in `convert-mcore-to-hf`.
+- **Before publishing any number, run the `publish-numbers` audit.** Four
+  recurring failure modes: (1) training-eval CP cited as inference CP for
+  CPB-using runs (they regress on stock HF), (2) limit=1000 trained
+  accuracy compared against the full-dataset pretrained baseline (inflates
+  Δ-acc by ~4 pp), (3) "best cell" cited as average (B1 best was 1.161×,
+  avg-all-cells was 1.064×), (4) projected microbench EP=128 speedup cited
+  as a measurement. When the user asks "are these fictional?", almost
+  always the numbers are real but the labels are missing — fix the labels,
+  do not generate new numbers.

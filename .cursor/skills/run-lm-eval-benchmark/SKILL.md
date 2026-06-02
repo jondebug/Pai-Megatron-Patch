@@ -81,3 +81,51 @@ skipped automatically.
 - Conversion (Step 1) is skipped only if `*.safetensors` exist — partial/failed conversions are detected by the absence of weight files, not config files.
 - `--limit ""` (empty) is treated as "no limit" (full dataset).
 - If `lm_eval` fails with `429`, retry — it's rate-limit, not a bug.
+- **Don't pass `--log_samples`** to `lm_eval` — on Lustre with long checkpoint names it produces `OSError: File name too long` because the sample-log filenames include the full pretrained path.
+- **Manifest paths must be `/lustre/fsw/...`, never `/lustre/fs12/...`.** The container only mounts `/lustre/fsw`. `Path(...).resolve()` silently rewrites to the `/lustre/fs12` real path and the job dies at start with `FileNotFoundError` on the manifest. See `pareto-benchmark` SKILL for details.
+
+## Wallclock budget per checkpoint (30B A3B, 4 GPUs)
+
+| Phase | `--limit 1000` | Full dataset |
+|---|---|---|
+| Megatron→HF conversion | ~100 s | ~100 s |
+| `lm_eval` (hellaswag+arc+winogrande) | 20–30 min | 2.5–3 h |
+| Total | ~30 min | ~3 h |
+
+**Implication for `submit_batch_benchmark.sh`:** with the 4 h SLURM cap,
+full-dataset batches can fit **at most 1, occasionally 2 checkpoints per
+job**. Asking for `--per-job 3` or more with no `--limit` will silently
+drop checkpoints 2+ on TIME LIMIT. Use `--per-job 1` for full runs.
+
+## Output directory naming convention
+
+The batch script writes per-checkpoint result dirs **inside the source
+checkpoint dir** (not in a separate `benchmark_logs/` tree):
+
+| Mode | Path |
+|---|---|
+| `--limit 1000` | `<ckpt_dir>/benchmark_iter<N>_limit1000/` |
+| Full | `<ckpt_dir>/benchmark_iter<N>_full/` |
+| No iter (legacy) | `<ckpt_dir>/benchmark_latest_<limit\|full>/` |
+
+`collect_benchmark_results.py` keys on `(run_name, bench_iteration, limit)`
+so the **same checkpoint can have both** a limit-1000 row and a full row in
+the master CSV — they are not deduplicated against each other. **Never**
+mix them in a single Pareto chart without the `--limit-filter` flag (see
+`generate-pareto-chart`).
+
+## If a batch job hit SLURM TIME LIMIT
+
+The end-of-script auto-call to `collect_benchmark_results.py` does **not**
+run on a TIME LIMIT kill (signal arrives mid-`lm_eval`). Per-checkpoint
+`accuracy_summary.json` files were still written by completed checkpoints.
+
+Recovery:
+
+```bash
+# 1. Aggregate the partial results
+python3 examples/qwen3/benchmarks/collect_benchmark_results.py
+
+# 2. Resubmit — the script auto-skips already-benchmarked checkpoints
+sbatch examples/qwen3/benchmarks/submit_batch_benchmark.sh --manifest <same_manifest>
+```

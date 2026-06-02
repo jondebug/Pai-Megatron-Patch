@@ -56,24 +56,51 @@ Always smoke-test once after pulling a new vLLM container.
 mean/std for `e2e_ms`, `ttft_ms`, `decode_tps`; plus speedup % vs the
 first model.
 
-A reasonable summary print:
+**Important: trust the `.out` log first.** A previous run wrote a JSON file
+with `e2e_ms_mean=0` and `decode_tps_mean=0` even though the stdout summary
+contained valid end-to-end and decode numbers. Always inspect the matching
+`/lustre/.../cp_latency_logs/vllm_*_<JOB_ID>.out` before concluding that only
+TTFT was measured. Treat the JSON as a convenience artifact, not the source of
+truth, until the serialization path is fixed.
+
+A reasonable summary print from the authoritative `.out` file:
 
 ```bash
-python3 -c "
-import json,sys
-d=json.load(open(sys.argv[1]))
-for cell in d['cells']:
-    print(f'plen={cell[\"prompt_len\"]} bs={cell[\"batch_size\"]}')
-    for m in cell['models']:
-        sp = m.get('e2e_speedup_pct'); print(f'  {m[\"name\"]:25s} e2e={m[\"e2e_ms\"]:.1f}ms ttft={m[\"ttft_ms\"]:.1f}ms', f'speedup={sp:+.1f}%' if sp is not None else '(baseline)')
-" /lustre/.../cp_latency_results/vllm_ngc_<TAG>.json
+python3 - /lustre/.../cp_latency_logs/vllm_ngc_<JOB_ID>.out <<'PY'
+import re, sys
+log = sys.argv[1]
+cell = None
+for line in open(log):
+    m = re.match(r"\s*##\s+(plen\d+_bs\d+)", line)
+    if m:
+        cell = m.group(1)
+        print(f"\n{cell}")
+        continue
+    if cell and re.match(r"\s*(pretrained|B1|aux|[A-Za-z0-9_+-]+)", line):
+        parts = line.split()
+        if len(parts) >= 6 and parts[-1].endswith("x"):
+            print("  " + line.strip())
+PY
 ```
 
 ## Validated headline results (30B, EP=8)
 
-- `B1` (RL + aux, no CPB): **+16.1 % e2e** at plen=1024 bs=32, +0.21 pp accuracy.
-- `aux_only`: +11.1 % at the same cell, +0.09 pp.
-- Speedup is largest at moderate prompt length + high batch — both increase per-step expert occupancy and surface the imbalance.
+Source: `cp_latency_logs/vllm_ngc_27853483.out`, not the JSON file.
+
+| Model | Best e2e speedup | Avg e2e speedup over bs≥8 cells | Accuracy delta |
+|---|---:|---:|---:|
+| `B1_rlaux_iter5000` (RL+aux, no CPB) | **1.161×** at plen=1024 bs=32 | **1.094×** (+9.4%) | +0.21 pp |
+| `aux_only_iter1500` | **1.111×** at plen=1024 bs=32 | **1.047×** (+4.7%) | +0.09 pp |
+
+Speedup is largest at moderate prompt length + high batch — both increase
+per-step expert occupancy and surface the imbalance. At bs=1 the effect is
+near zero, so don't summarize only single-request latency.
+
+Before publishing any of these numbers in a doc / table / slide, run the
+**`publish-numbers` checklist** — label the slice ("best cell" vs
+"avg over bs ≥ 8" vs "avg over all 9 cells"), disclose the EP layout, and
+cite the source JSON path. Mixing "best cell" with "average" in the same
+column has caused user pushback before.
 
 ## Gotchas
 
@@ -81,3 +108,6 @@ for cell in d['cells']:
 - Engine load time alone for 235B at TP=8 is ~5 min — budget accordingly.
 - 235B vLLM needs `gpu_memory_utilization` ≈ 0.92 on 8 × 80 GB; the default 0.85 will OOM mid-run.
 - Always sanity-generate a single token before the full benchmark (the script already does this) — catches bad checkpoints fast.
+- If the JSON and `.out` disagree, use the `.out` summary and file a follow-up
+  to fix `cp_vllm_bench.py` serialization. Do **not** tell the user e2e/decode
+  was never measured just because the JSON fields are zero.

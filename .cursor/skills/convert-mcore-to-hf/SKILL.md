@@ -67,6 +67,29 @@ splits the layer stack across 2 nodes, halving the per-GPU peak. Single
 node with TP=8 EP=8 fails with `TP*EP != world_size` (the Megatron
 converter requires this product to equal the actual GPU count).
 
+## 235B checkpoint-load OOM patch
+
+There is a second, separate 235B failure mode: distributed checkpoint load can
+OOM even on the correct 2-node layout. Symptom: OOM during
+`apply_factory_merges` / SwiGLU `torch.cat` while loading sharded tensors,
+with only a few MiB free on each 80 GB GPU.
+
+The working fix lives in the Megatron submodule and should be present before
+running 235B conversion/training:
+
+- `megatron/core/transformer/mlp.py`: copy SwiGLU shards to CPU, clear GPU
+  references, `synchronize()` + `empty_cache()`, concatenate on CPU, then move
+  the result back.
+- `megatron/core/dist_checkpointing/mapping.py`: drain/free CUDA cache after
+  each `ShardedTensorFactory` merge.
+- `megatron/core/dist_checkpointing/serialization.py`: drain/free before the
+  factory merge loop.
+- `megatron/training/training.py`: `empty_cache()` before `load_checkpoint`.
+
+If this patch is absent, do **not** keep retrying with different batch sizes or
+single-node layouts; the failure happens before training/eval starts and needs
+the checkpoint-load memory fix or a newer submodule commit containing it.
+
 ## Gotchas / things that broke before
 
 - **Don't** retry single-node 235B conversion — both OOM and the TP/EP/world_size mismatch are dead ends.

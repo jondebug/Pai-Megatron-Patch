@@ -70,3 +70,104 @@ Open `pareto_accuracy_vs_cp.html` for the chart.
 - **Step 2000 often beats step 3000/5000** for aggressive configs — accuracy degrades with more training when load balancing is too aggressive. Benchmark multiple steps when reporting.
 - The W&B sweep must already be done (`finished`/`crashed` states). Running runs are skipped.
 - `--per-job 1` will hit QOS limits fast on a 23-point Pareto front; always use ≥3.
+- **Filter out over-trained outliers when making method-comparison plots.**
+  One aux-only run trained past 8K iters (`norl_aux0.01_r08`) made the
+  non-RL frontier look stronger than the comparable ≤8K regime. For 30B
+  method plots, use `train_iters <= 8000` unless the point of the plot is
+  explicitly "long training horizon".
+- **Separate RL and non-RL frontiers when explaining method value.** A single
+  unified Pareto front can hide the baseline frontier. For method writeups,
+  plot CP reduction (%) on x (higher is better), accuracy on y, and draw one
+  frontier for `rl+aux`/`rl_only` and one for `aux_only`.
+
+## Per-job sizing: full vs limit (CRITICAL — wallclock budget)
+
+The SLURM `interactive` partition caps jobs at **4 h**. Per-checkpoint cost on
+the 30B A3B model:
+
+| Workload | Conversion (mcore→HF) | lm_eval (3 tasks) | Total per ckpt |
+|---|---|---|---|
+| `--limit 1000` | ~100 s | ~20–30 min | ~30 min |
+| Full dataset (no `--limit`) | ~100 s | ~2.5–3 h | ~3 h |
+
+Practical `--per-job` ceilings (so the job actually finishes within 4 h):
+
+| Mode | Safe `--per-job` |
+|---|---|
+| `--limit 1000` | 5 (default 3 also fine) |
+| Full dataset | **1–2** (≥3 will time out mid-eval) |
+
+If you submit `--per-job 5` with full dataset, only the first 1–2 checkpoints
+complete; the rest are silently dropped on SLURM TIME LIMIT cancellation.
+The end-of-job auto `collect_benchmark_results.py` **never runs** in that
+case — you must call it manually (see below).
+
+## Recovering after a TIME LIMIT kill
+
+When a batch job hits the 4 h wall:
+
+1. `accuracy_summary.json` is written **per checkpoint** as each completes,
+   not at end-of-job. So partially-completed batches still contributed data
+   — just not aggregated.
+2. Run `python3 collect_benchmark_results.py` manually to ingest the
+   completed checkpoints into `benchmark_results.csv`.
+3. The skipped checkpoints will re-submit cleanly: the script's
+   "already-benchmarked" check uses `accuracy_summary.json` existence, so
+   completed ones are auto-skipped and only the unfinished ones run again.
+
+## CRITICAL: never `Path(...).resolve()` manifest paths
+
+The training/benchmark area lives at
+`/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing`, which is a
+**symlink** to
+`/lustre/fs12/portfolios/nvr/projects/nvr_israel_scne/users/jonathanp/rl_token_routing`.
+
+The container only mounts the `/lustre/fsw/...` path. If your submission
+code calls `Path(manifest).resolve()` (which follows symlinks), the
+resulting absolute path will be `/lustre/fs12/...` and inside the
+container the manifest is `FileNotFoundError`.
+
+**Always write manifests with the `/lustre/fsw/...` string and pass that
+verbatim to `sbatch`. Do not `.resolve()`, `os.path.realpath`, or
+`Path.absolute()` on container-bound paths.**
+
+Symptom: job allocates, runs for ~1 s, then `traceback ... FileNotFoundError:
+'/lustre/fs12/portfolios/nvr/projects/nvr_israel_scne/.../manifest.json'`.
+
+When in doubt, translate explicitly:
+
+```python
+def to_fsw(p: str) -> str:
+    return p.replace(
+        '/lustre/fs12/portfolios/nvr/projects/nvr_israel_scne/users/jonathanp/rl_token_routing',
+        '/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing',
+    )
+```
+
+This same trap also bites `checkpoint_dir` paths read from older CSVs that
+were written from the resolved side.
+
+## Snapping eval steps to on-disk checkpoints
+
+`pareto_benchmark.py --step final` reports the W&B `iteration` from the
+run summary, but Megatron only saves at `save_interval` boundaries. For
+crashed/time-killed runs, the last on-disk iter is often slightly **less**
+than the W&B-reported final iteration (e.g. W&B final=2803, on-disk=2949
+because the run resumed and saved past the summary checkpoint; or W&B
+final=3000, on-disk=3000 cleanly).
+
+Before submitting, build the manifest from the **on-disk** max iter:
+
+```python
+import re, os
+def find_latest_iter(ckpt_dir):
+    iters = []
+    for d in os.listdir(ckpt_dir):
+        m = re.match(r'iter_(\d+)$', d)
+        if m and os.path.isdir(os.path.join(ckpt_dir, d)):
+            iters.append(int(m.group(1)))
+    return max(iters) if iters else None
+```
+
+Using this avoids the `pareto_benchmark.py` `--step <N>` mode silently
+skipping runs whose `iter_NNNNNNN/` doesn't exist on disk.

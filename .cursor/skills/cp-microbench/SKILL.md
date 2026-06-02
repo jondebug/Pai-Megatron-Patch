@@ -47,6 +47,13 @@ python3 -c "import json,sys; d=json.load(open(sys.argv[1]));
 
 ## Major finding to remember (don't re-discover)
 
+**Microbench numbers are projections, not wall-clock.** The script captures
+real router traces and measures real FFN kernel timings, then simulates EP
+step time from `max_tokens_on_busiest_GPU`. It does **not** include all-to-all
+dispatch/combine, queueing, scheduler overhead, or vLLM engine effects.
+Use it to compare checkpoint trends and decide what to validate next; use
+`vllm-latency-bench` for measured e2e/TTFT/decode numbers.
+
 **RL + CPB together is the problematic combination**. Models trained with
 both flags show CP **regression** on stock HF inference (no CPB hook),
 because `critical_path_bias` is a `register_buffer(persistent=False)` —
@@ -60,4 +67,5 @@ combination is being benchmarked when interpreting results.
 - `--cpus-per-gpu=2` is mandatory (defaults would eat ~60 CPUs/GPU).
 - The dataset path is sensitive: the script supports Megatron mmap (`.idx`+`.bin` siblings, no extension) and local `.arrow` / `.parquet`. Do **not** rely on `datasets.load_dataset("Salesforce/wikitext")` — older `datasets` in the container chokes on its glob patterns and compute nodes block S3.
 - For 235B, you'll need a converted `hf_converted_iter<N>_cp/` dir first (see `convert-mcore-to-hf`).
-- The `ep_speedup` numbers are projections from FFN kernel timings only — they ignore comms. Use `vllm-latency-bench` for real wall-time.
+- The `ep_speedup` numbers are projections from FFN kernel timings only — they ignore comms. Never cite EP=64/128 values as measured wall-clock.
+- Before any microbench number leaves this file (chat reply, doc, slide), run the `publish-numbers` audit and label the cell **"Projected / simulator"**, never "speedup" or "measured". Per the May 2026 stakeholder-doc doctrine, projections should not appear in the headline summary at all; if a projection is included, it goes in a clearly-separated section.
