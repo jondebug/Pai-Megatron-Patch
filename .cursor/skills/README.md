@@ -107,6 +107,24 @@ If `squeue` / `sacct` hangs (cluster congestion), fall back to tailing the
   If 235B OOMs during distributed checkpoint load, don't keep retrying launch
   flags; verify the submodule contains the SwiGLU/factory-merge
   `empty_cache()` patch described in `convert-mcore-to-hf`.
+- **A "loss term" can be inert even when its log values look healthy.** If
+  a coefficient sweep doesn't move any downstream metric AND the runs with
+  the term enabled completed fewer iters within wallclock than the
+  no-term runs, the "effect" is compute-budget throttling, not the
+  gradient. See `training-bug-investigation` Layer-4.5 for the
+  iter-count-parity diagnostic and the canonical KL example in
+  `hypothesis-reassessment`.
+- **On 235B, "crashed" usually means SLURM wall-time eviction, not failure.**
+  Don't draw conclusions from a sweep with a mix of `finished` and `crashed`
+  runs without resuming the crashed ones first — different training horizons
+  confound CP/LM/accuracy comparisons. See `resume-training-run` and
+  `slurm-wandb-sweep` ("Run-state taxonomy").
+- **When benchmark budget is small (e.g. 2 runs on 235B), pick a
+  matched-CP pair across mechanisms.** Two best-CP runs that share the
+  same mechanism produce an uninformative comparison; one RL run vs one
+  no-RL run at the same (CP, LM) directly tests "does the mechanism
+  matter for downstream accuracy". See `pareto-benchmark` ("Picking a
+  small comparable pair when benchmark budget is tight").
 - **Before publishing any number, run the `publish-numbers` audit.** Four
   recurring failure modes: (1) training-eval CP cited as inference CP for
   CPB-using runs (they regress on stock HF), (2) limit=1000 trained

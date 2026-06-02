@@ -33,8 +33,15 @@ For each finished run, pick:
 If two of these collapse to the same iter, drop the duplicate. Typical
 result: 2–3 unique iters per run, usually 3.
 
-`baseline_CP` is the **pretrained 235B baseline CP** (≈4780 for the 30B
-baseline; benchmark the 235B baseline once and use its eval_crit_path).
+`baseline_CP` is the **pretrained model baseline CP**:
+
+- 30B (Qwen3-30B-A3B): **≈ 4780**
+- 235B (Qwen3-235B-A22B): **≈ 6500** (varies slightly; pull from any
+  iter-1 row in the sweep with `eval_crit_path` to confirm before using).
+
+The 30B and 235B baselines are very different; don't accidentally use the
+30B 4780 number when computing thresholds for a 235B sweep — `i_early`
+will fire for almost every run and the filtering becomes useless.
 
 ## Step-by-step
 

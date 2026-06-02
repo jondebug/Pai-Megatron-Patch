@@ -10,6 +10,16 @@ description: Find Pareto-optimal (CP vs LM-loss) checkpoints from a finished W&B
 A sweep has finished and the user wants accuracy numbers for its
 Pareto-optimal points. Often the second step after `launch-sweep`.
 
+## Two budget regimes — pick differently
+
+- **Plenty of GPU budget** (e.g. 30B, 4-GPU jobs, ≥10 candidates): benchmark
+  the whole Pareto front + a few near-frontier points across multiple iters.
+  Use `pareto_benchmark.py --all` or per-iter loops.
+- **Tight budget** (typical for 235B: 1.5 h × 8-GPU per run, user picks 2–3):
+  see "Picking a small comparable pair when benchmark budget is tight" below
+  before submitting anything. **The choice of which pair to benchmark is at
+  least as important as the choice of iter.**
+
 ## Script
 
 `examples/qwen3/benchmarks/pareto_benchmark.py` — pulls all runs from a
@@ -146,6 +156,58 @@ def to_fsw(p: str) -> str:
 
 This same trap also bites `checkpoint_dir` paths read from older CSVs that
 were written from the resolved side.
+
+## Picking a small comparable pair when benchmark budget is tight
+
+When the user gives you a single-digit benchmark budget (often 2 for 235B, where
+each run is ~1.5 h on 8 GPU), don't auto-pick the top-N-by-CP. The two best
+configs often share the same mechanism and the comparison is uninformative.
+Instead, pick a **matched-CP pair across mechanisms** so the benchmark
+isolates *what's actually responsible* for the downstream accuracy.
+
+Algorithm:
+
+1. From the finished runs in the sweep, find the Pareto-optimal points in
+   (CP, LM) space.
+2. Group them by mechanism: `rl_only` vs `aux_only` vs `rl+aux` vs `cpb_only`
+   vs `rl+aux+cpb` etc. (parse from run name).
+3. Pick a pair `(A, B)` where:
+   - `A.mechanism ≠ B.mechanism`
+   - `|A.cp − B.cp| / max(A.cp, B.cp) < 0.02` (within 2% CP)
+   - `|A.lm − B.lm| < 0.02` (within 0.02 LM)
+   - Both **`finished`**, not `crashed` (different training horizons confound
+     downstream accuracy).
+4. If no pair meets the CP+LM tolerance, prefer the CP match (LM differences
+   <0.05 are within run-to-run noise; CP differences usually aren't).
+
+**Why this works**: matched (CP, LM) controls for the load-balance and quality
+state of the model. Any benchmark gap between A and B is then attributable to
+*how each one got there*, which is the interesting question for the paper.
+
+Worked example (q55w7678, 235B, picking 2 of 8 finished runs):
+
+| Run | Mechanism | CP | LM | iter | Why chosen |
+|---|---|---|---|---|---|
+| `235b-pareto_rlc0.5_c256_ppo_lm1.0_aux0.01_r04` | RL+aux+LM_reward | 6240 | 2.8449 | 1194 | Best CP overall |
+| `235b-pareto_norl_aux0.01_cpb_n1_a0.01_r14` | aux+CPB (no RL) | 6290 | 2.8455 | 1100 | Best non-RL baseline at matched CP/LM |
+
+The 50 CP gap and 0.0006 LM gap are within noise; the **mechanism** is the
+only meaningful difference. Whatever the benchmark gap is, that's the signal.
+
+Don't pick `rlc0.5_aux0.001_r02` (CP=7859) just because it shows the largest
+RL-vs-no-RL gap at *low aux* — you'll measure both "mechanism" and "training
+horizon hit different points" and not be able to attribute. Save the
+low-aux/wide-spread comparison for a separate benchmark pair specifically
+designed to test it.
+
+### Avoid `crashed` runs as benchmark candidates unless absolutely necessary
+
+In a 235B sweep, "crashed" usually means **SLURM wall-time eviction**, not
+training-collapse. The run is fine on disk, but if `iter` < `train_iters`,
+its CP/LM is measured at a different point than `finished` runs and the
+comparison is confounded by training horizon. If you must include a crashed
+run, **resume it first** (see `resume-training-run`) so all runs are at
+the same `train_iters` before benchmarking.
 
 ## Snapping eval steps to on-disk checkpoints
 

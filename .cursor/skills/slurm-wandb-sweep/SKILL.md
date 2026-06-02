@@ -126,6 +126,54 @@ For sanity-checking that training is healthy:
 
 If iter time is 2× higher than expected, suspect either contention with another job on the same node or that `--agents 2 --8gpu` is in effect.
 
+## KL on 235B — defer until hook bug is verified-fixed
+
+The KL gradient on this repo was broken from the start of the work in
+`megatron_patch/template/helper.py`: the hook to capture `current_logits`
+was registered against `model.output_layer` but Megatron training wraps the
+model as `DistributedDataParallel(Float16Module(GPTModel))`, so the attribute
+lookup returned `None` and the hook attached to nothing. The KL loss read
+`current_logits = None` and short-circuited to 0 in the backward graph.
+
+The user-visible effect ("KL improves accuracy +1.7 pp, +500 CP") was
+**entirely a wallclock-budget compute confound**: the reference-model
+forward pass roughly doubled iter time, so KL>0 runs completed ~half as
+many iters within the 4-h SLURM budget. Less training → less CP reduction
+*and* less LM degradation; both axes moved because the run was under-
+trained, not because KL regularized anything.
+
+Implications for sweep design:
+
+- **Until the hook fix is verified end-to-end** (param-grad nonzero on
+  router params, coefficient sweep changes outcome at matched-iter), do not
+  vary KL as a sweep axis on 235B. You pay 2× wallclock per run for an inert
+  regularizer.
+- A non-zero KL on 235B currently behaves as a **wallclock throttle**, not
+  a regularization signal. If that's actually what you want, say so
+  explicitly and disable the rest of the KL machinery.
+- When comparing pre-fix and post-fix runs in the same chart, **always
+  label which side of the fix each run is on**. Numerical comparisons
+  between them are not apples-to-apples.
+
+See `training-bug-investigation` SKILL for the recursive-hook-registration
+fix and Layer-4.5 iter-count parity check.
+
+## Run-state taxonomy (235B in particular)
+
+W&B `state` values on 235B sweeps don't mean what they suggest:
+
+| W&B state | Meaning (235B) |
+|---|---|
+| `finished` | Hit `train_iters`. Compare these freely. |
+| `crashed` | Almost always SLURM 4h wall-time eviction at iter < `train_iters`. **Resume before benchmarking**, otherwise comparisons across runs are horizon-confounded. See `resume-training-run`. |
+| `failed` | Real failure — OOM, NCCL, code error. Inspect the .out log. |
+| `killed` | User `scancel`, usually intentional. |
+
+A "1500-iter sweep" with 8 `finished` and 7 `crashed` is normal — the seven
+crashed runs are time-evicted, not broken. Don't draw conclusions from a
+mixed `finished` + `crashed` table until the crashed ones are resumed to
+their target.
+
 ## Reference
 
 For sweep-config-syntax details (filter semantics, parameter inheritance, etc.) see the `wandb_sweep_config.py` source. The `wandb_agent_runner.py` source documents how the runner builds the CLI command and handles cross-sweep resume.

@@ -79,3 +79,65 @@ challenge received
 update on-disk docs that referenced the stale conclusion
 state updated view with calibrated confidence
 ```
+
+## Worked example — the KL "regularizer" that was actually a compute throttle
+
+This is the canonical instance of all three audit questions firing at once
+on this project.
+
+**Old conclusion (~10 sweeps deep, multiple writeups, several follow-up
+sweep designs depending on it):**
+
+> KL constraint on output logits helps accuracy preservation. With
+> `kl_loss_coeff = 0.001`, accuracy is +1.7 pp higher and CP reduction is
+> ~500 worse than KL=0 — consistent with KL trading some CP-reduction
+> headroom for LM quality.
+
+**Challenge** (user, after a debug session): "I don't think KL has been
+working this whole time. If it has, why does it look like a binary switch?"
+
+**Audit:**
+
+- **Q1 (old runs invalidated?):** Forensics on `helper.py` showed the
+  `current_logits` hook was registered on `model.output_layer`, but the
+  actual training-time model is wrapped as
+  `DistributedDataParallel(Float16Module(GPTModel))`. The attribute lookup
+  returned None and the hook never attached. `current_logits` stayed None,
+  and the KL loss expression short-circuited to a constant. **Every KL>0
+  run in the historical data measured KL with a broken gradient.**
+- **Q2 (confound?):** The reference-model forward pass (run whenever
+  `kl_loss_coeff > 0`) doubled iter time from ~10s to ~22s. On the 4-h
+  SLURM cap, KL>0 runs completed ~700/1500 iters vs ~1500/1500 for KL=0.
+  Less training → less CP reduction and less LM degradation, on both axes
+  simultaneously. **The "KL effect" was wallclock-budget throttling.**
+- **Q3 (reconciling hypothesis?):** "KL>0 runs accidentally implemented
+  an early-stopping regularizer" — fewer iters preserved LM and capped CP
+  gain. Consistent with both the historical data ("KL preserves accuracy")
+  and the post-fix data ("KL coefficient changes nothing at matched iter
+  count"). This is the **only** hypothesis that fits both.
+
+**Updated conclusion (calibrated):**
+
+> The KL gradient on this codebase was broken from the start of the work.
+> Historical "KL on/off" comparisons measure compute-budget throttling, not
+> regularization. Sweep configs that *include* KL >0 as a quality
+> protection are not actually protecting quality via KL — they're under-
+> training. Until the hook fix is end-to-end-verified (Layer 2+4+4.5 in
+> `training-bug-investigation`), do not include KL as a sweep axis on 235B,
+> and re-interpret historical KL>0 runs as "ran for fewer iters than the
+> nominal `train_iters`".
+
+**Invalidated artifacts** (called out explicitly in the writeup, then
+patched):
+
+- `CLAUDE.md` "KL preserves accuracy at +500 CP cost" line
+- Sweep design rationale for `low_cp_dominance_sweep.json` (was hinged on
+  KL=0.001 sweet spot — now meaningless)
+- Cross-sweep aggregation CSVs that include a `kl_coeff` column without an
+  "iters_completed" column — the comparisons are confounded
+
+This example shows why the three-question audit is worth running even
+when the old conclusion *seemed* well-supported by data: the data was
+real, the *interpretation* was confounded, and a single targeted
+diagnostic ("did all runs complete the same iter count?") would have
+caught it at sweep 1 if anyone had thought to look.
