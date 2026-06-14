@@ -18,7 +18,8 @@ a0=my-b*mx
 resid=[y-(a0+b*x) for x,y in zip(xs,ys)]
 rmse=math.sqrt(sum(e*e for e in resid)/n)
 print("FIT acc = %.3f + %.3f*lmloss  (n=%d, RMSE=%.3f pp, max|resid|=%.2f)"%(a0,b,n,rmse,max(abs(e) for e in resid)))
-MARGIN=max(1.5, 3*rmse)   # delete only if predicted-acc is this far BELOW frontier
+import os as _os
+MARGIN=float(_os.environ.get("MARGIN", max(1.5, 3*rmse)))   # delete only if predicted-acc is this far BELOW frontier
 print("delete margin (pp below frontier):",round(MARGIN,2))
 # real frontier (per category) from evaluated CSV points
 pts=collections.defaultdict(list)
@@ -73,6 +74,14 @@ for c,rs in sorted(bycell.items()):
     if all(x[6].startswith("DELETE_far") for x in rs):
         ndel+=1; print("  %-46s iters=%d maxPredAcc=%.2f"%(c[:46],len(rs),max(x[5] for x in rs)))
 print("whole-deletable cells:",ndel,"/",len(bycell))
+with open("/tmp/nrt_delete_cells.txt","w") as fo:
+    for c,rs in sorted(bycell.items()):
+        if all(x[6].startswith("DELETE_far") for x in rs): fo.write(c+"\n")
+print("wrote deletable list -> /tmp/nrt_delete_cells.txt")
+with open("/tmp/nrt_delete_ckpts.txt","w") as fo:
+    for r in rec:
+        if r[6].startswith("DELETE_far"): fo.write("%s,%d\n"%(r[0],r[1]))
+print("wrote per-checkpoint DELETE_far list -> /tmp/nrt_delete_ckpts.txt (%d ckpts)"%sum(1 for r in rec if r[6].startswith("DELETE_far")))
 print("=== cells with a KEEP (near/above frontier) - DO NOT DELETE ===")
 for c,rs in sorted(bycell.items()):
     keeps=[x for x in rs if x[6].startswith("KEEP")]
