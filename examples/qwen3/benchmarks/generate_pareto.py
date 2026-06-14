@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import os
+import re
 from pathlib import Path
 
 
@@ -29,12 +30,19 @@ def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None,
     points = []
     for r in rows:
         avg = float(r.get("benchmark_avg") or "0")
-        cp = float(r.get("eval_crit_path") or "0")
+        # Two mutually-exclusive CP sources, both carried on every point:
+        #   cp_legacy = eval_crit_path     (legacy benchmark method; most-populated -> default)
+        #   cp_canon  = cp_critical_eval   (canonical wandb critical_eval/critical_path)
+        cp_legacy = float(r.get("eval_crit_path") or "0")
+        cp_canon = float(r.get("cp_critical_eval") or "0")
+        cp_legacy = cp_legacy if cp_legacy > 0 else None
+        cp_canon = cp_canon if cp_canon > 0 else None
+        cp = cp_legacy if cp_legacy is not None else cp_canon  # representative (default = legacy)
         if run_name_prefix:
             prefixes = [p.strip() for p in run_name_prefix.split(",")]
             if not any(r.get("run_name","").startswith(p) for p in prefixes):
                 continue
-        if avg <= 0 or cp <= 0 or avg < min_accuracy:
+        if avg <= 0 or cp is None or cp <= 0 or avg < min_accuracy:
             continue
         if limit_filter is not None and limit_filter != "":
             row_limit = r.get("limit", "")
@@ -60,7 +68,7 @@ def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None,
         aux = r.get("aux_enabled") == "True"
         rlc = r.get("rl_loss_coeff", "") or "0"
         auxc = r.get("aux_loss_coeff", "") or "0"
-        iters = r.get("train_iters", "") or "0"
+        iters = r.get("bench_iteration", "") or r.get("train_iters", "") or "0"
         sweep = r.get("sweep_id", "") or ""
         lm_loss = float(r.get("eval_lm_loss") or "0")
         h = float(r.get("hellaswag") or "0")
@@ -117,7 +125,39 @@ def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None,
             if klc:
                 label += " KL={}".format(klc)
 
+        # Reward function: prefer the CSV column, fall back to parsing the run name.
+        reward_type = (r.get("rl_reward_type", "") or "").strip()
+        if not reward_type:
+            if "critical_path" in name:
+                reward_type = "critical_path"
+            elif "topn" in name:
+                reward_type = "per_token_topn_binary"
+            elif "entropy" in name:
+                reward_type = "entropy"
+            elif rl:
+                reward_type = "per_token_load_weighted"
+        reward_short = reward_type.replace("per_token_", "")
+
+        # Gamma (discount factor): no CSV column, parse "_g<num>" / leading "g<num>" from the name.
+        gm = re.search(r"(?:^|_)g([0-9]+(?:\.[0-9]+)?)(?![0-9])", name)
+        gamma = gm.group(1) if gm else "0"
+
+        # PPO baseline type: explicit basecritic/basemean tokens, else a critic-network
+        # signature ("c256" hidden-dims / "crit" prefix) implies a learned critic; default mean.
+        if "basecritic" in name:
+            baseline_type = "critic"
+        elif "basemean" in name:
+            baseline_type = "mean"
+        elif "c256" in name or name.startswith("crit"):
+            baseline_type = "critic"
+        else:
+            baseline_type = "mean"
+
+        def _red(v):
+            return round((BASELINE_CP - v) / BASELINE_CP * 100, 2) if v is not None else None
         cp_red = (BASELINE_CP - cp) / BASELINE_CP * 100
+        x_legacy = _red(cp_legacy)
+        x_canon = _red(cp_canon)
 
         points.append({
             "label": label,
@@ -128,16 +168,23 @@ def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None,
             "iters": int(iters) if iters != "0" else 0,
             "rlc": float(rlc),
             "cp": cp,
+            "cp_legacy": cp_legacy,
+            "cp_canon": cp_canon,
             "lm": lm_loss,
             "h": h if h else None,
             "a": a if a else None,
             "w": w if w else None,
             "acc": avg,
             "x": round(cp_red, 2),
+            "x_legacy": x_legacy,
+            "x_canon": x_canon,
             "y": avg,
             "ppo_k": ppo_k,
             "lm_reward": has_lm,
             "klc": klc,
+            "reward_type": reward_short,
+            "gamma": gamma,
+            "baseline_type": baseline_type,
             "gumbel": has_gumbel,
             "cosine": has_cosine,
             "gae": has_gae,
@@ -172,15 +219,35 @@ def compute_pareto_frontier(points):
 
 def generate_html(points, output_path, y_min_override=None, y_max_override=None):
     cats_for_frontier = ["aux_only", "rl_only", "rl+aux"]
-    frontiers = {}
-    for cat in cats_for_frontier:
-        cat_points = [p for p in points if p["cat"] == cat]
-        if cat_points:
-            frontiers[cat] = compute_pareto_frontier(cat_points)
+
+    # Per-source, per-category Pareto frontiers. Each source uses its own CP/x;
+    # a point only participates in a source's frontier if it HAS that CP value.
+    def frontiers_for(xkey, cpkey):
+        fr = {}
+        for cat in cats_for_frontier:
+            cps = [dict(p, x=p[xkey], cp=p[cpkey]) for p in points
+                   if p["cat"] == cat and p.get(xkey) is not None]
+            if cps:
+                fr[cat] = compute_pareto_frontier(cps)
+        return fr
+    frontiers_by_source = {
+        "legacy": frontiers_for("x_legacy", "cp_legacy"),
+        "canon": frontiers_for("x_canon", "cp_canon"),
+    }
+    # Default = the source populated in (essentially) all rows = the most complete one.
+    n_legacy = sum(1 for p in points if p.get("x_legacy") is not None)
+    n_canon = sum(1 for p in points if p.get("x_canon") is not None)
+    default_source = "legacy" if n_legacy >= n_canon else "canon"
+    frontiers = frontiers_by_source[default_source]  # used for the stdout summary
 
     min_acc = min(p["y"] for p in points)
     y_min = y_min_override if y_min_override is not None else max(30, int(min_acc) - 2)
-    y_max = y_max_override if y_max_override is not None else 66
+    y_max = y_max_override if y_max_override is not None else (int(max(p["y"] for p in points))+2 if points else 78)
+    def _xrange(xkey):
+        xs = [p[xkey] for p in points if p.get(xkey) is not None] or [0]
+        return round(min(xs) - 3, 1), round(max(xs) + 4, 1)
+    xranges = {"legacy": list(_xrange("x_legacy")), "canon": list(_xrange("x_canon"))}
+    x_min, x_max = xranges[default_source]
 
     frontier_colors = {
         "aux_only": "rgba(46,125,50,0.45)",
@@ -218,6 +285,11 @@ def generate_html(points, output_path, y_min_override=None, y_max_override=None)
 <div class="container">
   <h1>Accuracy vs Critical Path Reduction</h1>
   <p class="subtitle">Top-right = best. Hover for details. 3 Pareto frontiers: aux-only, RL-only, RL+aux.</p>
+  <div class="cp-toggle" style="text-align:center;margin-bottom:14px;font-size:0.85em;color:#444;">
+    <b>CP source:</b>
+    <label style="margin:0 8px;cursor:pointer;"><input type="radio" name="cpsrc" value="legacy"> eval_crit_path <span style="color:#888;">(legacy method, {n_legacy} pts)</span></label>
+    <label style="margin:0 8px;cursor:pointer;"><input type="radio" name="cpsrc" value="canon"> cp_critical_eval <span style="color:#888;">(canonical wandb critical_eval, {n_canon} pts)</span></label>
+  </div>
   <div class="chart-wrap"><canvas id="pareto"></canvas></div>
   <div class="notes">
     <b>Baseline CP = {baseline_cp}</b> (pretrained {baseline_label}, no training).<br>
@@ -233,7 +305,9 @@ def generate_html(points, output_path, y_min_override=None, y_max_override=None)
 <script>
 const BASELINE_CP = {baseline_cp};
 const DATA = {data_json};
-const FRONTIERS = {frontiers_json};
+const FRONTIERS_BY_SOURCE = {frontiers_by_source_json};
+const XRANGES = {xranges_json};
+const DEFAULT_SOURCE = {default_source_json};
 
 const STYLES = {{
   pretrained: {{ bg: '#000000', border: '#000', shape: 'star', r: 22 }},
@@ -250,61 +324,72 @@ const LABELS = {{
 const FRONTIER_COLORS = {frontier_colors_json};
 const FRONTIER_LABELS = {frontier_labels_json};
 
-const groups = {{}};
-DATA.forEach(d => {{ (groups[d.cat] = groups[d.cat] || []).push(d); }});
-
-const chartDatasets = [];
-
-// Per-category Pareto frontier lines
-Object.entries(FRONTIERS).forEach(([cat, pts]) => {{
-  chartDatasets.push({{
-    label: FRONTIER_LABELS[cat] || cat + ' Frontier',
-    data: pts,
-    borderColor: FRONTIER_COLORS[cat] || 'rgba(100,100,100,0.3)',
-    borderWidth: 2, borderDash: [8, 4],
-    showLine: true, pointRadius: 0, pointHoverRadius: 0, tension: 0, order: 10,
-  }});
-}});
-
-// Scatter points per category
-Object.entries(groups).forEach(([cat, pts]) => {{
-  const s = STYLES[cat] || STYLES.degraded;
-  chartDatasets.push({{
-    label: LABELS[cat] || cat, data: pts.sort((a,b) => a.x - b.x),
-    backgroundColor: s.bg, borderColor: s.border, pointStyle: s.shape,
-    pointRadius: s.r, pointHoverRadius: s.r + 4, borderWidth: 2,
-    showLine: false, order: cat === 'degraded' ? 5 : 1,
-  }});
-}});
-
 const catClass = {{ pretrained:'c-pre', aux_only:'c-aux', rl_only:'c-rl', 'rl+aux':'c-rla', degraded:'c-bad' }};
 const tbody = document.querySelector('#data-table tbody');
-[...DATA].sort((a,b) => b.acc - a.acc).forEach(d => {{
-  const tr = document.createElement('tr');
-  tr.className = catClass[d.cat] || '';
-  tr.innerHTML =
-    '<td>'+d.label+'</td><td>'+d.cat+'</td><td>'+(d.sweep||'--')+'</td>'
-    +'<td>'+(d.rl?'Y':'N')+'</td><td>'+(d.aux?'Y':'N')+'</td>'
-    +'<td>'+(d.iters||'--')+'</td><td>'+(d.rlc||'--')+'</td><td>'+(d.klc||'--')+'</td>'
-    +'<td>'+d.cp.toFixed(0)+'</td><td>'+d.x.toFixed(1)+'%</td>'
-    +'<td>'+d.lm.toFixed(4)+'</td>'
-    +'<td>'+(d.h!=null?d.h.toFixed(1):'--')+'</td>'
-    +'<td>'+(d.a!=null?d.a.toFixed(1):'--')+'</td>'
-    +'<td>'+(d.w!=null?d.w.toFixed(1):'--')+'</td>'
-    +'<td><b>'+d.acc.toFixed(1)+'%</b></td>';
-  tbody.appendChild(tr);
-}});
 
-new Chart(document.getElementById('pareto').getContext('2d'), {{
+function rebuildTable(active) {{
+  tbody.innerHTML = '';
+  [...active].sort((a,b) => b.acc - a.acc).forEach(d => {{
+    const tr = document.createElement('tr');
+    tr.className = catClass[d.cat] || '';
+    tr.innerHTML =
+      '<td>'+d.label+'</td><td>'+d.cat+'</td><td>'+(d.sweep||'--')+'</td>'
+      +'<td>'+(d.rl?'Y':'N')+'</td><td>'+(d.aux?'Y':'N')+'</td>'
+      +'<td>'+(d.iters||'--')+'</td><td>'+(d.rlc||'--')+'</td><td>'+(d.klc||'--')+'</td>'
+      +'<td>'+d.cp.toFixed(0)+'</td><td>'+d.x.toFixed(1)+'%</td>'
+      +'<td>'+d.lm.toFixed(4)+'</td>'
+      +'<td>'+(d.h!=null?d.h.toFixed(1):'--')+'</td>'
+      +'<td>'+(d.a!=null?d.a.toFixed(1):'--')+'</td>'
+      +'<td>'+(d.w!=null?d.w.toFixed(1):'--')+'</td>'
+      +'<td><b>'+d.acc.toFixed(1)+'%</b></td>';
+    tbody.appendChild(tr);
+  }});
+}}
+
+// Build chart datasets for a given CP source ('legacy' | 'canon'); each point's
+// active .cp/.x is set to that source, and points lacking that source are dropped.
+function buildDatasets(src) {{
+  const useLegacy = src === 'legacy';
+  DATA.forEach(d => {{
+    d.cp = useLegacy ? d.cp_legacy : d.cp_canon;
+    d.x  = useLegacy ? d.x_legacy  : d.x_canon;
+  }});
+  const active = DATA.filter(d => d.x != null && d.cp != null);
+  const groups = {{}};
+  active.forEach(d => {{ (groups[d.cat] = groups[d.cat] || []).push(d); }});
+  const ds = [];
+  const fr = FRONTIERS_BY_SOURCE[src] || {{}};
+  Object.entries(fr).forEach(([cat, pts]) => {{
+    ds.push({{
+      label: FRONTIER_LABELS[cat] || cat + ' Frontier',
+      data: pts,
+      borderColor: FRONTIER_COLORS[cat] || 'rgba(100,100,100,0.3)',
+      borderWidth: 2, borderDash: [8, 4],
+      showLine: true, pointRadius: 0, pointHoverRadius: 0, tension: 0, order: 10,
+    }});
+  }});
+  Object.entries(groups).forEach(([cat, pts]) => {{
+    const s = STYLES[cat] || STYLES.degraded;
+    ds.push({{
+      label: LABELS[cat] || cat, data: pts.slice().sort((a,b) => a.x - b.x),
+      backgroundColor: s.bg, borderColor: s.border, pointStyle: s.shape,
+      pointRadius: s.r, pointHoverRadius: s.r + 4, borderWidth: 2,
+      showLine: false, order: cat === 'degraded' ? 5 : 1,
+    }});
+  }});
+  return {{ ds, active }};
+}}
+
+let chart = new Chart(document.getElementById('pareto').getContext('2d'), {{
   type: 'scatter',
-  data: {{ datasets: chartDatasets }},
+  data: {{ datasets: [] }},
   options: {{
     responsive: true, maintainAspectRatio: true, aspectRatio: 4/3,
     layout: {{ padding: {{ top: 10, right: 20, bottom: 10, left: 10 }} }},
     scales: {{
       x: {{
         title: {{ display: true, text: 'Critical Path Reduction (%)', font: {{ size: 14, weight: 'bold' }} }},
-        min: -10, max: 45, ticks: {{ callback: v => v + '%' }}, grid: {{ color: '#f0f0f0' }},
+        min: {x_min}, max: {x_max}, ticks: {{ callback: v => v + '%' }}, grid: {{ color: '#f0f0f0' }},
       }},
       y: {{
         title: {{ display: true, text: 'Benchmark Accuracy (%)', font: {{ size: 14, weight: 'bold' }} }},
@@ -335,6 +420,9 @@ new Chart(document.getElementById('pareto').getContext('2d'), {{
               'Eval LM Loss:   ' + p.lm.toFixed(4),
               'Train iters:    ' + (p.iters || '--'),
               ...(p.rl ? ['RL coeff:       ' + p.rlc] : []),
+              ...(p.rl ? ['Baseline type:  ' + p.baseline_type] : []),
+              ...(p.rl && p.reward_type ? ['Reward:         ' + p.reward_type] : []),
+              ...(p.rl ? ['Gamma (disc.):  ' + p.gamma] : []),
               ...(p.ppo_k ? ['PPO epochs:     ' + p.ppo_k] : []),
               ...(p.lm_reward ? ['LM reward:      yes'] : []),
               ...(p.klc ? ['KL coeff:       ' + p.klc] : []),
@@ -368,6 +456,21 @@ new Chart(document.getElementById('pareto').getContext('2d'), {{
     }}
   }}]
 }});
+
+// --- CP-source toggle: switch x-axis between the two mutually-exclusive CP columns ---
+function setSource(src) {{
+  const {{ ds, active }} = buildDatasets(src);
+  chart.data.datasets = ds;
+  chart.options.scales.x.min = XRANGES[src][0];
+  chart.options.scales.x.max = XRANGES[src][1];
+  chart.update();
+  rebuildTable(active);
+}}
+document.querySelectorAll('input[name="cpsrc"]').forEach(el => {{
+  el.checked = (el.value === DEFAULT_SOURCE);
+  el.addEventListener('change', e => {{ if (e.target.checked) setSource(e.target.value); }});
+}});
+setSource(DEFAULT_SOURCE);
 </script>
 </body>
 
@@ -378,11 +481,17 @@ new Chart(document.getElementById('pareto').getContext('2d'), {{
         baseline_label=BASELINE_LABEL,
         n_total=len(points),
         data_json=json.dumps(points),
-        frontiers_json=json.dumps(frontiers),
+        frontiers_by_source_json=json.dumps(frontiers_by_source),
+        xranges_json=json.dumps(xranges),
+        default_source_json=json.dumps(default_source),
+        n_legacy=n_legacy,
+        n_canon=n_canon,
         frontier_colors_json=json.dumps(frontier_colors),
         frontier_labels_json=json.dumps(frontier_labels),
         y_min=y_min,
         y_max=y_max,
+        x_min=round(x_min,1),
+        x_max=round(x_max,1),
     )
 
     with open(output_path, "w") as f:
@@ -431,9 +540,9 @@ def ensure_baseline_point(points, csv_path, run_name_prefix=None):
     points.append({
         "label": "Pretrained", "cat": "pretrained", "sweep": "",
         "rl": False, "aux": False, "iters": 0, "rlc": 0.0,
-        "cp": BASELINE_CP, "lm": 0.0,
+        "cp": BASELINE_CP, "cp_legacy": BASELINE_CP, "cp_canon": BASELINE_CP, "lm": 0.0,
         "h": best["h"], "a": best["a"], "w": best["w"],
-        "acc": best["acc"], "x": 0.0, "y": best["acc"],
+        "acc": best["acc"], "x": 0.0, "x_legacy": 0.0, "x_canon": 0.0, "y": best["acc"],
         "ppo_k": "", "lm_reward": False, "klc": "",
         "gumbel": False, "cosine": False, "gae": False,
     })
@@ -480,14 +589,25 @@ def main():
         return
 
     if args.clean:
+        # Keep the UNION of both CP sources' per-category frontiers, so a point that
+        # is Pareto-optimal under either eval_crit_path or cp_critical_eval survives
+        # the toggle. Dominance is evaluated per source using that source's x.
         frontier_set = set()
-        for cat in ["aux_only", "rl_only", "rl+aux"]:
-            cat_points = [p for p in points if p["cat"] == cat]
-            if cat_points:
-                for p in compute_pareto_frontier(cat_points):
-                    frontier_set.add(id(p))
+        for xkey in ("x_legacy", "x_canon"):
+            for cat in ["aux_only", "rl_only", "rl+aux"]:
+                cps = [p for p in points if p["cat"] == cat and p.get(xkey) is not None]
+                for i, pi in enumerate(cps):
+                    dominated = False
+                    for j, pj in enumerate(cps):
+                        if i == j:
+                            continue
+                        if pj[xkey] >= pi[xkey] and pj["y"] >= pi["y"] and (pj[xkey] > pi[xkey] or pj["y"] > pi["y"]):
+                            dominated = True
+                            break
+                    if not dominated:
+                        frontier_set.add(id(pi))
         points = [p for p in points if id(p) in frontier_set or p["cat"] == "pretrained"]
-        print("Clean mode: {} Pareto-optimal points retained".format(len(points)))
+        print("Clean mode: {} Pareto-optimal points retained (union of both CP sources)".format(len(points)))
 
     points = ensure_baseline_point(points, args.csv, run_name_prefix=args.run_name_prefix)
     generate_html(points, args.output, y_min_override=args.y_min, y_max_override=args.y_max)
