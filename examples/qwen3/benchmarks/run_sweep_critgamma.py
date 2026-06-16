@@ -51,10 +51,14 @@ for c,mi in plan["continue"]: print("   cont   %s @%s"%(c[:50],mi))
 for c in plan["inflight"]: print("   inflt  %s"%c[:54])
 for c in plan["fresh"]: print("   fresh  %s"%c[:56])
 if APPLY:
-    out=subprocess.run("squeue -u jonathanp -h -o '%D'",shell=True,capture_output=True,text=True).stdout
-    committed=sum(int(x)*8 for x in out.split() if x.strip().isdigit())
-    nslots=max(0, min(MAX_FRESH, (GPU_CAP-committed)//16))   # each fresh EP=16 run = 16 GPU
-    print("GPU committed=%d cap=%d -> submitting %d of %d pending fresh"%(committed,GPU_CAP,nslots,len(cmds)))
+    Q_CAP=int(os.environ.get("Q_CAP","36"))   # max total queued jobs (matches supervisor CAP)
+    com_nodes=subprocess.run("squeue -u jonathanp -h -t R,PD -o '%D'",shell=True,capture_output=True,text=True).stdout
+    gpus_committed=sum(int(x)*8 for x in com_nodes.split() if x.strip().isdigit())
+    qn=len([l for l in subprocess.run("squeue -u jonathanp -h",shell=True,capture_output=True,text=True).stdout.splitlines() if l.strip()])
+    # gate on COMMITTED (running+pending) GPU so we never queue >GPU_CAP -> SLURM never starts >cap
+    # -> enforce_cap never has to cancel anything. Matches the supervisor's committed-gating.
+    nslots=max(0, min(MAX_FRESH, (GPU_CAP-gpus_committed)//16, Q_CAP-qn))
+    print("GPUs committed=%d (cap %d) | queued=%d (cap %d) -> submitting %d of %d pending fresh"%(gpus_committed,GPU_CAP,qn,Q_CAP,nslots,len(cmds)))
     for cmd in cmds[:nslots]:
         jid=subprocess.run(cmd,shell=True,capture_output=True,text=True).stdout.strip()
         print("  SUBMIT",cmd.split("RUN_NAME=")[1].split()[0][:50],"->",jid)
