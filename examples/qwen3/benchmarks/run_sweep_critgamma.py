@@ -55,10 +55,15 @@ if APPLY:
     com_nodes=subprocess.run("squeue -u jonathanp -h -t R,PD -o '%D'",shell=True,capture_output=True,text=True).stdout
     gpus_committed=sum(int(x)*8 for x in com_nodes.split() if x.strip().isdigit())
     qn=len([l for l in subprocess.run("squeue -u jonathanp -h",shell=True,capture_output=True,text=True).stdout.splitlines() if l.strip()])
-    # gate on COMMITTED (running+pending) GPU so we never queue >GPU_CAP -> SLURM never starts >cap
-    # -> enforce_cap never has to cancel anything. Matches the supervisor's committed-gating.
-    nslots=max(0, min(MAX_FRESH, (GPU_CAP-gpus_committed)//16, Q_CAP-qn))
-    print("GPUs committed=%d (cap %d) | queued=%d (cap %d) -> submitting %d of %d pending fresh"%(gpus_committed,GPU_CAP,qn,Q_CAP,nslots,len(cmds)))
+    # Reserve a committed slice for the sweep: gate on THIS sweep's own committed GPU vs
+    # SWEEP_BUDGET, not total committed. So the sweep always keeps up to SWEEP_BUDGET/16 cells
+    # queued even when continuations fill the rest; CAP-TRIM (which protects cg_g) holds total
+    # committed <= GPU_CAP by trimming non-sweep pending. Result: sweep never starves, never >cap.
+    SWEEP_BUDGET=int(os.environ.get("SWEEP_BUDGET","32"))   # ~2 EP=16 cells reserved for the sweep
+    cg_lines=subprocess.run("squeue -u jonathanp -h -t R,PD -o '%D %j'",shell=True,capture_output=True,text=True).stdout.splitlines()
+    cg_committed=sum(int(l.split()[0])*8 for l in cg_lines if l.strip() and ("cg_g" in l or "235bv14cg" in l))
+    nslots=max(0, min(MAX_FRESH, (SWEEP_BUDGET-cg_committed)//16, Q_CAP-qn))
+    print("sweep committed=%d (budget %d) | total committed=%d | queued=%d -> submitting %d of %d pending"%(cg_committed,SWEEP_BUDGET,gpus_committed,qn,nslots,len(cmds)))
     for cmd in cmds[:nslots]:
         jid=subprocess.run(cmd,shell=True,capture_output=True,text=True).stdout.strip()
         print("  SUBMIT",cmd.split("RUN_NAME=")[1].split()[0][:50],"->",jid)
