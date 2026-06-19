@@ -25,8 +25,8 @@ for r in csv.DictReader(open(B+"/benchmark_results.csv")):
     except: continue
     k=(r["run_name"],it)
     if f(r.get("benchmark_avg"))>0: acc[k]=f(r.get("benchmark_avg"))
-    c=f(r.get("cp_critical_eval")) or f(r.get("eval_crit_path"))
-    if c>1000: cp[k]=c
+    c=f(r.get("cp_critical_eval"))   # CANONICAL CP ONLY (legacy eval_crit_path is stale/unreliable, never used)
+    if c and c>1000: cp[k]=c
 # 3) classify
 eligible=[]; excl_noacc=[]; excl_nocp=[]
 for k in universe:

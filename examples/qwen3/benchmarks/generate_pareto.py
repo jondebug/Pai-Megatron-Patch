@@ -22,8 +22,27 @@ DEFAULT_OUTPUT = SCRIPT_DIR.parent.parent.parent / "pareto_accuracy_vs_cp.html"
 BASELINE_CP = 4780
 BASELINE_LABEL = "Qwen3-30B-A3B"
 
+# Which CSV column / point field drives the accuracy axis. "avg" = mean of all 3.
+METRIC_COLS = {
+    "avg": "benchmark_avg",
+    "hellaswag": "hellaswag",
+    "arc_challenge": "arc_challenge",
+    "winogrande": "winogrande",
+}
+# Per-point field name (load_data stores them as h/a/w; avg lives in "acc").
+METRIC_POINT_FIELD = {
+    "avg": "acc", "hellaswag": "h", "arc_challenge": "a", "winogrande": "w",
+}
+METRIC_AXIS_LABEL = {
+    "avg": "Benchmark Accuracy (avg of HellaSwag/ARC/WinoGrande) (%)",
+    "hellaswag": "HellaSwag acc_norm (%)",
+    "arc_challenge": "ARC-Challenge acc_norm (%)",
+    "winogrande": "WinoGrande acc (%)",
+}
 
-def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None, run_name_prefix=None):
+
+def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None,
+              run_name_prefix=None, metric="avg"):
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(f))
 
@@ -37,12 +56,12 @@ def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None,
         cp_canon = float(r.get("cp_critical_eval") or "0")
         cp_legacy = cp_legacy if cp_legacy > 0 else None
         cp_canon = cp_canon if cp_canon > 0 else None
-        cp = cp_legacy if cp_legacy is not None else cp_canon  # representative (default = legacy)
+        cp = cp_canon  # representative = CANONICAL ONLY (legacy eval_crit_path is stale/unreliable, never used)
         if run_name_prefix:
             prefixes = [p.strip() for p in run_name_prefix.split(",")]
             if not any(r.get("run_name","").startswith(p) for p in prefixes):
                 continue
-        if avg <= 0 or cp is None or cp <= 0 or avg < min_accuracy:
+        if avg <= 0 or cp is None or cp <= 0:
             continue
         if limit_filter is not None and limit_filter != "":
             row_limit = r.get("limit", "")
@@ -74,6 +93,12 @@ def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None,
         h = float(r.get("hellaswag") or "0")
         a = float(r.get("arc_challenge") or "0")
         w = float(r.get("winogrande") or "0")
+
+        # The value that drives the accuracy axis. For a specific benchmark, skip
+        # rows that lack that task's score (0/blank) even if they have an avg.
+        y_val = {"avg": avg, "hellaswag": h, "arc_challenge": a, "winogrande": w}[metric]
+        if y_val <= 0 or y_val < min_accuracy:
+            continue
 
         klc = r.get("kl_loss_coeff", "") or ""
 
@@ -174,11 +199,12 @@ def load_data(csv_path, min_accuracy=0, limit_filter=None, max_train_iters=None,
             "h": h if h else None,
             "a": a if a else None,
             "w": w if w else None,
-            "acc": avg,
+            "avg": avg,
+            "acc": y_val,
             "x": round(cp_red, 2),
             "x_legacy": x_legacy,
             "x_canon": x_canon,
-            "y": avg,
+            "y": y_val,
             "ppo_k": ppo_k,
             "lm_reward": has_lm,
             "klc": klc,
@@ -217,8 +243,13 @@ def compute_pareto_frontier(points):
     return sorted(frontier, key=lambda p: p["x"])
 
 
-def generate_html(points, output_path, y_min_override=None, y_max_override=None):
+def generate_html(points, output_path, y_min_override=None, y_max_override=None, metric="avg"):
     cats_for_frontier = ["aux_only", "rl_only", "rl+aux"]
+    y_axis_label = METRIC_AXIS_LABEL.get(metric, "Benchmark Accuracy (%)")
+    y_metric_label = {
+        "avg": "Benchmark Avg", "hellaswag": "HellaSwag (axis)",
+        "arc_challenge": "ARC-Challenge (axis)", "winogrande": "WinoGrande (axis)",
+    }.get(metric, "Benchmark Avg")
 
     # Per-source, per-category Pareto frontiers. Each source uses its own CP/x;
     # a point only participates in a source's frontier if it HAS that CP value.
@@ -237,7 +268,7 @@ def generate_html(points, output_path, y_min_override=None, y_max_override=None)
     # Default = the source populated in (essentially) all rows = the most complete one.
     n_legacy = sum(1 for p in points if p.get("x_legacy") is not None)
     n_canon = sum(1 for p in points if p.get("x_canon") is not None)
-    default_source = "legacy" if n_legacy >= n_canon else "canon"
+    default_source = "canon"   # CANONICAL ONLY — legacy eval_crit_path is stale/unreliable, never the default
     frontiers = frontiers_by_source[default_source]  # used for the stdout summary
 
     min_acc = min(p["y"] for p in points)
@@ -392,7 +423,7 @@ let chart = new Chart(document.getElementById('pareto').getContext('2d'), {{
         min: {x_min}, max: {x_max}, ticks: {{ callback: v => v + '%' }}, grid: {{ color: '#f0f0f0' }},
       }},
       y: {{
-        title: {{ display: true, text: 'Benchmark Accuracy (%)', font: {{ size: 14, weight: 'bold' }} }},
+        title: {{ display: true, text: '{y_axis_label}', font: {{ size: 14, weight: 'bold' }} }},
         min: {y_min}, max: {y_max}, ticks: {{ callback: v => v.toFixed(0) + '%' }}, grid: {{ color: '#f0f0f0' }},
       }}
     }},
@@ -412,7 +443,7 @@ let chart = new Chart(document.getElementById('pareto').getContext('2d'), {{
           label: ctx => {{
             const p = ctx.raw;
             return [
-              '', 'Benchmark Avg:  ' + p.acc.toFixed(1) + '%',
+              '', '{y_metric_label}:  ' + p.acc.toFixed(1) + '%',
               '  HellaSwag:    ' + (p.h != null ? p.h.toFixed(1)+'%' : '--'),
               '  ARC-Challenge:' + (p.a != null ? p.a.toFixed(1)+'%' : '--'),
               '  WinoGrande:   ' + (p.w != null ? p.w.toFixed(1)+'%' : '--'),
@@ -492,6 +523,8 @@ setSource(DEFAULT_SOURCE);
         y_max=y_max,
         x_min=round(x_min,1),
         x_max=round(x_max,1),
+        y_axis_label=y_axis_label,
+        y_metric_label=y_metric_label,
     )
 
     with open(output_path, "w") as f:
@@ -507,7 +540,7 @@ setSource(DEFAULT_SOURCE);
 
 
 
-def ensure_baseline_point(points, csv_path, run_name_prefix=None):
+def ensure_baseline_point(points, csv_path, run_name_prefix=None, metric="avg"):
     """Guarantee the pretrained baseline is plotted, regardless of limit filter
     or whether its CSV row has an eval_crit_path. The baseline CP is supplied via
     --baseline-cp (BASELINE_CP); its accuracy is read from the highest-accuracy
@@ -522,7 +555,7 @@ def ensure_baseline_point(points, csv_path, run_name_prefix=None):
             if not (nm.startswith("pretrained_235b") or (cat == "pretrained" and "235b" in nm.lower())):
                 continue
             try:
-                acc = float(r.get("benchmark_avg") or 0)
+                acc = float(r.get(METRIC_COLS[metric]) or 0)
             except ValueError:
                 continue
             if acc <= 0:
@@ -572,6 +605,11 @@ def main():
                         help="Label for the baseline shown on the chart")
     parser.add_argument("--y-max", type=float, default=None,
                         help="Y-axis maximum (default: 66)")
+    parser.add_argument("--metric", type=str, default="avg",
+                        choices=list(METRIC_COLS.keys()),
+                        help="Which benchmark drives the accuracy axis. Default 'avg' "
+                             "(mean of all). If not 'avg', the metric name is appended to "
+                             "the output filename (e.g. pareto_235b_hellaswag.html).")
     args = parser.parse_args()
     global BASELINE_CP, BASELINE_LABEL
     BASELINE_CP = args.baseline_cp
@@ -579,8 +617,11 @@ def main():
 
     if args.output.suffix != '.html':
         args.output = args.output.with_suffix('.html')
+    # Append the benchmark name to the filename when a specific metric is selected.
+    if args.metric != "avg":
+        args.output = args.output.with_name("{}_{}.html".format(args.output.stem, args.metric))
 
-    points = load_data(args.csv, args.min_accuracy, limit_filter=args.limit_filter, max_train_iters=args.max_train_iters, run_name_prefix=args.run_name_prefix)
+    points = load_data(args.csv, args.min_accuracy, limit_filter=args.limit_filter, max_train_iters=args.max_train_iters, run_name_prefix=args.run_name_prefix, metric=args.metric)
     print(f"max train iters: {args.max_train_iters}")
     print(f"y-min: {args.y_min}")
     print(f"y-max: {args.y_max}")
@@ -589,11 +630,13 @@ def main():
         return
 
     if args.clean:
-        # Keep the UNION of both CP sources' per-category frontiers, so a point that
-        # is Pareto-optimal under either eval_crit_path or cp_critical_eval survives
-        # the toggle. Dominance is evaluated per source using that source's x.
+        # Keep only points on the CANONICAL (displayed) per-category frontiers.
+        # The chart draws the canonical source only (default_source="canon"); the
+        # legacy eval_crit_path is stale/unreliable and never displayed, so including
+        # legacy-only-optimal points here would leave canon-dominated dots on the
+        # chart and make --clean look "not clean".
         frontier_set = set()
-        for xkey in ("x_legacy", "x_canon"):
+        for xkey in ("x_canon",):
             for cat in ["aux_only", "rl_only", "rl+aux"]:
                 cps = [p for p in points if p["cat"] == cat and p.get(xkey) is not None]
                 for i, pi in enumerate(cps):
@@ -607,10 +650,10 @@ def main():
                     if not dominated:
                         frontier_set.add(id(pi))
         points = [p for p in points if id(p) in frontier_set or p["cat"] == "pretrained"]
-        print("Clean mode: {} Pareto-optimal points retained (union of both CP sources)".format(len(points)))
+        print("Clean mode: {} Pareto-optimal points retained (canonical CP source)".format(len(points)))
 
-    points = ensure_baseline_point(points, args.csv, run_name_prefix=args.run_name_prefix)
-    generate_html(points, args.output, y_min_override=args.y_min, y_max_override=args.y_max)
+    points = ensure_baseline_point(points, args.csv, run_name_prefix=args.run_name_prefix, metric=args.metric)
+    generate_html(points, args.output, y_min_override=args.y_min, y_max_override=args.y_max, metric=args.metric)
 
 
 if __name__ == "__main__":
