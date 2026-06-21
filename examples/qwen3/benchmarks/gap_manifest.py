@@ -22,6 +22,13 @@ BCSV=os.path.join(ROOT,"Pai-Megatron-Patch/examples/qwen3/benchmarks/benchmark_r
 TCSV=os.path.join(ROOT,"Pai-Megatron-Patch/examples/qwen3/benchmarks/training_results.csv")
 OUT=os.environ.get("OUTDIR","/tmp")
 DROP={"235bv2","235bv2p","235bv7","235bv7r"}   # abandoned/superseded early sweeps (user-approved)
+COLLAPSED={  # rlc1xgamma cells w/ confirmed router collapse (acc<72, degrade w/ training); see CELL_BACKLOG.md
+ "235bv14cg_rlc1_aux0.005_basecritic_g0.3_r1","235bv14cg_rlc1_aux0.008_basecritic_g0.3_r1",
+ "235bv14cg_rlc1_aux0.012_basecritic_g0.3_r1","235bv14cg_rlc1_aux0.016_basecritic_g0.3_r1",
+ "235bv14cg_rlc1_aux0.02_basecritic_g0.3_r1","235bv14cg_rlc1_aux0.008_basecritic_g0.5_r1",
+ "235bv14cg_rlc1_aux0.012_basecritic_g0.5_r1","235bv14cg_rlc1_aux0.016_basecritic_g0.5_r1",
+ "235bv14cg_rlc1_aux0.02_basecritic_g0.5_r1"}
+
 FLOOR=1500
 TOL=60          # off-grid label drift: an eval within +-TOL of an on-disk iter counts as that ckpt
 REWARDS=("critical_path","per_token_load_weighted","per_token","topn","entropy")
@@ -46,6 +53,14 @@ for kl in (0.0001,0.001,0.01):
         for (rlc,aux) in ((0.5,0.001),(1.0,0.005),(1.0,0.02)):
             c="235bv15klcg_rlc%s_aux%s_basecritic_g%s_kl%s_r1"%(g(rlc),g(aux),g(gm),g(kl))
             PLANNED[c]=dict(BASELINE="critic",GAMMA=g(gm),RLC=g(rlc),AUX=g(aux),KL=g(kl),LM="0",
+                            REWARD_TYPE="per_token_load_weighted")
+# v16cgr: low-rlc x gamma CORRECTIVE probe -- tests whether reducing rlc stabilizes gamma>0
+# (rlc1xgamma collapsed; lr was fixed at 1e-4 across the whole v14cg grid). 8 cells.
+for gm in (0.3,0.5):
+    for rlc in (0.1,0.25):
+        for aux in (0.001,0.003):
+            c="235bv16cgr_rlc%s_aux%s_basecritic_g%s_r1"%(g(rlc),g(aux),g(gm))
+            PLANNED[c]=dict(BASELINE="critic",GAMMA=g(gm),RLC=g(rlc),AUX=g(aux),KL="0",LM="0",
                             REWARD_TYPE="per_token_load_weighted")
 
 def gen(n):
@@ -116,6 +131,7 @@ covered=set(r["sig"] for r in recs if r["fr"])
 
 def cat(r):
     if r["gen"] in DROP: return "DROP"
+    if r["c"] in COLLAPSED: return "DROP"   # collapsed rlc1xgamma cells: stop auto-continuing
     if r["fr"]: return "DONE"
     if r["sig"] in covered and r["m"]<3000: return "COVERED"        # config reached fruition elsewhere
     if r["m"]==0:
