@@ -1259,3 +1259,4 @@ pretrained_235b,,,pretrained,False,False,1500,,,,0,0,8800.0,,85.92,65.53,78.77,7
 235bv15klcg_rlc1_aux0.02_basecritic_g0.5_kl0.01_r1,1134,,rl+aux,True,True,1134,per_token_load_weighted,1,0.02,0.01,,,,,,,,,cponly,,cp_stub,,,,,,5096.9,extrap,73.03,train_proxy(rmse1.76)
 235bv15klcg_rlc1_aux0.02_basecritic_g0_kl0.0001_r1,1000,,rl+aux,True,True,1000,per_token_load_weighted,1,0.02,0.0001,,,,,,,,,cponly,,cp_stub,,,,,,5053.5,exact,72.83,train_proxy(rmse1.76)
 235bv15klcg_rlc1_aux0.02_basecritic_g0_kl0.0001_r1,1136,,rl+aux,True,True,1136,per_token_load_weighted,1,0.02,0.0001,,,,,,,,,cponly,,cp_stub,,,,,,5053.5,extrap,74.25,train_proxy(rmse1.76)
+235bv14cg_rlc1_aux0.02_basecritic_g0.3_r1,2000,,,,,2000,,,,,,,,,,,,,cponly,,cp_stub,,,,,,4782.7,exact,69.37,train_proxy(rmse1.76)
