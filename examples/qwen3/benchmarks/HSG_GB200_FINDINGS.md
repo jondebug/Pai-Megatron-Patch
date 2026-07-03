@@ -174,3 +174,23 @@ Under `examples/qwen3/benchmarks/`:
 - [Ray on SLURM deployment docs](https://docs.ray.io/en/latest/cluster/vms/user-guides/community/slurm.html)
 - [CoreWeave: Topology/Block Scheduling in Slurm](https://docs.coreweave.com/products/sunk/optimize_workloads/topology-scheduling)
 - [Microsoft: AI Infrastructure Preflight at User Space](https://techcommunity.microsoft.com/blog/azurehighperformancecomputingblog/ai-infrastructure-preflight-at-user-space-validating-multi-node-multi-gpu-slurm-/4522284)
+
+## §7 Complete EP scaling ladder (added 2026-07-03)
+
+Decode plen=256 max_tokens=16 (matches ORD Phase C), pretrained vs r15_router_swap delta:
+
+| bs | ORD H100 EP=64 | HSG EP=8 | HSG EP=16 | HSG EP=32 | HSG EP=64 |
+|---|---|---|---|---|---|
+| 512  | +15.13% hurts | +2.91% hurts | +2.43% hurts | **-10.45% wins** | -6.50% wins |
+| 2048 | +0.57% ns    | –            | +5.22% hurts | **-22.66% wins** | +9.37% hurts |
+| 8192 | -11.67% helps| –            | -0.34% ns    | -1.87% ns    | +4.09% hurts |
+
+**Sweet spot on GB200 = EP=32** where CP-RL delivers 10-22% improvements at bs=512-2048.
+
+Notable shifts vs H100:
+- Win regime moved from high-bs (ORD H100 EP=64) to low-bs (HSG GB200 EP=32).
+- HSG EP=64 partially reverses EP=32 gains at bs=2048/8192.
+- At bs=512, r15rs helps on GB200 at both EP=32 (-10.45%) and EP=64 (-6.5%), whereas it HURT badly on ORD H100 EP=64 (+15.13%).
+- The EP=64 pattern on GB200 vs ORD is nearly a mirror image at bs=512.
+
+The multi-node Ray+vLLM launcher that made this measurement possible required 6 iterations to get working; final v5/v6 uses hostname --ip-address, --include-dashboard=false, Ray-native worker port range 10002-19999, per-node RAY_TMPDIR, shared-Lustre HEAD_IP broadcast, and worker-side ray-start retry loop.
