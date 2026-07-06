@@ -194,3 +194,83 @@ Notable shifts vs H100:
 - The EP=64 pattern on GB200 vs ORD is nearly a mirror image at bs=512.
 
 The multi-node Ray+vLLM launcher that made this measurement possible required 6 iterations to get working; final v5/v6 uses hostname --ip-address, --include-dashboard=false, Ray-native worker port range 10002-19999, per-node RAY_TMPDIR, shared-Lustre HEAD_IP broadcast, and worker-side ray-start retry loop.
+
+
+---
+
+# 2026-07-06 addendum: full-campaign verdict, noise analysis, and mechanism study
+
+Supersedes the per-cell claims earlier in this document.
+
+## §A Final verdict
+
+**CP-reducing router RL does not change vLLM e2e latency on GB200 beyond ±2%, at any
+EP ∈ {8,16,32,64}, batch size ∈ {1..512}, prefill or decode.** Per-cell e2e deltas from
+this campaign must not be quoted: the measurement noise structure (§B) produces sorted
+per-cell extremes of ±7-9% from null data, and the mechanism study (§C) shows the
+CP→compute-time hypothesis is not merely unconfirmed but inverted.
+
+Campaign coverage: 32 router-swap cells + 6 full-weight checkpoints (r15, r63, r1_i2018,
+r1_i2577, r23_i3000, r03_i3000; each 118/118 shards on HSG), A/B'd against pretrained in
+the same job at EP=8/16/32/64, prefill (plen=8192, bs=1,4,16,32) and decode (plen=256,
+bs=64,512), logged separately for swap vs full.
+
+## §B Noise analysis (why per-cell e2e claims died)
+
+Two controlled tests using the full-weight duplicates (same routers as the swap dirs):
+
+1. **Duplicate disagreement.** Same nominal weights measured twice:
+   - r1_i2018 @ EP16 bs32: swap +28.0% vs full +0.0% (28pp apart)
+   - r23_i3000 @ EP16 bs32: swap +22.1% vs full +2.4%
+   - r1_i2577 @ EP16 bs32: swap +12.6% vs full −2.6%
+   At EP=32 duplicates agree to ~1pp — the methodology is clean mid-range and broken at
+   the bs extremes.
+2. **Cross-EP sign flips of the apparent "winners":** r1_i2779 −7.3%@EP16 → +2.7%@EP32;
+   r05 +4.7%@EP16 → −9.0%@EP32; aux0.01_i1524 +4.4%@EP16 → −7.1%@EP32.
+
+Noise structure: bs=4-16 prefill repeatable to ±1-2pp; bs=1 and bs=32 carry one-sided
+straggler spikes (up to +92% on a single cell); decode bs=64 shows a uniform **+1.3%
+order bias** (the fine-tune is always measured second in the engine session); decode
+bs=512 swings ±10-20%. EP=64 is quietest (2 experts/GPU quantizes routing shifts away).
+
+## §C Mechanism study: per-rank kernel timing (nsys v3 + SPORK)
+
+Since e2e cannot resolve ≤2%, we measured the mechanism directly: per-rank expert-FFN
+kernel time from worker-side Nsight traces (method: `SPORK_METHODS.md`), 3-cell CP
+ladder at EP=32, 8 nodes, prefill (bs=1,16) and decode (bs=64,512), each A/B'd vs
+pretrained in-session. Jobs 4129251-56; per-step values normalized by AllReduce count;
+mean over 7 worker ranks:
+
+| cell | CP cut (train) | regime | Δ MoE-FFN kernel time/step | busiest-rank FFN |
+|------|------|---------|---------------------------|------------------|
+| r05_i3000 | ~57% | decode  | **+32.8%** | 1273→1463 ms |
+| r05_i3000 | ~57% | prefill | **+14.6%** | 1194→1371 ms |
+| r15       | ~47% | decode  | +2.4%  | ~flat |
+| r15       | ~47% | prefill | +4.9%  | ~flat |
+| r46_i3000 | control | decode  | −0.4% | flat |
+| r46_i3000 | control | prefill | −0.1% | flat |
+
+Findings:
+
+1. **CP reduction does not reduce per-rank FFN time; the most aggressive cut increases
+   it.** Flattening the routing distributes tokens more evenly across each rank's 4
+   experts → smaller per-expert grouped-GEMM tiles → worse GEMM efficiency. The
+   busiest-rank FFN time never dropped for any CP-cut cell.
+2. **Why e2e is insensitive: MoE-FFN kernel time is ~1% of NCCL kernel time at EP=32**
+   (moe/nccl = 0.97-1.59% across all six runs; NCCL includes barrier/late-arrival spin).
+   Even r05's +33% FFN shift is ~0.3% of the comms-dominated step — invisible in e2e.
+   Dominant collective is `AllReduce_Sum_bf16` (TP-AR); no all-to-all appears in vLLM
+   serving traces, consistent with the ORD A100 findings.
+3. r46_i3000 — the largest apparent e2e "hurter" (+12.7% median at EP=32) — is exactly
+   flat in kernel time, confirming its e2e number was allocation noise.
+
+## §D Provenance
+
+- e2e JSONs: `cp_latency_results/hsg_*swap|full_{prefill,decode}_ep{8,16,32,64}_*.json`
+- Ladder traces: `cp_latency_results/nsys_v3_{r05_i3000,r15,r46_i3000}_{prefill,decode}_ep32_41292*/`
+- SPORK reports: `spork_ladder_out/<job>/bulk_report.{html,xlsx}`; splits:
+  `ladder_ffn_results.json`
+- Scripts: `hsg_scripts/hsg_run_nsys_ab_v3.sh`, `hsg_scripts/analyze_ladder_ffn.py`
+- Known residual gaps at write time: EP=64 retries in queue for r05 swap prefill,
+  r63 full, r03_i3000 full (all other EP=64 cells complete: 27/28 prefill, 28/28 decode
+  swap; 4/6 full).
