@@ -27,7 +27,10 @@ COLLAPSED={  # rlc1xgamma cells w/ confirmed router collapse (acc<72, degrade w/
  "235bv14cg_rlc1_aux0.012_basecritic_g0.3_r1","235bv14cg_rlc1_aux0.016_basecritic_g0.3_r1",
  "235bv14cg_rlc1_aux0.02_basecritic_g0.3_r1","235bv14cg_rlc1_aux0.008_basecritic_g0.5_r1",
  "235bv14cg_rlc1_aux0.012_basecritic_g0.5_r1","235bv14cg_rlc1_aux0.016_basecritic_g0.5_r1",
- "235bv14cg_rlc1_aux0.02_basecritic_g0.5_r1"}
+ "235bv14cg_rlc1_aux0.02_basecritic_g0.5_r1",
+ # triage 2026-07-01: latest real eval acc<70 (collapsed) -> do not continue
+ "235bv5b_rlc1.0_aux0.005_basecritic_r73","235bv11e16_critical_path_rlc0.5_aux0.01_stoch",
+ "235bv11e16_topn_load_rlc0.5_aux0.01_stoch"}
 
 FLOOR=1500
 TOL=60          # off-grid label drift: an eval within +-TOL of an on-disk iter counts as that ckpt
@@ -62,6 +65,11 @@ for gm in (0.3,0.5):
             c="235bv16cgr_rlc%s_aux%s_basecritic_g%s_r1"%(g(rlc),g(aux),g(gm))
             PLANNED[c]=dict(BASELINE="critic",GAMMA=g(gm),RLC=g(rlc),AUX=g(aux),KL="0",LM="0",
                             REWARD_TYPE="per_token_load_weighted")
+# seed-replication of the corner-dominating config (76.37@8179, 2026-07-01): confirm across seeds
+for sd in ("2027","2028"):
+    c="235bv15klcg_rlc0.5_aux0.001_basecritic_g0_kl0.001_seed%s_r1"%sd
+    PLANNED[c]=dict(BASELINE="critic",GAMMA="0",RLC="0.5",AUX="0.001",KL="0.001",LM="0",
+                    REWARD_TYPE="per_token_load_weighted",SEED=sd)
 
 def gen(n):
     m=re.match(r"(235bv[0-9]+[a-z]*)",n); return m.group(1) if m else None
@@ -146,10 +154,17 @@ B=defaultdict(list)
 for r in recs: B[cat(r)].append(r)
 
 # ---------- emit ----------
+def _prio(c):  # campaign 2026-07-01: P1 frontier-critical first, then grids, then legacy
+    if c.startswith("235bv15klcg_rlc0.5"): return 0
+    if c.startswith("235bv16cgr"): return 1
+    if "seed202" in c: return 0
+    if c.startswith("235bv15klcg"): return 2
+    if c.startswith("235bv14cg"): return 3
+    return 9
 with open(os.path.join(OUT,"gap_cont.txt"),"w") as f:
-    for r in sorted(B["CONT"],key=lambda r:r["c"]): f.write(r["c"]+"\n")
+    for r in sorted(B["CONT"],key=lambda r:(_prio(r["c"]),r["c"])): f.write(r["c"]+"\n")
 with open(os.path.join(OUT,"gap_fresh.txt"),"w") as f:
-    for r in sorted(B["NEVER"],key=lambda r:r["c"]):
+    for r in sorted(B["NEVER"],key=lambda r:(_prio(r["c"]),r["c"])):
         e=fresh_env(r["c"]); e["RUN_NAME"]=r["c"]
         kv=" ".join("%s=%s"%(k,e[k]) for k in ("RUN_NAME","BASELINE","GAMMA","RLC","AUX","KL","LM","REWARD_TYPE"))
         f.write(r["c"]+"|"+kv+"\n")
