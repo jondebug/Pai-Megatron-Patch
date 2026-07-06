@@ -69,7 +69,15 @@ lr/rlc is effectively too hot → collapse. So "γ is a dead end" is **not yet a
 
 ---
 
-## v16cgr — corrective sweep (SCHEDULED 2026-06-21)
+## v16cgr — corrective sweep (CONCLUDED 2026-07-06) ✅ HYPOTHESIS CONFIRMED
+
+**Verdict:** at rlc=0.1, both γ0.3 and γ0.5 are fully stable 1500→3000 (75.3–76.2, zero collapse) —
+the v14cg rlc1×γ collapse was an effective-step-size artifact. **New frontier point:**
+`rlc0.1_aux0.003_g0.3 @2961 = 75.90 @ CP6090` (dominates r75 75.68@6130 & 75.77@6501, mid-CP +0.22pp).
+High end: 76.21@7970 (aux0.001 g0.3 @1500) ties v14cg-g0.8 within 0.01pp. γ+critic at low rlc is a
+productive direction. rlc0.25 arm evals pending. Follow-ups: γ0.8×rlc0.1 probe; low-LR arm still open.
+
+### (original plan, 2026-06-21)
 
 Hypothesis: **reducing rlc stabilizes γ>0.** Grid = γ{0.3,0.5} × rlc{0.1,0.25} × aux{0.001,0.003},
 basecritic, fixed lr=1e-4. 8 cells, fresh-start 0→1500, then supervisor continues→3000 + evals.
