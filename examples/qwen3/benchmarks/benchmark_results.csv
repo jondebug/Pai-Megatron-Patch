@@ -1387,4 +1387,4 @@ pretrained_235b,,,pretrained,False,False,1500,,,,0,0,8800.0,,85.92,65.53,78.77,7
 235bv16cgr_rlc0.25_aux0.003_basecritic_g0.3_r1,2500,,rl+aux,True,True,2500,per_token_load_weighted,0.25,0.003,,,,,,,,,,cponly,,cp_stub,,,,,,6294.5,interp,72.74,train_proxy(rmse1.80)
 235bv16cgr_rlc0.25_aux0.003_basecritic_g0.5_r1,2418,,rl+aux,True,True,2418,per_token_load_weighted,0.25,0.003,,,,,,,,,,cponly,,cp_stub,,,,,,6355.3,exact,74.22,train_proxy(rmse1.80)
 235bv16cgr_rlc0.25_aux0.003_basecritic_g0.5_r1,2500,,rl+aux,True,True,2500,per_token_load_weighted,0.25,0.003,,,,,,,,,,cponly,,cp_stub,,,,,,6306.8,interp,72.72,train_proxy(rmse1.80)
-235bv16cgr_rlc0.1_aux0.001_basecritic_g0.3_r1,2500,,,,,2500,,,,,,,,,,,,,cponly,,cp_stub,,,,,,7559.8,interp,72.99,train_proxy(rmse1.80)
+235bv16cgr_rlc0.1_aux0.001_basecritic_g0.3_r1,2500,,rl+aux,True,True,2500,per_token_load_weighted,0.1,0.001,,,,,,,,,,cponly,,cp_stub,,,,,,7559.8,interp,72.99,train_proxy(rmse1.80)
