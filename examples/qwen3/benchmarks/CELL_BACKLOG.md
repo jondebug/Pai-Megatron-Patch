@@ -86,6 +86,18 @@ Registered in `gap_manifest.PLANNED`; launcher `run_sweep_v16cgr.py`.
 
 ---
 
+## v17g — gamma-interaction grid (REGISTERED 2026-07-07, prio 2.5)
+
+Now that gamma is stabilized at low rlc (v16cgr), sweep gamma against every relevant dimension at the
+stable operating point. 14 net-new cells (2 mean-gamma0 controls COVERED by v5a r00 / v5b r44):
+- **A baseline:** mean x gamma{0.3,0.5} x aux{0.001,0.003} @rlc0.1 (4) — was only ever tested at rlc>=0.5 where it diverged
+- **B reward-type:** {critical_path, topn_load, entropy} x gamma{0,0.5} @rlc0.1 aux0.003 critic (6)
+- **C gamma0.8 low-rlc:** rlc0.1 x aux{0.001,0.003} critic (2)
+- **F KL x gamma0.3:** 76.37-config+g0.3, and rlc0.1+aux0.003+kl0.001+g0.3 (2)
+- **E LR x gamma (BLOCKED on plumbing):** policy-lr {5e-5,2e-5} x gamma{0,0.5} — the main --lr is not
+  yet an env knob in submit_fresh_corner_ep16.sh / continue parser; plumb PLR + _plr name token first.
+Supervisor fresh-starts these from gap_fresh.txt (priority 2.5: after v15klcg arms, before v14cg completion).
+
 ## Open backlog — queued / not yet launched
 
 1. **Low-LR arm of the γ fix** — QUEUED. γ{0.3,0.5} at policy lr {5e-5, 2e-5} (rlc held). Needs the

@@ -70,6 +70,29 @@ for sd in ("2027","2028"):
     c="235bv15klcg_rlc0.5_aux0.001_basecritic_g0_kl0.001_seed%s_r1"%sd
     PLANNED[c]=dict(BASELINE="critic",GAMMA="0",RLC="0.5",AUX="0.001",KL="0.001",LM="0",
                     REWARD_TYPE="per_token_load_weighted",SEED=sd)
+# v17g: gamma-interaction grid at the STABLE low-rlc operating point (user 2026-07-07).
+# A) baseline mean-vs-critic x gamma (mean+gamma was only ever tested at rlc>=0.5 where it diverged)
+for gm in ("0","0.3","0.5"):
+    for aux in ("0.001","0.003"):
+        c="235bv17g_rlc0.1_aux%s_basemean_g%s_r1"%(aux,gm)
+        PLANNED[c]=dict(BASELINE="mean",GAMMA=gm,RLC="0.1",AUX=aux,KL="0",LM="0",
+                        REWARD_TYPE="per_token_load_weighted")
+# B) reward-type x gamma (all rewards were gamma0-only or rlc1-collapsed)
+for rw in ("critical_path","topn_load","entropy"):
+    for gm in ("0","0.5"):
+        c="235bv17g_rlc0.1_aux0.003_basecritic_g%s_rwd%s_r1"%(gm,rw)
+        PLANNED[c]=dict(BASELINE="critic",GAMMA=gm,RLC="0.1",AUX="0.003",KL="0",LM="0",
+                        REWARD_TYPE=rw)
+# C) gamma0.8 at low rlc (0.8 was stable+frontier at rlc0.5; probe rlc0.1)
+for aux in ("0.001","0.003"):
+    c="235bv17g_rlc0.1_aux%s_basecritic_g0.8_r1"%aux
+    PLANNED[c]=dict(BASELINE="critic",GAMMA="0.8",RLC="0.1",AUX=aux,KL="0",LM="0",
+                    REWARD_TYPE="per_token_load_weighted")
+# F) KL x gamma0.3 (v15klcg covered gamma {0,0.5}; marry the two frontier configs)
+for (rlc,aux) in (("0.5","0.001"),("0.1","0.003")):
+    c="235bv17g_rlc%s_aux%s_basecritic_g0.3_kl0.001_r1"%(rlc,aux)
+    PLANNED[c]=dict(BASELINE="critic",GAMMA="0.3",RLC=rlc,AUX=aux,KL="0.001",LM="0",
+                    REWARD_TYPE="per_token_load_weighted")
 
 def gen(n):
     m=re.match(r"(235bv[0-9]+[a-z]*)",n); return m.group(1) if m else None
@@ -159,6 +182,7 @@ def _prio(c):  # campaign 2026-07-01: P1 frontier-critical first, then grids, th
     if c.startswith("235bv16cgr"): return 1
     if "seed202" in c: return 0
     if c.startswith("235bv15klcg"): return 2
+    if c.startswith("235bv17g"): return 2.5
     if c.startswith("235bv14cg"): return 3
     return 9
 with open(os.path.join(OUT,"gap_cont.txt"),"w") as f:
