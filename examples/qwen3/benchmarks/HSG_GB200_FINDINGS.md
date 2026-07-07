@@ -293,3 +293,15 @@ re-analysis of §C shows busiest-GPU MoE time is pinned identical pre-vs-cell (e
 381 ms); r05s +33% was the *mean* rising as flattened routing lifted formerly-light GPUs
 to the busiest ones fixed-cost floor. Above-knee EP=64 prefill-heavy ladder (jobs
 4227653-55) pending as the decisive busiest-GPU test.
+
+## §F 2026-07-07: NCCL protocol investigation (why comms looks high)
+
+Trace inventory showed 100% of AllReduce time on RING_LL (no NVLS/Simple), even for 64MB
+prefill ARs. Root cause: NCCL collectives captured inside CUDA graphs are restricted to
+LL-family protocols. Eager-mode test (job 4232428, NCCL_DEBUG=INFO) proves the fabric is
+healthy — "NVLS multicast support available (24 ch)", channels "via P2P/MNNVL" — and that
+graphs are still net 4x faster e2e (TTFT bs=1: 36ms graphed vs 149ms eager; launch
+overhead >> AR bandwidth loss). Conclusion: campaign config was correct for serving; the
+40-45% exposed prefill comms is partly LL-limited AR inside graphs. Optimization frontier:
+in-graph NVLS / symmetric-memory AR (vLLM SymmMem reports world size 64 unsupported today)
+could recover a large share of exposed prefill comms — likely worth more than router RL.
