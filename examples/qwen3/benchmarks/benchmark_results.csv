@@ -1446,4 +1446,4 @@ pretrained_235b,,,pretrained,False,False,1500,,,,0,0,8800.0,,85.92,65.53,78.77,7
 235bv15klcg_rlc0.5_aux0.001_basecritic_g0_kl0.001_seed2028_r1,2000,,rl+aux,True,True,2000,per_token_load_weighted,0.5,0.001,0.001,,,,,,,,,cponly,,cp_stub,,,,,,8455.9,exact,74.54,train_proxy(rmse1.78)
 235bv15klcg_rlc0.5_aux0.001_basecritic_g0_kl0.001_seed2028_r1,2095,,rl+aux,True,True,2095,per_token_load_weighted,0.5,0.001,0.001,,,,,,,,,cponly,,cp_stub,,,,,,8423.8,interp,74.77,train_proxy(rmse1.78)
 235bv15klcg_rlc0.5_aux0.001_basecritic_g0_kl0.01_r1,3000,,rl+aux,True,True,3000,per_token_load_weighted,0.5,0.001,0.01,,,,,,,,,cponly,,cp_stub,,,,,,7807.6,exact,75.85,train_proxy(rmse1.78)
-235bv17g_rlc0.1_aux0.001_basecritic_g0.8_r1,500,,,,,500,,,,,,,,,,,,,cponly,,cp_stub,,,,,,9076.3,extrap,74.18,train_proxy(rmse1.78)
+235bv17g_rlc0.1_aux0.001_basecritic_g0.8_r1,500,,rl+aux,True,True,500,per_token_load_weighted,0.1,0.001,,,,,,,,,,cponly,,cp_stub,,,,,,9076.3,extrap,74.18,train_proxy(rmse1.78)
