@@ -274,3 +274,22 @@ Findings:
 - Known residual gaps at write time: EP=64 retries in queue for r05 swap prefill,
   r63 full, r03_i3000 full (all other EP=64 cells complete: 27/28 prefill, 28/28 decode
   swap; 4/6 full).
+
+## §E 2026-07-07 correction: wall-clock exposure split (per-GPU interval unions)
+
+The §C kernel-time ratios overstated NCCL share (late-arrival spin + graph-capture ARs +
+4-GPU node sums). Interval-union analysis within the steady bench burst only
+(`hsg_scripts/analyze_exposure.py`, job 4231396) gives the true per-GPU wall split at EP=32:
+
+| regime | compute | exposed comms | idle (host-bound) |
+|---|---|---|---|
+| prefill | ~2% | 40-45% | ~55% |
+| decode  | 3-9% | 15-32% | 60-81% |
+
+Corrected narrative: exposed comms remains 5-20x compute (FFN deltas stay second-order),
+but the FIRST-order limiter at these batch sizes is host-side idle — GPU waiting on
+scheduling/launch between steps — which no routing change can affect. Also, per-GPU
+re-analysis of §C shows busiest-GPU MoE time is pinned identical pre-vs-cell (e.g. 381 vs
+381 ms); r05s +33% was the *mean* rising as flattened routing lifted formerly-light GPUs
+to the busiest ones fixed-cost floor. Above-knee EP=64 prefill-heavy ladder (jobs
+4227653-55) pending as the decisive busiest-GPU test.
