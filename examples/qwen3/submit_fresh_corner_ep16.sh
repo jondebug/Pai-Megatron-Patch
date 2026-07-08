@@ -33,6 +33,7 @@ GAMMA="${GAMMA:-0}"
 RL_TRAIN_ITERS="${RL_TRAIN_ITERS:-1500}"
 SEED="${SEED:-1234}"   # Megatron default is 1234; vary per multi-seed cell.
 BASELINE="${BASELINE:-mean}"
+USE_RL="${USE_RL:-1}"      # 0 -> aux-only (no RL flags at all; v18s seed baseline)
 PLR="${PLR:-1e-4}"       # policy learning rate (v17g LR arm); min-lr scales /100
 PMINLR="${PMINLR:-1e-6}"   # mean (REINFORCE-with-mean-baseline) or critic (learned value head).
                                # critic args below are inert under mean, used under critic.
@@ -60,6 +61,18 @@ echo "LOAD (fresh): $PRETRAIN_CKPT"
 echo "Master: $MASTER_ADDR:$MASTER_PORT   Start: $(date)"
 echo "============================================================"
 
+# RL flag block (omitted entirely for aux-only cells)
+if [ "$USE_RL" = "1" ]; then
+  RL_FLAGS="--use_rl_loss --rl-normalize-rewards --rl-use-ema-loads --rl-ppo-reeval \
+    --rl-algorithm ppo --rl-loss-coeff $RLC --rl-ppo-entropy-coeff 0.01 \
+    --rl-ppo-baseline-type $BASELINE --rl-critic-hidden-dims 256 --rl-critic-lr 1e-3 \
+    --rl-reward-type $REWARD_TYPE --rl-reward-topn 2 --rl-discount-factor $GAMMA \
+    --rl-gae-lambda 1.0 --rl-ppo-epochs 1 --rl-ppo-extra-lr 0.0001 \
+    --rl-lm-reward-coeff $LM"
+else
+  RL_FLAGS=""
+fi
+
 srun --container-image="$CONTAINER_IMAGE" \
      --container-mounts="$HOME:$HOME,/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing:/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing" \
      --container-workdir="$WORKDIR" \
@@ -78,17 +91,7 @@ srun --container-image="$CONTAINER_IMAGE" \
          cd $WORKDIR
          sh run_mcore_qwen3.sh dlc A22B 1 16 $PLR $PMINLR 128 128 bf16 1 1 1 1 16 true true true false sel false $RL_TRAIN_ITERS \\
            $DATASET_PATH $DATASET_PATH $PRETRAIN_CKPT 1024000 10240 $TARGET_RUN_DIR \\
-           --router-only-training --enable-wandb-logging --use_rl_loss \\
-           --rl-normalize-rewards --rl-use-ema-loads --rl-ppo-reeval \\
-           --ckpt-assume-constant-structure --ckpt-fully-parallel-save \\
-           --wandb-project-name qwen3-router-training \\
-           --wandb-run-name $RUN_NAME \\
-           --rl-algorithm ppo --rl-loss-coeff $RLC --rl-ppo-entropy-coeff 0.01 \\
-           --rl-ppo-baseline-type $BASELINE --rl-critic-hidden-dims 256 --rl-critic-lr 1e-3 \\
-           --seed $SEED \\
-           --rl-reward-type $REWARD_TYPE --rl-reward-topn 2 --rl-discount-factor $GAMMA \\
-           --rl-gae-lambda 1.0 --rl-ppo-epochs 1 --rl-ppo-extra-lr 0.0001 \\
-           --rl-lm-reward-coeff $LM --kl-loss-coeff $KL \\
+           --router-only-training --enable-wandb-logging $RL_FLAGS --kl-loss-coeff $KL \\
            --moe-aux-loss-coeff $AUX \\
            --exit-duration-in-mins 230 --train-iters $RL_TRAIN_ITERS \\
            --save-interval 500 --eval-interval 200 --eval-iters 50 \\

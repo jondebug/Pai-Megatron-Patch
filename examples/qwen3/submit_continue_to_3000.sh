@@ -180,7 +180,7 @@ fi
 if [[ "$CELL_NAME" =~ _g([0-9.]+) ]]; then RL_DISCOUNT_FACTOR="${BASH_REMATCH[1]}"; fi
 
 # norl baseline: aux-only
-if [[ "$CELL_NAME" == 235bv5a_norl_aux* ]]; then
+if [[ "$CELL_NAME" == *norl* ]]; then   # generalized 2026-07-08 (v18s aux-seed cells)
     USE_RL_LOSS=false
     if [[ "$CELL_NAME" =~ _aux([0-9.]+)_r ]]; then
         AUX_COEFF="${BASH_REMATCH[1]}"

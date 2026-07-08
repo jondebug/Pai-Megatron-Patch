@@ -99,6 +99,12 @@ for plr in ("5e-5","2e-5"):
         c="235bv17g_rlc0.25_aux0.001_basecritic_g%s_plr%s_r1"%(gm,plr)
         PLANNED[c]=dict(BASELINE="critic",GAMMA=gm,RLC="0.25",AUX="0.001",KL="0",LM="0",
                         REWARD_TYPE="per_token_load_weighted",PLR=plr)
+# v18s: aux-only SEED replication (user 2026-07-08): n=3 at the aux corner + frontier aux points
+for aux,seeds in (("0.001",("2027","2028")),("0.02",("2027","2028")),("0.005",("2027",)),("0.015",("2027",))):
+    for sd in seeds:
+        c="235bv18s_norl_aux%s_seed%s_r1"%(aux,sd)
+        PLANNED[c]=dict(USE_RL="0",RLC="0",AUX=aux,KL="0",LM="0",GAMMA="0",BASELINE="mean",
+                        REWARD_TYPE="per_token_load_weighted",SEED=sd)
 
 def gen(n):
     m=re.match(r"(235bv[0-9]+[a-z]*)",n); return m.group(1) if m else None
@@ -153,7 +159,8 @@ def feats(c):
 def sig(c):
     rw,rlc,aux,kl,gm,base=feats(c)
     plr=(re.search(r"_plr([0-9.e-]+)",c).group(1) if re.search(r"_plr([0-9.e-]+)",c) else "1e-4")
-    return (rw,rlc,aux,kl,gm,base,plr)   # plr in sig so LR-arm cells are not COVERED by lr-1e-4 twins
+    sd=(re.search(r"_seed([0-9]+)",c).group(1) if re.search(r"_seed([0-9]+)",c) else "1234")
+    return (rw,rlc,aux,kl,gm,base,plr,sd)  # plr+seed in sig: replication cells are not COVERED by twins
 def fresh_env(c):
     if c in PLANNED: return dict(PLANNED[c])
     rw,rlc,aux,kl,gm,base=feats(c)
@@ -174,9 +181,10 @@ def cat(r):
     if r["fr"]: return "DONE"
     if r["sig"] in covered and r["m"]<3000: return "COVERED"        # config reached fruition elsewhere
     if r["m"]==0:
-        if is_norl(r["c"]): return "NORL_NEVER"                     # needs a no-RL fresh-start path
-        rlc=fresh_env(r["c"])["RLC"]
-        if rlc in ("0","0.0"): return "NEEDS_MANUAL"                # RL cell but rlc/aux not in name
+        if is_norl(r["c"]) and r["c"] not in PLANNED: return "NORL_NEVER"  # legacy norl w/o env; PLANNED norl cells carry USE_RL=0 and are auto-startable
+        env=fresh_env(r["c"])
+        if env.get("USE_RL")=="0": return "NEVER"                   # aux-only PLANNED cell (launcher supports USE_RL=0)
+        if env["RLC"] in ("0","0.0"): return "NEEDS_MANUAL"         # RL cell but rlc/aux not in name
         return "NEVER"
     if r["m"]<3000: return "CONT"
     return "EVAL"
@@ -188,6 +196,7 @@ for r in recs: B[cat(r)].append(r)
 def _prio(c):  # campaign 2026-07-01: P1 frontier-critical first, then grids, then legacy
     if c.startswith("235bv15klcg_rlc0.5"): return 0
     if c.startswith("235bv16cgr"): return 1
+    if c.startswith("235bv18s"): return 1
     if "seed202" in c: return 0
     if c.startswith("235bv15klcg"): return 2
     if c.startswith("235bv17g"): return 2.5
