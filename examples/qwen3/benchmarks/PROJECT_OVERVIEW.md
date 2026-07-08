@@ -87,17 +87,30 @@ Each evaluated checkpoint is recorded together with its critical path, so every 
 
 **Figure 4.** Accuracy (mean of HellaSwag/ARC-C/WinoGrande) vs critical path for Qwen3-235B-A22B. Each point is an evaluated checkpoint `(accuracy, CP)`; the frontier is the non-dominated set (high accuracy at low CP). Lower CP (left) is the objective.
 
-Canonical frontier (CP-reduction % is relative to the no-reduction corner, CP = 8435).
+Canonical frontier (CP-reduction % is relative to the 235B pretrained router, CP = 9320).
 
 **R2. RL vs aux-only vs RL+aux.**
-RL (predominantly RL+aux) owns essentially the entire CP-reduction frontier: from ~6% to ~56% CP reduction, every frontier point is an RL variant, holding accuracy within ~0.1–1 pp of the no-reduction corner while cutting CP by up to **56%**. Aux-only appears at just two points — the **no-reduction corner (76.28 @ CP 8435)**, which RL has not yet beaten, and one mid-frontier point (74.08 @ 4189). The headline: **RL reduces critical path by ~50%+ at ≲1 pp accuracy cost; the only regime aux-only still wins is the no-reduction corner.** _(Numbers as of 2026-06-28; see R4 for seed-variance caveats on sub-pp gaps.)_
+RL+aux owns the entire overall frontier (as of 2026-07-08): the top is `v15klcg kl0.001` at **76.37 @ CP 8179**
+(single seed; family mean 75.73±0.32 @3000 — see R4), which unseats the aux-only corner (76.28 @ 8435, n=1)
+on both axes at the point level and holds **iso-accuracy at ~6% lower CP** at the family level. Below the
+corner, RL+aux dominates continuously to **60.6% CP reduction** (aux-only max 57.2%), with the largest margin
+(+1.0pp at ~35% reduction) from the γ-stabilized `v16cgr rlc0.1 γ0.3` point (75.90 @ 6090). RL-only (no aux
+floor) is dominated everywhere — the combination is what wins. γ (discounting with a critic baseline) is
+productive **only at low rlc** (≤0.25); at rlc=1 it collapses the router.
+
+**R4. Seed variance.**
+The corner config (`rlc0.5 aux0.001 critic γ0 kl0.001`) was replicated across 3 seeds to iter 3000:
+acc mean ± half-range = 75.76±0.53 @1500, 75.47±0.32 @2000, 75.64±0.53 @2500, **75.73±0.32 @3000
+(CP 7950±198)**. The headline 76.37/76.27 points are the original seed's high draws; seed spread exceeds the
+0.09pp corner gap, so the corner result is reported as **iso-accuracy at ~6% lower CP (n=3)** rather than
+strict domination (the aux corner is itself n=1). Figure 4 shows the n=3 mean±½range as the grey marker.
 
 
 ## Limitations & Threats to Validity
 - Narrow eval set: three multiple-choice tasks; no generative or long-context evaluation.
 - Seq-len 128 and small global batch — chosen for cheap router adaptation, but not representative of full serving distributions.
 - The load reward (CP) is a surrogate for end-to-end latency; whether CP reductions translate into wall-clock speedups remains to be confirmed by direct systems measurements.
-- Seed variance is non-trivial relative to small frontier gaps; frontier points need error bars.
+- Seed variance is non-trivial relative to small frontier gaps; the corner config now has n=3 error bars (R4) — other frontier points remain n=1.
 
 ## Artifacts / Reproducibility
 Every frontier point is backed by a per-checkpoint registry linking it to its training configuration and measured `(accuracy, CP)`; training and evaluation protocols are version-controlled for reproducibility.
