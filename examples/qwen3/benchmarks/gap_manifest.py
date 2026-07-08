@@ -207,7 +207,8 @@ with open(os.path.join(OUT,"gap_cont.txt"),"w") as f:
 with open(os.path.join(OUT,"gap_fresh.txt"),"w") as f:
     for r in sorted(B["NEVER"],key=lambda r:(_prio(r["c"]),r["c"])):
         e=fresh_env(r["c"]); e["RUN_NAME"]=r["c"]
-        kv=" ".join("%s=%s"%(k,e[k]) for k in ("RUN_NAME","BASELINE","GAMMA","RLC","AUX","KL","LM","REWARD_TYPE"))
+        # emit ALL env keys (2026-07-08 fix): the fixed tuple dropped SEED/USE_RL/PLR silently
+        kv=" ".join("%s=%s"%(k,e[k]) for k in ["RUN_NAME"]+sorted(k for k in e if k!="RUN_NAME"))
         f.write(r["c"]+"|"+kv+"\n")
 with open(os.path.join(OUT,"gap_eval.txt"),"w") as f:
     for r in recs:

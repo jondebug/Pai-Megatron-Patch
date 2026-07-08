@@ -91,7 +91,7 @@ srun --container-image="$CONTAINER_IMAGE" \
          cd $WORKDIR
          sh run_mcore_qwen3.sh dlc A22B 1 16 $PLR $PMINLR 128 128 bf16 1 1 1 1 16 true true true false sel false $RL_TRAIN_ITERS \\
            $DATASET_PATH $DATASET_PATH $PRETRAIN_CKPT 1024000 10240 $TARGET_RUN_DIR \\
-           --router-only-training --enable-wandb-logging $RL_FLAGS --kl-loss-coeff $KL \\
+           --router-only-training --enable-wandb-logging --seed $SEED $RL_FLAGS --kl-loss-coeff $KL \\
            --moe-aux-loss-coeff $AUX \\
            --exit-duration-in-mins 230 --train-iters $RL_TRAIN_ITERS \\
            --save-interval 500 --eval-interval 200 --eval-iters 50 \\
