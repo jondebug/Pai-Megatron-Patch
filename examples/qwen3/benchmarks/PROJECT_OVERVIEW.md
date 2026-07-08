@@ -98,8 +98,12 @@ corner, RL+aux dominates continuously to **60.6% CP reduction** (aux-only max 57
 floor) is dominated everywhere — the combination is what wins. γ (discounting with a critic baseline) is
 productive **only at low rlc** (≤0.25); at rlc=1 it collapses the router.
 
-**R4. Seed variance.**
-The corner config (`rlc0.5 aux0.001 critic γ0 kl0.001`) was replicated across 3 seeds to iter 3000:
+**R4. Replication variance.**
+The corner config (`rlc0.5 aux0.001 critic γ0 kl0.001`) was replicated with 3 independent runs to iter
+3000. *(Correction 2026-07-08: a submission bug meant all three runs used the same seed (1234) — these
+bars measure **run-to-run training nondeterminism** at fixed seed, a lower bound on seed variance.
+True distinct-seed replicas (seeds 3027/3028) and aux-only seed replicas (v18s) are training now.)*
+Family stats:
 acc mean ± half-range = 75.76±0.53 @1500, 75.47±0.32 @2000, 75.64±0.53 @2500, **75.73±0.32 @3000
 (CP 7950±198)**. The headline 76.37/76.27 points are the original seed's high draws; seed spread exceeds the
 0.09pp corner gap, so the corner result is reported as **iso-accuracy at ~6% lower CP (n=3)** rather than

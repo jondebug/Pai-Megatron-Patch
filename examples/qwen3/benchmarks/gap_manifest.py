@@ -65,6 +65,12 @@ for gm in (0.3,0.5):
             c="235bv16cgr_rlc%s_aux%s_basecritic_g%s_r1"%(g(rlc),g(aux),g(gm))
             PLANNED[c]=dict(BASELINE="critic",GAMMA=g(gm),RLC=g(rlc),AUX=g(aux),KL="0",LM="0",
                             REWARD_TYPE="per_token_load_weighted")
+# TRUE-seed replicas (2026-07-08): seed2027/2028 cells actually ran seed=1234 (emitter bug) —
+# they are same-seed replication runs. These get real distinct seeds now that SEED propagates.
+for sd in ("3027","3028"):
+    c="235bv15klcg_rlc0.5_aux0.001_basecritic_g0_kl0.001_seed%s_r1"%sd
+    PLANNED[c]=dict(BASELINE="critic",GAMMA="0",RLC="0.5",AUX="0.001",KL="0.001",LM="0",
+                    REWARD_TYPE="per_token_load_weighted",SEED=sd)
 # seed-replication of the corner-dominating config (76.37@8179, 2026-07-01): confirm across seeds
 for sd in ("2027","2028"):
     c="235bv15klcg_rlc0.5_aux0.001_basecritic_g0_kl0.001_seed%s_r1"%sd
