@@ -349,3 +349,17 @@ not supported" for symm-mem is by design — supported TP is {2,4,6,8}; (4) the 
 serving geometry is a TP<=8 clique + EP/DP (TEP4 pattern, validated internally with
 symm-mem AR under graphs on NCCL 2.30.1). Diagnostic rule for future trace work: check
 blockX, never kernel names, for NCCL algo attribution. NCCL 2.28→2.30 upgrade recommended.
+
+## §I 2026-07-08: confirmatory analyses (late-arrival A/B, TEP4)
+
+Cross-rank AR core/late-arrival analysis (Nemotron-study methodology, intra-node 4-GPU
+matching, job 4273809): r05 @ EP=64 above-knee shows a small late-arrival reduction
+(25.4→24.1%), directionally consistent with its −50% busiest-GPU FFN, but no ladder
+dose-response — intra-node matching covers only 4/64 EP ranks so the global straggler is
+mostly invisible; inconclusive. TEP4 production shape (TP=4×DP=4, naive a2a, decode, job
+4273578): r15 −1.9% at bs=32, inside the −2.8% A/A order bias — null. Key transferable
+insight from the Nemotron Ultra comms study: a2a traffic ratio AG+RS/HybridEP = EP/topK →
+for Qwen3-235B (topK=8) token-routing dispatch/combine wins from EP=8 up, so CP-balance
+relevance is broad for low-topK models once a working MNNVL dispatch backend (hybrid_ep)
+is available. Full cross-rank straggler measurement needs global-clock instance matching
+across all EP ranks (their end-time alignment method, ~15-28µs skew) — future work.
