@@ -305,3 +305,31 @@ overhead >> AR bandwidth loss). Conclusion: campaign config was correct for serv
 40-45% exposed prefill comms is partly LL-limited AR inside graphs. Optimization frontier:
 in-graph NVLS / symmetric-memory AR (vLLM SymmMem reports world size 64 unsupported today)
 could recover a large share of exposed prefill comms — likely worth more than router RL.
+
+## §G 2026-07-08: dispatch/combine (a2a) EP study + EP=64 above-knee mechanism
+
+**Above-knee mechanism (EP=64 prefill-heavy, bs=16/32, jobs 4227653-55)**: r05 (~57% CP cut)
+delivers a real compute win — mean MoE-FFN −33% (1405→937ms), busiest-GPU −50% (483→240ms),
+uniform across 15 nodes. The CP→compute conversion exists exactly in the regime theory
+predicts (above GEMM knee, 2 experts/GPU). r15/r46 heavy windows show composition artifacts
+(pending validation); NCCL time unchanged, so in TP-AR serving this win never reaches e2e.
+
+**a2a e2e study (DP=16×TP=1, EP=16, working backend inventory)**:
+upstream DeepEP HT/LL both crash on GB200 MNNVL (deep_ep.cpp:226 invalid resource handle —
+KNOWN upstream limitation per inference team; fix = hybrid_ep fork/container, not present in
+our container). flashinfer_nvlink_one_sided requires nvfp4; two_sided crashes on bf16
+(NoneType .dim). Only "naive" torch a2a works.
+
+naive-a2a decode initially showed r15 −2.6/−3.3% (both bs, reproduced) — but the 3-cell
+ladder had NO dose-response (control r46 −5.1/−3.5% > r15 > r05 −1.6/+0.9), and the A/A
+NULL TEST (pretrained vs itself, job 4271554) shows −2.82% at bs/rank=4: pure order bias
+(second model reuses warm torchinductor/lustre caches). At bs/rank=32 the null is clean
+(+0.02%) and the ladder spread there is cross-allocation noise.
+
+**Final e2e verdict stands and extends: no demonstrated CP-RL e2e win in ANY tested
+config** (TP-AR at EP 8-64; naive-a2a at DP=16), bounded ≲2-3% after artifact control.
+The mechanism-level FFN win is real but reaches e2e only if (a) serving uses
+load-proportional optimized a2a (hybrid_ep / nvfp4+flashinfer — blocked on container),
+and (b) the step is not host/comms dominated. Open follow-ups: hybrid_ep container
+(deci_handoff, owner I. Rosenfeld Rauch), nvfp4 quantized serving, EPLB comparison
+(placement rebalancing may capture the same balance win with zero retraining).
