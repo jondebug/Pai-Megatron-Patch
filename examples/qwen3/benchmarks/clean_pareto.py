@@ -32,11 +32,16 @@ for k in ("aux","rl-only","rl+aux"):
     col,mk,lab=style[k]
     plt.plot(xs,ys,marker=mk,color=col,lw=2,ms=7,label="%s (%d pts)"%(lab,len(fr)))
 plt.scatter([0],[BASE_ACC],marker="*",s=320,color="black",zorder=5,label="Qwen3-235B-A22B pretrained")
+# seed-variability bar: the 76.37-config family, n=3 seeds @3000 (mean 75.73 +- 0.32 acc, CP 7950 +- 198)
+_sx=(BASE_CP-7950.0)/BASE_CP*100; _sxe=198.0/BASE_CP*100
+plt.errorbar([_sx],[75.73],yerr=[0.32],xerr=[_sxe],fmt="s",color="dimgray",ms=6,capsize=4,zorder=4,
+             label="corner config, n=3 seeds @3000 (mean±½range)")
 plt.annotate("pretrained\n%.1f%% acc, CP=%.0f (0%% reduction)"%(BASE_ACC,BASE_CP),(0,BASE_ACC),
              textcoords="offset points",xytext=(12,-8),fontsize=8)
 plt.xlabel("Critical Path Reduction (%)  vs 235B pretrained (CP=9320)")
 plt.ylabel("Benchmark Accuracy (%)  (HellaSwag/ARC-C/WinoGrande mean)")
 plt.title("Qwen3-235B-A22B: Accuracy vs Critical-Path Reduction — per-class Pareto frontiers")
+plt.ylim(72.0, 77.2)   # explicit floor at 72 (frontier min 72.12); no dead padding below
 plt.grid(alpha=0.3); plt.legend(loc="lower left", fontsize=9)
 plt.tight_layout(); plt.savefig(B+"/pareto_235b_clean.png",dpi=150)
 print("wrote pareto_235b_clean.png")
