@@ -64,29 +64,26 @@ if [ ! -d "$CELL_DIR" ]; then
     echo "ERROR: cell dir does not exist: $CELL_DIR" >&2
     exit 2
 fi
-if [ ! -d "$LOAD_PATH" ]; then
-    echo "ERROR: load path does not exist: $LOAD_PATH" >&2
+# RELAXED VALIDATION (2026-07-01): the ti-1500 seed may have been legitimately pruned by disk
+# cleanup AFTER the cell moved on — if the ti-3000 save root already holds iter_* checkpoints,
+# resume from there and do NOT require the ti-1500 seed to still exist.
+mkdir -p "$CELL_CKPT_ROOT"
+TI3000_OK=0
+ls -d "$CELL_CKPT_ROOT"/iter_* >/dev/null 2>&1 && TI3000_OK=1
+LATEST_ITER=""
+if [ -d "$LOAD_PATH" ] && [ -f "$LOAD_PATH/latest_checkpointed_iteration.txt" ]; then
+    LATEST_ITER=$(tr -d '[:space:]' < "$LOAD_PATH/latest_checkpointed_iteration.txt")
+    ITER_DIR=$(printf "%s/iter_%07d" "$LOAD_PATH" "$LATEST_ITER")
+    NUM_DISTCP=0; [ -d "$ITER_DIR" ] && NUM_DISTCP=$(find "$ITER_DIR" -maxdepth 1 -name '*.distcp' | wc -l)
+else
+    ITER_DIR=""; NUM_DISTCP=0
+fi
+if [ "$NUM_DISTCP" -lt 1 ] && [ "$TI3000_OK" -ne 1 ]; then
+    echo "ERROR: no usable checkpoint (ti-1500 seed missing/empty AND ti-3000 root empty) for $CELL_NAME" >&2
     exit 2
 fi
-LATEST_ITER_FILE=$LOAD_PATH/latest_checkpointed_iteration.txt
-if [ ! -f "$LATEST_ITER_FILE" ]; then
-    echo "ERROR: latest_checkpointed_iteration.txt missing in $LOAD_PATH" >&2
-    exit 2
-fi
-# Ensure the (possibly-new) save dir exists for cleanup logic
-mkdir -p "$CELL_CKPT_ROOT" 
-LATEST_ITER=$(tr -d '[:space:]' < "$LATEST_ITER_FILE")
-ITER_DIR=$(printf "%s/iter_%07d" "$LOAD_PATH" "$LATEST_ITER")
-if [ ! -d "$ITER_DIR" ]; then
-    echo "ERROR: iter dir not found: $ITER_DIR" >&2
-    exit 2
-fi
-NUM_DISTCP=$(find "$ITER_DIR" -maxdepth 1 -name '*.distcp' | wc -l)
-if [ "$NUM_DISTCP" -lt 1 ]; then
-    echo "ERROR: no .distcp files in $ITER_DIR" >&2
-    exit 2
-fi
-echo "Validated: $CELL_CKPT_ROOT  latest_iter=$LATEST_ITER  distcp_files=$NUM_DISTCP"
+[ "$NUM_DISTCP" -lt 1 ] && echo "WARN: ti-1500 seed pruned; resuming from ti-3000 root (has checkpoints)"
+echo "Validated: $CELL_CKPT_ROOT  ti1500_latest=${LATEST_ITER:-none} distcp=$NUM_DISTCP ti3000_ok=$TI3000_OK"
 
 # Choose resume source: continue from ti-3000 save target if it already holds a
 # checkpoint, otherwise seed from the iter-1500 source-of-truth.
@@ -96,6 +93,18 @@ else
     RESUME_LOAD="$LOAD_PATH"
 fi
 echo "RESUME_LOAD=$RESUME_LOAD"
+# POINTER-REPAIR (2026-06-05): if latest_checkpointed_iteration.txt points to a missing
+# iter dir (stale exit-save pointer), reset it to the max existing iter dir. Prevents
+# FileNotFoundError crashes on resume. Never deletes anything.
+if [ -d "$RESUME_LOAD" ]; then
+  _PF="$RESUME_LOAD/latest_checkpointed_iteration.txt"
+  _CUR=$(tr -d "[:space:]" < "$_PF" 2>/dev/null || echo "")
+  _PAD=$(printf "%07d" "${_CUR:-0}" 2>/dev/null || echo "")
+  if [ -n "$_CUR" ] && [ ! -d "$RESUME_LOAD/iter_$_PAD" ]; then
+    _MAX=$(ls -d "$RESUME_LOAD"/iter_* 2>/dev/null | grep -oE "iter_[0-9]+" | sed "s/iter_0*//" | sort -n | tail -1)
+    if [ -n "$_MAX" ]; then echo "$_MAX" > "$_PF"; echo "POINTER-REPAIR: $_CUR -> $_MAX (missing iter dir)"; fi
+  fi
+fi
 
 # ----- parse hyperparameters from CELL_NAME -----
 # Defaults (from v5a/v5b sweep configs):
@@ -108,6 +117,67 @@ RL_LM_REWARD_COEFF=0
 RL_STOCHASTIC_ROUTING=false
 RL_STOCHASTIC_TEMPERATURE=0.3
 KL_LOSS_COEFF=0
+# reward type default matches the long-standing v5a/v5b/v12corner convention.
+REWARD_TYPE=per_token_load_weighted
+# SEED empty => do not emit --seed (preserves existing cells' trainer default of 1234).
+SEED=""
+PLR="1e-4"; PMINLR="1e-6"   # default; overridden by _plr<val> in cell name (v17g LR arm)
+
+# generic fallback (2026-06-06): pull rlc/aux from ANY cell name so non-v5a/v5b cells
+# (e.g. v12corner) continue with their REAL hyperparams, not the rlc0.5/aux0.01 defaults.
+if [[ "$CELL_NAME" =~ rlc([0-9.]+) ]]; then RL_LOSS_COEFF="${BASH_REMATCH[1]}"; fi
+if [[ "$CELL_NAME" =~ _aux([0-9.]+) ]]; then AUX_COEFF="${BASH_REMATCH[1]}"; fi
+
+# generic fallback (2026-06-07): thread reward-type / KL / LM-reward from ANY cell name.
+# Without this, REWARD_TYPE/KL/LM do NOT survive name-based continuation (the trainer
+# silently reverts to per_token_load_weighted / kl0 / lm0), confounding reward-comparison,
+# KL, and LM-reward cells. Cell-name encodings:
+#   _rwd<type>   e.g. _rwdcritical_path / _rwdentropy / _rwdtopn_binary / _rwdper_token_load_weighted
+#   _kl<x>       e.g. _kl0.001
+#   _lm<x>       e.g. _lm0.3
+# The reward type itself contains underscores, so we first strip any trailing _r<digits>
+# seed suffix (bash ERE has no reliable lazy match), then match _rwd<type> anchored at end.
+_RWD_STRIPPED="${CELL_NAME%_r[0-9]}"
+_RWD_STRIPPED="${_RWD_STRIPPED%_r[0-9][0-9]}"
+_RWD_STRIPPED="${_RWD_STRIPPED%_r[0-9][0-9][0-9]}"
+if [[ "$_RWD_STRIPPED" =~ _rwd([a-zA-Z0-9_]+)$ ]]; then REWARD_TYPE="${BASH_REMATCH[1]}"; fi
+# topn_binary is the human-friendly name; the trainer arg is per_token_topn_binary.
+if [[ "$REWARD_TYPE" == "topn_binary" ]]; then REWARD_TYPE=per_token_topn_binary; fi
+if [[ "$CELL_NAME" =~ _kl([0-9.]+) ]]; then KL_LOSS_COEFF="${BASH_REMATCH[1]}"; fi
+if [[ "$CELL_NAME" =~ _lm([0-9.]+) ]]; then RL_LM_REWARD_COEFF="${BASH_REMATCH[1]}"; fi
+# Multi-seed cells (#5): _seed<N> must keep the SAME seed through continuation as the fresh
+# launch used, else the two seeds reconverge. Mapping MUST match submit_fresh_corner_ep16.sh's
+# launch env: seed1->1234 (Megatron default), seed2->2025.
+if [[ "$CELL_NAME" =~ _plr([0-9.e-]+) ]]; then PLR="${BASH_REMATCH[1]}"; PMINLR="1e-7"; fi
+if [[ "$CELL_NAME" =~ _seed([0-9]+) ]]; then
+    case "${BASH_REMATCH[1]}" in
+        1) SEED=1234 ;;
+        2) SEED=2025 ;;
+        *) SEED="${BASH_REMATCH[1]}" ;;
+    esac
+fi
+
+# generic fallback (2026-06-07): thread PPO baseline-type from ANY cell name so the
+# critic-vs-mean ablation setting SURVIVES the 1500->3000 continuation. Without this the
+# trainer silently reverts to the mean baseline default, confounding the comparison.
+# Cell-name encodings: _basemean (mean baseline) / _basecritic (learned critic value head).
+# No marker => RL_BASELINE_TYPE stays 'mean' (default) => existing cells byte-identical.
+if [[ "$CELL_NAME" =~ _basecritic ]]; then
+    RL_BASELINE_TYPE=critic
+elif [[ "$CELL_NAME" =~ _basemean ]]; then
+    RL_BASELINE_TYPE=mean
+fi
+
+# generic fallback (2026-06-08): thread the discount factor gamma from ANY cell name so
+# gamma SURVIVES the 1500->3000 continuation. Previously gamma was parsed ONLY inside the
+# 235bv5b_* block (regex _g(...)_), so non-v5b cells (v7/v10/v11/crit_n1, and any cell whose
+# gamma token is not followed by '_') silently reverted to gamma=0 at the handoff -- the
+# factorial sweep's gamma>0 cells would have collapsed to gamma0, confounding the discount
+# ablation. Cell-name encoding: _g<x> e.g. _g0.3 / _g0.5 / _g0 . The pattern requires a digit
+# immediately after 'g' so _gumbel / _gbs / _gpus etc. never false-match. No _g<digit> token
+# => RL_DISCOUNT_FACTOR stays at its current value (default 0) => those cells byte-identical.
+# Placed AFTER the v5b block so it is a strict superset; v5b cells resolve identically.
+if [[ "$CELL_NAME" =~ _g([0-9.]+) ]]; then RL_DISCOUNT_FACTOR="${BASH_REMATCH[1]}"; fi
 
 # norl baseline: aux-only
 if [[ "$CELL_NAME" == 235bv5a_norl_aux* ]]; then
@@ -149,6 +219,7 @@ fi
 echo "Resolved hyperparameters:"
 echo "  use_rl_loss=$USE_RL_LOSS  rl_loss_coeff=$RL_LOSS_COEFF  aux_coeff=$AUX_COEFF"
 echo "  baseline=$RL_BASELINE_TYPE  gamma=$RL_DISCOUNT_FACTOR  kl=$KL_LOSS_COEFF  lm=$RL_LM_REWARD_COEFF"
+echo "  reward_type=$REWARD_TYPE  seed=${SEED:-<default>}"
 echo "  stoch=$RL_STOCHASTIC_ROUTING (T=$RL_STOCHASTIC_TEMPERATURE)"
 
 # ----- pre-submit chain successor BEFORE training -----
@@ -178,8 +249,9 @@ if [ -n "$MAX_ITER" ]; then
     [ -d "$IT_DIR" ] || continue
     THIS_ITER=$(echo "$IT_DIR" | sed -E 's@.*/iter_0*@@')
     if [ "$THIS_ITER" != "$MAX_ITER" ]; then
-      echo "  rm $IT_DIR (iter $THIS_ITER, keeping iter $MAX_ITER)"
-      rm -rf "$IT_DIR"
+      # FRONTIER-SAFETY (2026-06-05): never delete checkpoints. A pruned iter may be
+      # an unbenchmarked frontier point. Disk is reclaimed via the frontier-exempt HF cleanup.
+      echo "  [prune-disabled] KEEPING $IT_DIR (iter $THIS_ITER); distcp checkpoints are never deleted"
     fi
   done
   shopt -u nullglob
@@ -205,7 +277,8 @@ EXTRA_ARGS=(
     --rl-ppo-entropy-coeff 0.01
     --rl-ppo-baseline-type "$RL_BASELINE_TYPE"
     --rl-critic-hidden-dims 256
-    --rl-reward-type per_token_load_weighted
+    --rl-critic-lr 1e-3
+    --rl-reward-type "$REWARD_TYPE"
     --rl-reward-topn 2
     --rl-discount-factor "$RL_DISCOUNT_FACTOR"
     --rl-gae-lambda 1.0
@@ -229,6 +302,11 @@ if [ "$USE_RL_LOSS" = "true" ]; then
 fi
 if [ "$RL_STOCHASTIC_ROUTING" = "true" ]; then
     EXTRA_ARGS+=( --rl-stochastic-routing --rl-stochastic-temperature "$RL_STOCHASTIC_TEMPERATURE" )
+fi
+# Only emit --seed for cells that encode a seed (multi-seed #5); other cells keep the
+# trainer default 1234 -> byte-identical behavior to before this change.
+if [ -n "$SEED" ]; then
+    EXTRA_ARGS+=( --seed "$SEED" )
 fi
 
 # Render extra-args as a single shell-safe string for the srun bash -c invocation
@@ -255,7 +333,7 @@ srun --container-image="$CONTAINER_IMAGE" \
          export MASTER_PORT=$MASTER_PORT
          echo \"node \$(hostname) RANK=\${RANK} WORLD_SIZE=\${WORLD_SIZE}\"
          cd $WORKDIR
-         sh run_mcore_qwen3.sh dlc A22B 1 16 1e-4 1e-6 128 128 bf16 1 1 1 1 16 true true true false sel false 3000 \\
+         sh run_mcore_qwen3.sh dlc A22B 1 16 $PLR $PMINLR 128 128 bf16 1 1 1 1 16 true true true false sel false 3000 \\
            $DATASET_PATH $DATASET_PATH $PRETRAIN_CKPT 1024000 10240 $CELL_DIR$EXTRA_ARGS_STR
      "
 

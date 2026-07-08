@@ -93,6 +93,12 @@ for (rlc,aux) in (("0.5","0.001"),("0.1","0.003")):
     c="235bv17g_rlc%s_aux%s_basecritic_g0.3_kl0.001_r1"%(rlc,aux)
     PLANNED[c]=dict(BASELINE="critic",GAMMA="0.3",RLC=rlc,AUX=aux,KL="0.001",LM="0",
                     REWARD_TYPE="per_token_load_weighted")
+# E) LR x gamma (plumbed 2026-07-08): policy-lr {5e-5,2e-5} x gamma {0,0.5} at rlc0.25 aux0.001
+for plr in ("5e-5","2e-5"):
+    for gm in ("0","0.5"):
+        c="235bv17g_rlc0.25_aux0.001_basecritic_g%s_plr%s_r1"%(gm,plr)
+        PLANNED[c]=dict(BASELINE="critic",GAMMA=gm,RLC="0.25",AUX="0.001",KL="0",LM="0",
+                        REWARD_TYPE="per_token_load_weighted",PLR=plr)
 
 def gen(n):
     m=re.match(r"(235bv[0-9]+[a-z]*)",n); return m.group(1) if m else None
@@ -145,7 +151,9 @@ def feats(c):
             (re.search(r"_g([0-9.]+)",c).group(1) if re.search(r"_g([0-9.]+)",c) else "0"),
             base)
 def sig(c):
-    rw,rlc,aux,kl,gm,base=feats(c); return (rw,rlc,aux,kl,gm,base)
+    rw,rlc,aux,kl,gm,base=feats(c)
+    plr=(re.search(r"_plr([0-9.e-]+)",c).group(1) if re.search(r"_plr([0-9.e-]+)",c) else "1e-4")
+    return (rw,rlc,aux,kl,gm,base,plr)   # plr in sig so LR-arm cells are not COVERED by lr-1e-4 twins
 def fresh_env(c):
     if c in PLANNED: return dict(PLANNED[c])
     rw,rlc,aux,kl,gm,base=feats(c)
