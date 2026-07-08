@@ -333,3 +333,19 @@ load-proportional optimized a2a (hybrid_ep / nvfp4+flashinfer — blocked on con
 and (b) the step is not host/comms dominated. Open follow-ups: hybrid_ep container
 (deci_handoff, owner I. Rosenfeld Rauch), nvfp4 quantized serving, EPLB comparison
 (placement rebalancing may capture the same balance win with zero retraining).
+
+
+## §H 2026-07-08: §F RETRACTED — ARs were NVLS+SIMPLE all along (blockX evidence)
+
+NCCL kernel-name specialization maps all non-TREE AllReduce algo/proto combos onto
+`ncclDevKernel_AllReduce_*_RING_LL` — the trace NAME does not indicate the algorithm.
+The reliable discriminator is launch block dimension: NVLS+SIMPLE launches 640 threads,
+RING+SIMPLE <=544. Query of our graphed EP=32 prefill trace: ALL 160,288 AR kernels have
+blockX=640 → NVLS+SIMPLE was selected inside CUDA graphs. §F's "graphs force LL" claim is
+wrong (kernel-name misread). Implications: (1) the serving config was correct; (2) the
+~40-45% exposed prefill comms is the STRUCTURAL cost of 32-wide TP-AR on NVL72 (NVLS
+clique-limited at width; cross-trunk NVLS is a future-hardware item); (3) "world size 64
+not supported" for symm-mem is by design — supported TP is {2,4,6,8}; (4) the right GB200
+serving geometry is a TP<=8 clique + EP/DP (TEP4 pattern, validated internally with
+symm-mem AR under graphs on NCCL 2.30.1). Diagnostic rule for future trace work: check
+blockX, never kernel names, for NCCL algo attribution. NCCL 2.28→2.30 upgrade recommended.
