@@ -363,3 +363,43 @@ for Qwen3-235B (topK=8) token-routing dispatch/combine wins from EP=8 up, so CP-
 relevance is broad for low-topK models once a working MNNVL dispatch backend (hybrid_ep)
 is available. Full cross-rank straggler measurement needs global-clock instance matching
 across all EP ranks (their end-time alignment method, ~15-28µs skew) — future work.
+
+## §J (2026-07-09): hybrid_ep works on MNNVL — backend comparison + AG+RS ladder
+
+**Container**: registry tag was unbootable (mixed-commit skew); rebuilt the final
+deci-handoff container from public sources (`hsg_build_deci_handoff.sh`, 23G sqsh):
+Shahar vLLM pin 010583efa + Sam cherry-picks 3e6549755/c95c94ec2/c249dbf22 +
+Tongliu DeepEP 9e94c34. Traps: enroot tzdata postinst (EBUSY on bind-mounted
+/etc/localtime) and VLLM_USE_PRECOMPILED default-variant wheel lacking _C.abi3.so
+(pin VLLM_PRECOMPILED_WHEEL_LOCATION to the cu130 aarch64 wheel).
+
+**hybrid_ep boots and serves** (first working MNNVL dispatch/combine): 2N DP=8/EP=8
+and 4N DP=16/EP=16, real requests through CUDA-graph replay path (jobs 4291282,
+4295136/7, 4315328/9, 4320667/69).
+
+**Backend comparison, Qwen3-235B bf16, c=64, streaming bench (median of 3 reps):**
+
+| EP | backend | TTFT p50 std/dec | ITL p50 | tok/s std/dec |
+|---|---|---|---|---|
+| 8 | AG+RS | 61/62 ms | ~19 ms | 2950/3250 |
+| 8 | hybrid_ep | 103/106 ms | ~37 ms | 1580/1730 |
+| 16 | AG+RS | ~82/79 ms | ~23 ms | 2370/2680 |
+| 16 | hybrid_ep | 131/140 ms | ~42 ms | 1390/1515 |
+
+**Root cause of the 2× gap: hybrid_ep runs 100% eager** — nsys traces (jobs
+4318033/4) show 0 of 2.41M kernels graph-launched; per-session kernel time is
+comms+sync dominated (ag_nvl 61.5s + device_sync 42.8s + reduce 14.3s vs
+fused_moe 47.4s). Forcing cudagraph_mode=FULL_AND_PIECEWISE boots (job 4331577)
+but ITL is unchanged (~36ms) — the backend silently overrides graph mode. The gap
+is an integration artifact, not a comms property; the EP/topK crossover argument
+is about traffic volume and does not apply to this launch-bound regime.
+
+**A/A order bias is backend-specific**: hybrid_ep second position +2.8% faster
+(dec); AG+RS second position −3.1% slower (dec). Always run per-backend A/A.
+
+**AG+RS CP ladder @ EP=8 (jobs 4331578/9) — r15 decode signal REFUTED**: raw r15
++6.4% dec looked real after bias correction (~+9%), but r05 (~57% cut) = −1.4% dec
+and the r46 CONTROL = +4.9% dec / −4.2% std. No dose-response, control outranks
+treatment, signs flip across regimes → selection-from-noise. CP-RL e2e effect
+remains bounded within the ±3-5% job-to-job noise floor on every backend tested
+(TP=EP+AR, naive a2a, AG+RS, hybrid_ep eager).

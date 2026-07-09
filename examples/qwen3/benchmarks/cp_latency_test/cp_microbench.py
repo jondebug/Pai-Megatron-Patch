@@ -266,6 +266,10 @@ def _build_dataloader(tokenizer, args):
     return ids
 
 
+import os as _os2
+_os2.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF','expandable_segments:True')
+
+
 def capture_routing_traces(model_path: str, args) -> List[Dict[int, np.ndarray]]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -275,8 +279,11 @@ def capture_routing_traces(model_path: str, args) -> List[Dict[int, np.ndarray]]
     ngpu = _t.cuda.device_count()
     # Balance shards across ALL visible GPUs (device_map="auto" overloads GPU 0
     # and OOMs on 235B). Cap per-GPU so activations fit.
-    per_gpu = os.environ.get("MAX_MEM_PER_GPU", "70GiB")
+    per_gpu = os.environ.get("MAX_MEM_PER_GPU", "60GiB")
     max_memory = {i: per_gpu for i in range(ngpu)}
+    # Allow CPU offload for overflow so 235B (470GB) never OOMs GPU 0 during the
+    # forward (routing capture is bandwidth-bound, not latency-sensitive).
+    max_memory["cpu"] = os.environ.get("MAX_MEM_CPU", "600GiB")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=DTYPE,

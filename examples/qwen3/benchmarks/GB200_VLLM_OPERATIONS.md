@@ -71,3 +71,21 @@ networking-insights team (their workaround was the mp backend + cudaProfilerStar
 | worker nsys rep 12MB / no kernels | daemonized ray start traced, not workers | use --block recipe |
 | SPORK `no such table: X` | tables_to_read includes absent tables | trim advanced_config (no missing-table tolerance) |
 | Excel `sheet too large` in SPORK | >1,048,576 kernel timestamps | ignore; HTML + summary sheets unaffected |
+
+## 2026-07-09 addendum: rebuilt hybrid_ep container + serve-mode ops
+
+- Registry hybridep tag = mixed-commit, unbootable. Rebuild via
+  `spork_configs/hsg_build_deci_handoff.sh` (see HSG_GB200_FINDINGS §J for traps).
+- Offline LLM() DP path is broken in the fork; use `vllm serve` + `--headless`
+  + `--data-parallel-start-rank 4i` per extra node. VLLM_ENGINE_READY_TIMEOUT_S=1800
+  (cold lustre load at DP=16 exceeds the 600s default).
+- Rebuilt container has NO nsys; stage from vllm-openai-arm.sqsh to
+  $BASE/tools/nsys_pkg (binary under target-linux-sbsa-armv8/).
+- sbatch --export strips quotes: JSON flags (--compilation-config) must be
+  embedded single-quoted in the script, not passed via --export. -O.field dot
+  notation is NOT in this fork (-O = optimization_level enum).
+- hybrid_ep: eager-only in practice (ignores cudagraph_mode); expect ~2× worse
+  ITL than AG+RS at small batch. hybrid_ep comms are DeepEP kernels (ag_nvl_kernel,
+  dispatch/combine_kernel), NOT NCCL — SPORK collectives parser sees ~nothing;
+  classify by kernel name instead.
+- Rack-locality: launcher now asserts single nvl72 rack prefix (--segment gives it).

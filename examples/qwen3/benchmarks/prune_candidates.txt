@@ -1,0 +1,9 @@
+=== DRY-RUN far-from-frontier distcp prune (CANONICAL-CP ONLY, FARTHRESH=1.5pp, TARGET_TB=all) ===
+frontier cells exempt: 14 | deletable candidates: 6
+  would 235bv14cg_rlc1_aux0.008_basecritic_g0.3_r1@2000 acc=65.82 cp_canon=6396 gap=9.86pp 0.47TB
+  would 235bv14cg_rlc1_aux0.016_basecritic_g0.5_r1@2000 acc=64.98 cp_canon=5017 gap=9.46pp 0.47TB
+  would 235bv14cg_rlc1_aux0.02_basecritic_g0.3_r1@2000 acc=65.87 cp_canon=4783 gap=8.57pp 0.47TB
+  would 235bv14cg_rlc1_aux0.012_basecritic_g0.5_r1@2000 acc=66.62 cp_canon=5497 gap=8.06pp 0.47TB
+  would 235bv14cg_rlc0.5_aux0.012_basecritic_g0.5_r1@2000 acc=71.44 cp_canon=4780 gap=3.00pp 0.47TB
+  would 235bv14cg_rlc0.5_aux0.016_basecritic_g0.5_r1@2000 acc=71.36 cp_canon=4395 gap=2.72pp 0.47TB
+=== WOULD DELETE: 6 distcp dirs, 2.8 TB (reclaimable; canonical-frontier+cell-max+unevaluated+no-canon-CP kept) ===

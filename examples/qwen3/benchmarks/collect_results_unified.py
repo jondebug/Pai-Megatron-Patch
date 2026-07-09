@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
-"""Unified results collector for 235B v5/v6 sweeps.
+"""LEGACY results collector for 235B v5/v6 sweeps — DO NOT run as the routine refresher.
+
+!!!  FOOTGUN WARNING  !!!
+This script REBUILDS the 235B rows from its OWN (older) sources:
+  - lm-eval accuracy from benchmark_logs/baseline_vllm_*.out
+  - eval_lm_loss + critical_path from W&B history
+It does NOT read the conv_eval_*.out / lmeval_ord_*.out stdout markdown tables that hold
+today's eval results (those eval jobs fail to write results.json — OSError filename-too-long —
+so their scores live only in the stdout logs). Those scores are ingested by `ingest_evals.py`,
+which is the CANONICAL refresher run every cron cycle.
+
+Running this collector will OVERWRITE/DROP the ingested frontier rows and reset cluster +
+backfilled metadata. It is kept only for the W&B critical_path / lm_loss backfill it can do.
+
+==> To refresh accuracy results, run `python ingest_evals.py` instead. <==
+
+If you genuinely need this collector's W&B backfill, pass --force to acknowledge it will
+clobber ingested rows.
 
 For every cell directory in output_router_finetuning/235bv*/:
   - Parse hyperparameters from cell name + sweep config defaults
@@ -9,7 +26,7 @@ For every cell directory in output_router_finetuning/235bv*/:
   - Write rows keyed by (run_name, bench_iteration) — append or update
 
 Writes to benchmark_results.csv with the same schema as the 30B sweep.
-Usage:  python collect_results_unified.py [--limit N] [--cells regex]
+Usage:  python collect_results_unified.py --force [--limit N] [--cells regex]
 """
 import argparse, csv, json, re, sys
 from pathlib import Path
@@ -27,6 +44,7 @@ COLS = [
     "hellaswag","arc_challenge","winogrande","benchmark_avg",
     "benchmark_time_sec","limit","timestamp","comments","checkpoint_path",
     "wt_decode_tps","wt_ttft_ms","wt_e2e_ms",
+    "cluster",
 ]
 
 def parse_cell_hyperparams(name):
@@ -221,7 +239,18 @@ def main():
     ap.add_argument("--limit", type=int, default=1000)
     ap.add_argument("--cells", default=r"^(235b)", help="cell name regex")
     ap.add_argument("--out", default=str(CSV_PATH))
+    ap.add_argument("--force", action="store_true",
+                    help="Acknowledge this LEGACY collector will clobber ingest_evals.py rows.")
     args = ap.parse_args()
+    if not args.force:
+        sys.stderr.write(
+            "\nREFUSING TO RUN: collect_results_unified.py is LEGACY and will overwrite the\n"
+            "rows ingested by ingest_evals.py (the canonical refresher). It reads older sources\n"
+            "(baseline_vllm_*.out + W&B) and does NOT read the conv_eval/lmeval_ord stdout tables\n"
+            "that hold current eval results.\n\n"
+            "  To refresh accuracy results:   python ingest_evals.py\n"
+            "  To force this anyway (clobbers): python collect_results_unified.py --force\n\n")
+        sys.exit(2)
     cell_re = re.compile(args.cells)
 
     # 1) Scrape all lm-eval logs
@@ -356,6 +385,7 @@ def main():
             w.writerow({k: r.get(k, "") for k in COLS})
         # Then 235B rows, sorted
         for r in sorted(final_rows, key=lambda x:(x["run_name"], x.get("bench_iteration") or 0)):
+            r["cluster"]="nrt" if ("/lustre/fs1/" in (r.get("checkpoint_path","") or "")) else "ord"
             w.writerow({k: r.get(k, "") for k in COLS})
 
     n_235b = len(final_rows)

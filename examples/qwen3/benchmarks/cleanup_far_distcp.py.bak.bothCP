@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+# Frontier-safe distcp prune — HARDENED (both-CP rule).
+# Delete a distcp iter-dir ONLY when it is "absolutely" below the frontier:
+#   (1) inf-accuracy-evaluated (acc present, >=40), AND
+#   (2) has BOTH CP values present: eval_crit_path (legacy) AND cp_critical_eval (canonical), AND
+#   (3) NOT on the frontier under EITHER CP metric, AND
+#   (4) dominated by >= FARTHRESH pp under BOTH metrics (min of the two gaps >= FARTHRESH), AND
+#   (5) NOT the cell's MAX iter (keep >=1 distcp/cell for continuation), AND
+#   (6) the cell contributes NO frontier point under EITHER metric (frontier cells fully exempt).
+# Anything missing a canonical CP, or un-evaluated, or frontier under either metric -> EXEMPT (kept).
+# Default DRY-RUN. DELETE=1 to remove. FARTHRESH default 1.0pp. TARGET_TB optional cumulative cap.
+import csv, os, glob, re, shutil, subprocess
+ROOT="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/output_router_finetuning"
+CSV="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/examples/qwen3/benchmarks/benchmark_results.csv"
+FARTHRESH=float(os.environ.get("FARTHRESH","1.0"))
+DELETE=os.environ.get("DELETE","0")=="1"
+TARGET_TB=float(os.environ.get("TARGET_TB","0") or 0)
+def f(x):
+    try: return float(x)
+    except: return None
+rows=list(csv.DictReader(open(CSV)))
+itc=[c for c in rows[0] if "iter" in c.lower()][0]
+# inf[(cell,it)] = (acc, cp_legacy, cp_canon)   -- requires acc>=40 and legacy cp present
+inf={}; leg=[]; can=[]
+for r in rows:
+    if r["limit"].strip()!="inf": continue
+    cell=r["run_name"].strip(); it=f(r[itc]); acc=f(r["benchmark_avg"])
+    cl=f(r.get("eval_crit_path","")); cc=f(r.get("cp_critical_eval",""))
+    if it is None or acc is None or acc<40: continue
+    if cl is None: continue                       # legacy CP is the always-present anchor
+    inf[(cell,int(it))]=(acc,cl,cc)
+    leg.append((cl,acc))
+    if cc is not None: can.append((cc,acc))
+def onf(pts,cp,acc): return not any(q0<=cp and q1>=acc and (q0<cp or q1>acc) for q0,q1 in pts)
+def ceil(pts,cp):
+    c=[a for (cc_,a) in pts if cc_<=cp+1e-6]; return max(c) if c else None
+# cells that contribute ANY frontier point under EITHER metric -> exempt ALL their iters
+frontier_cells=set()
+for (cell,it),(acc,cl,cc) in inf.items():
+    if onf(leg,cl,acc) or (cc is not None and onf(can,cc,acc)): frontier_cells.add(cell)
+# scan distcp on disk
+cells={}
+for itd in glob.glob(f"{ROOT}/*/checkpoint/*/iter_*"):
+    if not glob.glob(itd+"/*.distcp"): continue
+    m=re.search(r"/([^/]+)/checkpoint/.*/iter_0*(\d+)$",itd)
+    if not m: continue
+    cells.setdefault(m.group(1),[]).append((int(m.group(2)),itd))
+cands=[]
+for cell,lst in cells.items():
+    if cell in frontier_cells: continue                       # HARD exempt frontier cells
+    mx=max(i for i,_ in lst)
+    for it,itd in lst:
+        if it==mx: continue                                   # keep cell's latest (continuation source)
+        if (cell,it) not in inf: continue                     # un-evaluated / CP-less -> keep
+        acc,cl,cc=inf[(cell,it)]
+        if cc is None: continue                               # NO canonical CP -> can't be sure -> keep
+        if onf(leg,cl,acc) or onf(can,cc,acc): continue       # frontier under EITHER metric -> keep
+        gl=ceil(leg,cl); gc=ceil(can,cc)
+        if gl is None or gc is None: continue
+        gap=min(gl-acc, gc-acc)                               # conservative: dominated under BOTH
+        if gap < FARTHRESH: continue
+        cands.append((gap,cell,it,acc,cl,cc,itd))
+cands.sort(reverse=True)
+def dsz(p):
+    try: return int(subprocess.check_output(["du","-sb",p]).split()[0])
+    except: return 0
+freed=0; n=0
+print(f"=== {'DELETE' if DELETE else 'DRY-RUN'} far-from-frontier distcp prune (HARDENED both-CP, "
+      f"FARTHRESH={FARTHRESH}pp, TARGET_TB={TARGET_TB or 'all'}) ===")
+print(f"frontier cells exempt: {len(frontier_cells)} | deletable candidates: {len(cands)}")
+for gap,cell,it,acc,cl,cc,itd in cands:
+    if TARGET_TB and freed/1e12 >= TARGET_TB: break
+    sz=dsz(itd)
+    print(f"  {'DEL' if DELETE else 'would'} {cell}@{it} acc={acc} cp_leg={cl:.0f} cp_can={cc:.0f} "
+          f"min_gap={gap:.2f}pp {sz/1e12:.2f}TB")
+    if DELETE:
+        try: shutil.rmtree(itd); freed+=sz; n+=1
+        except Exception as e: print("    rm failed:",e)
+    else: freed+=sz; n+=1
+print(f"=== {'DELETED' if DELETE else 'WOULD DELETE'}: {n} distcp dirs, {freed/1e12:.1f} TB "
+      f"({'freed' if DELETE else 'reclaimable'}; frontier(either-CP)+cell-max+unevaluated+no-canon-CP kept) ===")

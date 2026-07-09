@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""cp_routing_dump.py (FIXED 2026-06-07) -- capture REAL per-layer routing of 235B HF
+model on real data to resolve the CP-semantics paradox and measure per-layer hot-expert
+imbalance for pretrained vs r15.
+
+FIX: prior version hooked the SparseMoeBlock and relied on out[1] being router_logits,
+which was always None (captured nothing). Now we hook the gate nn.Linear directly
+(model.model.layers[i].mlp.gate) and capture ITS OUTPUT tensor = logits [num_tokens,128].
+Self-verifies that capture is non-empty on batch 0.
+"""
+import argparse, json, os, sys
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+NUM_EXPERTS = 128; TOP_K = 8; NUM_MOE_LAYERS = 94
+
+
+class Hook:
+    def __init__(self):
+        self.cur = {}            # layer_idx -> tokens-per-expert array (this batch)
+        self.num_tokens = None
+        self.handles = []
+    def mk(self, idx):
+        def h(module, inp, out):
+            # out is the gate Linear output = router logits, shape [..., NUM_EXPERTS]
+            rl = out[0] if isinstance(out, (tuple, list)) else out
+            if rl is None:
+                return
+            rl = rl.reshape(-1, rl.shape[-1])     # [num_tokens, num_experts]
+            nt, ne = rl.shape
+            if ne != NUM_EXPERTS:
+                return
+            self.num_tokens = nt
+            w = F.softmax(rl, dim=-1, dtype=torch.float32)
+            _, sel = torch.topk(w, TOP_K, dim=-1)
+            rm = torch.zeros(nt, ne, dtype=torch.bool, device=rl.device)
+            rm.scatter_(1, sel, True)
+            self.cur[idx] = rm.sum(dim=0).to(torch.int64).cpu().numpy()
+        return h
+    def attach(self, model):
+        idx = 0
+        for name, m in model.named_modules():
+            # target the router gate Linear: name endswith 'mlp.gate' and is a Linear
+            if name.endswith("mlp.gate") and ("Router" in m.__class__.__name__ or m.__class__.__name__ == "Linear"):
+                self.handles.append(m.register_forward_hook(self.mk(idx))); idx += 1
+        return idx
+    def detach(self):
+        for h in self.handles: h.remove()
+
+
+def load_model(path):
+    from transformers import AutoModelForCausalLM
+    ngpu = torch.cuda.device_count()
+    per_gpu = os.environ.get("MAX_MEM_PER_GPU", "62GiB")
+    mm = {i: per_gpu for i in range(ngpu)}; mm["cpu"] = "600GiB"
+    return AutoModelForCausalLM.from_pretrained(
+        path, torch_dtype=torch.bfloat16, device_map="auto",
+        max_memory=mm, trust_remote_code=True).eval()
+
+
+def build_chunks(tok, seq_len, n_needed):
+    prefix = os.environ.get("MEGDATA_PREFIX",
+        "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/qwen-datasets/mmap_qwen3_datasets_text_document")
+    if os.path.isfile(prefix + ".idx") and os.path.isfile(prefix + ".bin"):
+        repo = "/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch"
+        meg = os.path.join(repo, "backends/megatron/Megatron-LM-250624")
+        if meg not in sys.path: sys.path.insert(0, meg)
+        from megatron.core.datasets.indexed_dataset import IndexedDataset
+        ds = IndexedDataset(prefix)
+        need = (n_needed + 1) * seq_len
+        all_ids = []
+        for i in range(len(ds)):
+            all_ids.extend(int(x) for x in ds[i])
+            if len(all_ids) >= need: break
+        ids = torch.tensor(all_ids[:(len(all_ids)//seq_len)*seq_len], dtype=torch.long)
+        n = len(ids)//seq_len
+        print(f"  Megatron mmap: built {n} chunks of {seq_len} tokens", flush=True)
+        return ids.reshape(n, seq_len)[:n_needed]
+    raise FileNotFoundError(f"Megatron mmap dataset not found at {prefix}.idx/.bin")
+
+
+def ep_busiest_gpu_load(tpe_arrays, ep):
+    """Given per-layer tokens-per-expert (list of [128] arrays), compute the per-layer
+    busiest-GPU load under a contiguous block expert->GPU map (experts_per_gpu=128/ep),
+    then sum over layers = the EP-aware decode/forward critical path on the busiest GPU."""
+    epg = NUM_EXPERTS // ep
+    cp_gpu = 0.0
+    per_layer = []
+    for tpe in tpe_arrays:
+        gpu_loads = [int(tpe[g*epg:(g+1)*epg].sum()) for g in range(ep)]
+        mx = max(gpu_loads)
+        per_layer.append(mx); cp_gpu += mx
+    return cp_gpu, float(np.mean(per_layer))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--seq-length", type=int, default=2048)
+    ap.add_argument("--batch-size", type=int, default=4)
+    ap.add_argument("--num-batches", type=int, default=8)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    model = load_model(args.model)
+    dev = next(model.parameters()).device
+    hook = Hook(); n = hook.attach(model)
+    print(f"attached {n} gate hooks (expect {NUM_MOE_LAYERS})", flush=True)
+    assert n == NUM_MOE_LAYERS, f"hook count {n} != {NUM_MOE_LAYERS}"
+    chunks = build_chunks(tok, args.seq_length, (args.num_batches+1)*args.batch_size).to(dev)
+
+    per_layer_max = {}; per_layer_mean = {}; per_layer_tpe = {}; cp_batches = []; ntok_seen = []
+    # also keep last-batch tpe per layer for EP-aware analysis
+    last_tpe = None
+    with torch.no_grad():
+        for b in range(args.num_batches):
+            x = chunks[b*args.batch_size:(b+1)*args.batch_size]
+            if x.shape[0] < args.batch_size: break
+            hook.cur = {}
+            _ = model(input_ids=x)
+            if b == 0:
+                assert hook.num_tokens and len(hook.cur) > 0, "HOOK CAPTURED NOTHING on batch 0"
+            ntok_seen.append(hook.num_tokens)
+            cp = 0
+            for li, tpe in hook.cur.items():
+                per_layer_max.setdefault(li, []).append(int(tpe.max()))
+                per_layer_mean.setdefault(li, []).append(float(tpe.mean()))
+                per_layer_tpe.setdefault(li, []).append(tpe.copy())
+                cp += int(tpe.max())
+            cp_batches.append(cp)
+            last_tpe = [hook.cur[li] for li in sorted(hook.cur)]
+            print(f"  batch {b}: num_tokens={hook.num_tokens} CP={cp} "
+                  f"busiest/layer~{cp/max(1,len(hook.cur)):.1f} "
+                  f"mean/exp~{np.mean([v.mean() for v in hook.cur.values()]):.1f}", flush=True)
+    hook.detach()
+
+    ep_cp = {}
+    if last_tpe is not None:
+        for ep in (8, 16, 32, 64):
+            cpg, perl = ep_busiest_gpu_load(last_tpe, ep)
+            ep_cp[str(ep)] = {"cp_busiest_gpu_sum": cpg, "busiest_gpu_per_layer_mean": perl}
+
+    nt = int(np.median([x for x in ntok_seen if x])) if ntok_seen else None
+    out = {
+        "name": args.name, "model": args.model,
+        "seq_length": args.seq_length, "batch_size": args.batch_size,
+        "num_tokens_per_forward": nt,
+        "balanced_tokens_per_expert": (nt*TOP_K/NUM_EXPERTS) if nt else None,
+        "cp_mean": float(np.mean(cp_batches)), "cp_std": float(np.std(cp_batches)),
+        "cp_per_layer_busiest_mean": float(np.mean(cp_batches))/NUM_MOE_LAYERS,
+        "per_layer_max_tokens_per_expert": {str(li): float(np.mean(v)) for li, v in per_layer_max.items()},
+        "per_layer_mean_tokens_per_expert": {str(li): float(np.mean(v)) for li, v in per_layer_mean.items()},
+        "imbalance_ratio_layeravg": float(np.mean([np.mean(per_layer_max[li]) / max(1e-9, np.mean(per_layer_mean[li])) for li in per_layer_max])),
+        "ep_aware_busiest_gpu": ep_cp,
+        "per_layer_per_expert_tokens": {str(li): [float(x) for x in np.mean(np.array(per_layer_tpe[li]), axis=0).tolist()] for li in sorted(per_layer_tpe.keys())},
+        "n_layers_captured": len(per_layer_max), "n_batches": len(cp_batches),
+    }
+    json.dump(out, open(args.out, "w"), indent=2)
+    print(f"WROTE {args.out}", flush=True)
+    print(f"SUMMARY name={args.name} num_tokens={nt} "
+          f"balanced/exp={out['balanced_tokens_per_expert']:.1f} CP={out['cp_mean']:.0f} "
+          f"busiest/layer={out['cp_per_layer_busiest_mean']:.1f} imbalance={out['imbalance_ratio_layeravg']:.2f}", flush=True)
+    for ep,v in ep_cp.items():
+        print(f"  EP={ep}: busiest-GPU/layer={v['busiest_gpu_per_layer_mean']:.1f} CP_gpu={v['cp_busiest_gpu_sum']:.0f}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

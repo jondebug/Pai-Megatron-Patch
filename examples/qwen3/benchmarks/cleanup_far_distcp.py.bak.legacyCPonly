@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+# Frontier-safe distcp prune: delete distcp iter-dirs that are (1) already inf-accuracy-evaluated,
+# (2) NOT on the accuracy-vs-CP frontier, and (3) FARTHEST below the frontier — worst-first.
+# HARD EXEMPTIONS: any frontier point (incl. intermediates like r06@2190), each cell's MAX iter
+# (keep >=1 distcp/cell for continuation), and any checkpoint lacking an inf eval (still needed).
+# Default DRY-RUN. DELETE=1 to remove. FARTHRESH=min pp below frontier to qualify (default 0.8).
+# TARGET_TB optional cumulative cap (delete worst-first until this much freed).
+import csv, os, glob, re, shutil, sys, subprocess
+ROOT="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/output_router_finetuning"
+CSV="/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/examples/qwen3/benchmarks/benchmark_results.csv"
+FARTHRESH=float(os.environ.get("FARTHRESH","0.8"))
+DELETE=os.environ.get("DELETE","0")=="1"
+TARGET_TB=float(os.environ.get("TARGET_TB","0") or 0)
+def f(x):
+    try:return float(x)
+    except:return None
+rows=list(csv.DictReader(open(CSV)))
+itc=[c for c in rows[0] if "iter" in c.lower()][0]
+inf={}; pts=[]
+for r in rows:
+    if r["limit"].strip()!="inf": continue
+    cell=r["run_name"].strip(); it=f(r[itc]); acc=f(r["benchmark_avg"]); cp=f(r["eval_crit_path"])
+    if it is None or acc is None or cp is None or acc<40: continue
+    inf[(cell,int(it))]=(acc,cp); pts.append((cp,acc))
+# frontier = non-dominated over ALL inf points (rl + aux); ceiling(cp)=best acc at cp-or-lower
+frontier=set(id(p) for p in pts if not any(q[0]<=p[0] and q[1]>=p[1] and (q[0]<p[0] or q[1]>p[1]) for q in pts))
+def on_frontier(cp,acc):
+    return not any(q[0]<=cp and q[1]>=acc and (q[0]<cp or q[1]>acc) for q in pts)
+def ceiling(cp):
+    c=[a for (cc,a) in pts if cc<=cp+1e-6]; return max(c) if c else acc
+# cells that contribute ANY frontier point -> exempt ALL their iters (keep full trace; hard rule)
+frontier_cells=set(cell for (cell,it),(acc,cp) in inf.items() if on_frontier(cp,acc))
+# scan distcp dirs
+cells={}
+for itd in glob.glob(f"{ROOT}/*/checkpoint/*/iter_*"):
+    if not glob.glob(itd+"/*.distcp"): continue
+    m=re.search(r"/([^/]+)/checkpoint/.*/iter_0*(\d+)$",itd)
+    if not m: continue
+    cells.setdefault(m.group(1),[]).append((int(m.group(2)),itd))
+cands=[]
+for cell,lst in cells.items():
+    mx=max(i for i,_ in lst)
+    if cell in frontier_cells: continue            # HARD exempt: keep ALL iters of any frontier cell
+    for it,itd in lst:
+        if it==mx: continue                       # keep cell's latest (>=1/cell, continuation source)
+        if (cell,it) not in inf: continue          # keep un-evaluated (still need to eval) — incl >1k pending
+        acc,cp=inf[(cell,it)]
+        if on_frontier(cp,acc): continue           # HARD exempt frontier points
+        gap=ceiling(cp)-acc
+        if gap < FARTHRESH: continue               # only FAR-from-frontier
+        cands.append((gap,cell,it,acc,cp,itd))
+cands.sort(reverse=True)                            # farthest first
+def dsz(p):
+    try: return int(subprocess.check_output(["du","-sb",p]).split()[0])
+    except: return 0
+freed=0; n=0
+print(f"=== {'DELETE' if DELETE else 'DRY-RUN'} far-from-frontier distcp prune (FARTHRESH={FARTHRESH}pp, TARGET_TB={TARGET_TB or 'all'}) ===")
+print(f"frontier points exempt: {sum(1 for p in pts if id(p) in frontier)} | total distcp candidates considered")
+for gap,cell,it,acc,cp,itd in cands:
+    if TARGET_TB and freed/1e12 >= TARGET_TB: break
+    sz=dsz(itd); freed+=sz; n+=1
+    print(f"  {'DEL' if DELETE else 'would'} {cell}@{it} acc={acc:.2f} cp={cp:.0f} gap={gap:.2f}pp {sz/1e12:.2f}TB")
+    if DELETE: shutil.rmtree(itd, ignore_errors=True)
+print(f"=== {'DELETED' if DELETE else 'WOULD DELETE'}: {n} distcp dirs, {freed/1e12:.1f} TB {'freed' if DELETE else 'reclaimable'} (frontier+cell-max+unevaluated kept) ===")

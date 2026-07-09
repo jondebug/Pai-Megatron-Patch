@@ -19,8 +19,8 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_CSV = SCRIPT_DIR / "benchmark_results.csv"
 DEFAULT_OUTPUT = SCRIPT_DIR.parent.parent.parent / "pareto_accuracy_vs_cp.html"
-BASELINE_CP = 4780
-BASELINE_LABEL = "Qwen3-30B-A3B"
+BASELINE_CP = 9320
+BASELINE_LABEL = "Qwen3-235B-A22B (pretrained, earliest-measured CP)"
 
 # Which CSV column / point field drives the accuracy axis. "avg" = mean of all 3.
 METRIC_COLS = {
@@ -419,12 +419,12 @@ let chart = new Chart(document.getElementById('pareto').getContext('2d'), {{
     layout: {{ padding: {{ top: 10, right: 20, bottom: 10, left: 10 }} }},
     scales: {{
       x: {{
-        title: {{ display: true, text: 'Critical Path Reduction (%)', font: {{ size: 14, weight: 'bold' }} }},
-        min: {x_min}, max: {x_max}, ticks: {{ callback: v => v + '%' }}, grid: {{ color: '#f0f0f0' }},
+        title: {{ display: true, text: 'Critical Path Reduction (%)', font: {{ size: 20, weight: 'bold' }} }},
+        min: {x_min}, max: {x_max}, ticks: {{ callback: v => v + '%', font: {{ size: 15 }} }}, grid: {{ color: '#f0f0f0' }},
       }},
       y: {{
-        title: {{ display: true, text: '{y_axis_label}', font: {{ size: 14, weight: 'bold' }} }},
-        min: {y_min}, max: {y_max}, ticks: {{ callback: v => v.toFixed(0) + '%' }}, grid: {{ color: '#f0f0f0' }},
+        title: {{ display: true, text: '{y_axis_label}', font: {{ size: 20, weight: 'bold' }} }},
+        min: {y_min}, max: {y_max}, ticks: {{ callback: v => v.toFixed(0) + '%', font: {{ size: 15 }} }}, grid: {{ color: '#f0f0f0' }},
       }}
     }},
     plugins: {{
@@ -539,6 +539,89 @@ setSource(DEFAULT_SOURCE);
     ))
 
 
+def generate_png(points, output_path, y_min_override=None, y_max_override=None, metric="avg"):
+    """Static PNG of the same Pareto chart (matplotlib), matching the HTML colors,
+    markers and per-category canonical frontiers. Deliberately omits the per-point
+    text labels for the rl/aux points (only the pretrained baseline keeps a label),
+    for a clean publication-style figure."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import FuncFormatter
+    except Exception as e:  # noqa: BLE001
+        print("PNG skipped (matplotlib unavailable): {}".format(e))
+        return
+
+    # Marker / color styling mirrored from the HTML STYLES + FRONTIER_COLORS.
+    STYLE = {
+        "pretrained": dict(color="#000000", marker="*", s=420, ec="#000000"),
+        "aux_only":   dict(color="#4caf50", marker="D", s=80,  ec="#2e7d32"),
+        "rl_only":    dict(color="#e53935", marker="^", s=95,  ec="#c62828"),
+        "rl+aux":     dict(color="#2196f3", marker="o", s=85,  ec="#1565c0"),
+        "degraded":   dict(color="#b4b4b4", marker="x", s=55,  ec="#969696"),
+    }
+    FCOLOR = {"aux_only": "#2e7d32", "rl_only": "#c62828", "rl+aux": "#1565c0"}
+    LEGEND = {
+        "pretrained": "Pretrained Baseline", "aux_only": "Aux Loss Only",
+        "rl_only": "RL Only (no aux)", "rl+aux": "RL + Aux Combined",
+        "degraded": "Multi-epoch PPO (degraded)",
+    }
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+
+    # Per-category canonical Pareto frontier dashed lines (same source the HTML draws).
+    for cat in ("aux_only", "rl_only", "rl+aux"):
+        cat_pts = [p for p in points if p["cat"] == cat]
+        fr = compute_pareto_frontier(cat_pts)  # sorted by x
+        if len(fr) >= 2:
+            ax.plot([p["x"] for p in fr], [p["y"] for p in fr], "--",
+                    color=FCOLOR[cat], lw=2, alpha=0.7, zorder=2)
+
+    # Scatter, drawn in a stable z-order with the baseline on top.
+    for cat in ("aux_only", "rl_only", "rl+aux", "degraded", "pretrained"):
+        cat_pts = [p for p in points if p["cat"] == cat]
+        if not cat_pts:
+            continue
+        st = STYLE.get(cat, STYLE["degraded"])
+        ax.scatter([p["x"] for p in cat_pts], [p["y"] for p in cat_pts],
+                   c=st["color"], marker=st["marker"], s=st["s"],
+                   edgecolors=st["ec"], linewidths=0.8, zorder=3, label=LEGEND.get(cat, cat))
+
+    # Only the baseline keeps a text label (rl/aux point labels are intentionally omitted).
+    for p in (p for p in points if p["cat"] == "pretrained"):
+        ax.annotate("Pretrained", (p["x"], p["y"]), textcoords="offset points",
+                    xytext=(12, 8), fontsize=17, fontweight="bold", zorder=5)
+
+    xs = [p["x"] for p in points] or [0]
+    ys = [p["y"] for p in points] or [0]
+    y_min = y_min_override if y_min_override is not None else max(30, int(min(ys)) - 2)
+    y_max = y_max_override if y_max_override is not None else int(max(ys)) + 2
+    ax.set_xlim(round(min(xs) - 3, 1), round(max(xs) + 4, 1))
+    ax.set_ylim(y_min, y_max)
+
+    # Concise y-label for the PNG (the verbose avg label overflows the axis at size 20).
+    y_label_png = "Benchmark Accuracy (%)" if metric == "avg" else METRIC_AXIS_LABEL.get(metric, "Benchmark Accuracy (%)")
+    ax.set_xlabel("Critical Path Reduction (%)", fontsize=20, fontweight="bold")
+    ax.set_ylabel(y_label_png, fontsize=20, fontweight="bold")
+    ax.tick_params(axis="both", labelsize=15)
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: "{:g}%".format(v)))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: "{:g}%".format(v)))
+    ax.grid(True, color="#f0f0f0")
+    # "best" direction indicator: upper-right (more CP reduction + higher accuracy) is best.
+    ax.annotate("best", xy=(0.96, 0.96), xytext=(0.80, 0.80),
+                xycoords="axes fraction", textcoords="axes fraction",
+                fontsize=16, fontweight="bold", color="#444",
+                ha="center", va="center",
+                arrowprops=dict(arrowstyle="-|>", color="#444", lw=2.6))
+    # Legend moved to lower-left so it doesn't collide with the "best" arrow.
+    ax.legend(fontsize=20, loc="lower left")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print("PNG written to: {}".format(output_path))
+
+
 
 def ensure_baseline_point(points, csv_path, run_name_prefix=None, metric="avg"):
     """Guarantee the pretrained baseline is plotted, regardless of limit filter
@@ -599,8 +682,8 @@ def main():
                         help="Y-axis minimum (default: auto)")
     parser.add_argument("--run-name-prefix", type=str, default=None,
                         help="Only include rows whose run_name starts with this string (e.g. '235b' for 235B-only chart)")
-    parser.add_argument("--baseline-cp", type=float, default=4780,
-                        help="Reference baseline critical_path (default 4780 = 30B pretrained; use 8800 for 235B)")
+    parser.add_argument("--baseline-cp", type=float, default=9320,
+                        help="Reference baseline critical_path (235B pretrained earliest-measured CP)")
     parser.add_argument("--baseline-label", type=str, default="Qwen3-30B-A3B",
                         help="Label for the baseline shown on the chart")
     parser.add_argument("--y-max", type=float, default=None,
@@ -654,6 +737,7 @@ def main():
 
     points = ensure_baseline_point(points, args.csv, run_name_prefix=args.run_name_prefix, metric=args.metric)
     generate_html(points, args.output, y_min_override=args.y_min, y_max_override=args.y_max, metric=args.metric)
+    generate_png(points, args.output.with_suffix(".png"), y_min_override=args.y_min, y_max_override=args.y_max, metric=args.metric)
 
 
 if __name__ == "__main__":
