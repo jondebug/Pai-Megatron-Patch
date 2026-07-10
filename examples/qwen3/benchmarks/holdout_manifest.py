@@ -43,6 +43,24 @@ BESTS=[
 ]
 for cell,its in CORNER+BESTS:
     for it in its: want.add((cell,it))
+# AUX-ONLY re-test ladder (2026-07-10): per aux-only cell with real evals, best-acc iter + 3000
+bycell={}
+for r in inf:
+    n=r["run_name"].strip()
+    if "norl" not in n: continue
+    try: it=int(float(r.get("bench_iteration") or r.get("train_iters")))
+    except: continue
+    a=f(r.get("benchmark_avg"))
+    if a: bycell.setdefault(n,[]).append((a,it))
+for cell,pts_ in bycell.items():
+    best=max(pts_)[1]
+    want.add((cell,best))
+    if any(it==3000 for a,it in pts_): want.add((cell,3000))
+# v18s seed cells: full grid (they ARE the aux corner replication)
+for sd in ("2027","2028"):
+    for aux in ("0.001","0.02","0.005","0.015"):
+        for it in (1500,2000,2500,3000):
+            want.add(("235bv18s_norl_aux%s_seed%s_r1"%(aux,sd),it))
 out=[]; missing=[]
 for cell,it in sorted(want):
     if (cell,it) in have_hold: continue
