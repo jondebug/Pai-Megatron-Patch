@@ -403,3 +403,27 @@ and the r46 CONTROL = +4.9% dec / −4.2% std. No dose-response, control outrank
 treatment, signs flip across regimes → selection-from-noise. CP-RL e2e effect
 remains bounded within the ±3-5% job-to-job noise floor on every backend tested
 (TP=EP+AR, naive a2a, AG+RS, hybrid_ep eager).
+
+## §K (2026-07-10): EP=32/64 AG+RS ladder finale + measured decode-step decomposition
+
+**Ladder (AG+RS, dec regime, r15/r05/r46 vs pre, per-EP A/A):**
+EP=32 round1: AA −5.5, r15 +2.0, r05 −0.7, r46 −5.5 | round2 (fresh alloc): AA 0.0,
+r15 +8.5, r05 −6.5 | EP=64: AA −1.2, r15 +7.7, r05 +0.3, r46 +0.0.
+A/A itself swings 0↔−5.5% between replicas; r05 (strongest CP cut) ≤0 in 3 of 4 runs;
+hybrid_ep r05 std flipped +12.0→−6.5 across replicas. **No dose-response at any EP;
+CP-RL e2e effect remains bounded by the ±6-8% job-level noise floor at EP=8-64 on all
+backends.** r15-only positives (+2.0/+8.5/+7.7 dec) lack ordering support and match the
+noise envelope; logged, not claimed.
+
+**Measured decode-step decomposition (AG+RS EP=8, c=64, ITL=19.0ms, nsys
+--cuda-graph-trace=node, per GPU):** compute 9.5-9.9ms (~51%) | NCCL comms 7.7-8.2ms
+(~42%, RS:AG ≈ 2:1, essentially unoverlapped; includes late-arrival spin) | idle 1.4ms
+(~7%). Key contrast with the offline TP=EP harness: host idle collapsed 60-81% → 7%
+under serve+CUDA graphs. Comms fraction is large but fixed-size (AG+RS is
+balance-insensitive by construction) — consistent with CP changes having no e2e lever
+in this config.
+
+**Tracing graphed vLLM**: nsys defaults to graph-level trace — kernel table shows only
+the eager fringe (0.6s busy in a 20s dec window). MUST pass --cuda-graph-trace=node.
+vLLM serve head node hangs on SIGINT (NCCL teardown) — worker-node traces are the
+reliable artifact; kill-escalation pattern in hsg_scripts/hsg_serve_agrs_nsys.sh.
