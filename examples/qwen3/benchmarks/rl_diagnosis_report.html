@@ -11,7 +11,7 @@ code{background:#f5f5f5;padding:1px 5px;border-radius:3px;font-size:0.9em}
 .hyp{background:#fffde7;border-left:4px solid #f9a825;padding:6px 12px;margin:8px 0;font-size:0.93em}
 </style></head><body>
 <h1>RL-Benefit Diagnosis — Qwen3-235B Router-Only RL vs Aux-Loss</h1>
-<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-11 15:08.
+<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-11 15:21.
 Spec: <code>docs/superpowers/specs/2026-07-11-rl-benefit-diagnosis-design.md</code>.
 All accuracy/CP data from the audited registry (canonical CP, quarantined rows excluded).</p>
 <div class="card"><h2>0. Overview — hypotheses, diagnostics, decision rule</h2>
@@ -93,5 +93,38 @@ actually PPO) and un-whitened (scale-preserving) advantages. These are three ind
 upgrades.</p>
 <p><span class="verdict" style="background:#c62828">CONFIRMED</span> &nbsp; CONFIRMED — ppo_epochs=1 (REINFORCE in practice), max-objectives restricted to per-layer scalar advantages (no token credit), and the only per-token reward is an aux-like surrogate. The winning quadrant (per-token credit x true CP) is empty.</p>
 <p class="meta">updated 2026-07-11 15:08</p>
+</div>
+<div class="card"><h2>4. Literature verdicts (adversarially verified deep-research pass)</h2>
+<div class="hyp"><b>Hypothesis under test:</b> Which of H1-H5 does published work support, and what method upgrades have precedent?</div>
+<p><b>Method:</b> 5 search angles, 22 primary sources fetched, 108 claims extracted, top 25 verified by 3 independent adversarial voters (2/3 refutes kill); 20 confirmed / 5 refuted.</p>
+
+<p>Deep-research pass (22 sources, 108 extracted claims, top 25 adversarially verified with 3 votes;
+20 survived). Every quote verbatim-verified. Full notes: <code>docs/research_notes/rl-moe-litreview.md</code>.</p>
+<table><tr><th>Hypothesis</th><th>Literature verdict</th></tr>
+<tr><td>H1 reward convergence</td><td><b>Supported within the aux family</b> — Shazeer'17 App.A: importance/load losses across coeffs 0.01&ndash;1.0 all land at PPL 35.6&ndash;35.7 (unregularized 39.8): the specific balance objective barely matters. <b>Refuted between task-reward RL and balance</b> (MoE-GRPO still needs the LB loss, +0.9%).</td></tr>
+<tr><td>H2 broken credit</td><td><b>Best-supported.</b> The only direct RL-on-router precedent (MoE-GRPO, CVPR'26) broadcasts ONE sequence-level advantage to all layers/tokens — coarser than ours — and its Gate-GRPO alone degrades accuracy. MoE routing is documented RL-unstable: ~10% expert flips per update (GSPO), measurable train-vs-infer routing divergence (R3).</td></tr>
+<tr><td>H3 frozen-LM manifold</td><td><b>Contradicted for quality headroom</b>: RoMA (ICLR'26) — pretrained routers leave a 10&ndash;20pp oracle gap; router-ONLY finetuning at a fully frozen backbone recovers +4.6&ndash;+11.2pp MMLU. Balance-conditional headroom still unproven &rarr; D1 stays necessary.</td></tr>
+<tr><td>H4 hyperparam asymmetry</td><td>Indirect: RLOO removes the value network entirely (leave-one-out baseline) and beats PPO by 10&ndash;32pp win-rate — the critic our v14cg arm collapsed on is unnecessary.</td></tr>
+<tr><td>H5 proxy batch shape</td><td>No literature signal — D4 is novel measurement.</td></tr></table>
+<p><b>Literature-grounded method upgrade</b> (fills the empty quadrant from section 3):</p>
+<ol>
+<li><b>Exact difference rewards, critic-free</b> (Dr.Reinforce): when the global reward is an analytic
+function of decisions — CP is — the counterfactual advantage is computed by differencing the reward
+function itself. Caveat (verified): max-objectives give zero credit to non-bottleneck tokens &rarr;
+difference a smoothed aggregate (LogSumExp over expert loads); monitor corr vs aux objective so
+smoothing doesn't recreate H1.</li>
+<li><b>RLOO k-realization baselining</b> — kills the critic hyperparameter surface; pair with (1)
+because sequence-level credit alone was refuted 0-3.</li>
+<li><b>Enable real PPO</b> (ppo_epochs&ge;2) with router-shift control: R3 rollout-routing-replay
+(Megatron-LM PR #4168 — our stack) or RSPO stop-grad down-weighting; never backprop through
+router-derived ratios (collapses at ~40 steps).</li></ol>
+<p><b>Positioning:</b> no prior work does router-only RL with a balance/CP reward on a frozen
+backbone — our setup is more novel than assumed, and Shazeer'17 App.A lets us frame bulk-region
+parity as <i>extending balance-method-independence</i> to naive RL, with the deep end as the
+divergence. Gaps the pass could not verify: aux-alternatives comparisons (loss-free bias, Expert
+Choice, Sinkhorn, EPLB) and constrained-RL CP-budget methods — the "dial-a-CP" Lagrangian story has
+no found precedent (potential novelty).</p>
+<p><span class="verdict" style="background:#ef6c00">PARTIAL</span> &nbsp; H2 best-supported by literature; H3 contradicted for quality headroom (balance-conditional case open); the counterfactual-CP design is validated as Dr.Reinforce-style exact difference rewards with a LogSumExp smoothing caveat.</p>
+<p class="meta">updated 2026-07-11 15:21</p>
 </div>
 </body></html>
