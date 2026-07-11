@@ -11,7 +11,7 @@ code{background:#f5f5f5;padding:1px 5px;border-radius:3px;font-size:0.9em}
 .hyp{background:#fffde7;border-left:4px solid #f9a825;padding:6px 12px;margin:8px 0;font-size:0.93em}
 </style></head><body>
 <h1>RL-Benefit Diagnosis — Qwen3-235B Router-Only RL vs Aux-Loss</h1>
-<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-11 15:21.
+<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-11 15:56.
 Spec: <code>docs/superpowers/specs/2026-07-11-rl-benefit-diagnosis-design.md</code>.
 All accuracy/CP data from the audited registry (canonical CP, quarantined rows excluded).</p>
 <div class="card"><h2>0. Overview — hypotheses, diagnostics, decision rule</h2>
@@ -126,5 +126,43 @@ Choice, Sinkhorn, EPLB) and constrained-RL CP-budget methods — the "dial-a-CP"
 no found precedent (potential novelty).</p>
 <p><span class="verdict" style="background:#ef6c00">PARTIAL</span> &nbsp; H2 best-supported by literature; H3 contradicted for quality headroom (balance-conditional case open); the counterfactual-CP design is validated as Dr.Reinforce-style exact difference rewards with a LogSumExp smoothing caveat.</p>
 <p class="meta">updated 2026-07-11 15:21</p>
+</div>
+<div class="card"><h2>5. Upgrade pilots — one variable each, ready to launch</h2>
+<div class="hyp"><b>Hypothesis under test:</b> If sections 3-4 are right, per-token exact difference rewards (P1), critic-free RLOO baselines (P2), and real multi-epoch PPO (P3) should each independently improve the accuracy-per-CP trade over the corner recipe.</div>
+<p><b>Method:</b> Three single-variable pilot cells + contemporaneous control, fresh 0-1500 @ EP=16, corner recipe base, full PPO telemetry.</p>
+
+<p>Three pilot cells, each isolating ONE upgrade from sections 3–4, all at the proven corner recipe
+(rlc0.5, aux 0.001, kl 0.001, seed 1234 for comparability with the n=3 fixed-seed family), fresh-start
+0&rarr;1500 @ EP=16, standard grid evals + canonical CP. Ready to submit the moment disk frees
+(<code>submit_fresh_corner_ep16.sh</code> env-driven; new reward/config flags to be added to
+rl_trajectory.py behind defaults-off switches).</p>
+<table><tr><th>Pilot</th><th>Change (only one)</th><th>Mechanism it tests</th><th>Success signal @1500</th></tr>
+<tr><td><b>P1 diff-reward</b></td><td>reward_type=<code>diff_lse_load</code>: per-token exact difference
+reward &Delta;R = R(loads) &minus; R(loads with token t moved to its next-best expert), where R =
+&minus;LogSumExp<sub>&tau;</sub>(expert loads) per layer (&tau; tuned so soft-max&asymp;max but gradient reaches
+non-bottleneck tokens). Per-token credit on the (smoothed) true objective — fills the empty quadrant.
+Monitor corr(reward, load_balancing_loss): if &rarr;1, smoothing collapsed into H1.</td>
+<td>Dr.Reinforce exact differencing (2012.11258)</td>
+<td>lower CP than the corner family at equal acc (76.0/8000 band), or equal CP at higher acc; corr &lt; 0.9</td></tr>
+<tr><td><b>P2 RLOO</b></td><td>baseline_type=<code>rloo</code>: k=4 stochastic routing realizations per batch
+(router sampling on), each realization's scalar CP reward baselined against the other 3. No critic at all.</td>
+<td>RLOO (2402.14740) — removes the critic surface that collapsed in v14cg</td>
+<td>stable training at rlc1 (where critic+&gamma; collapsed); CP slope &ge; surrogate cell's</td></tr>
+<tr><td><b>P3 real-PPO</b></td><td><code>ppo_epochs=2</code> (existing run_extra_ppo_epochs machinery),
+clip 0.2, extra-epoch LR 1e-4/(K-1), stop-gradient on any router-shift ratio (RSPO: backprop through it
+collapses at ~40 steps). Everything else = corner recipe.</td>
+<td>clip_fraction must become &gt;0 — PPO actually PPO for the first time</td>
+<td>clip_fraction in (0.01, 0.3); non-degraded acc; faster CP descent per iter than corner family</td></tr></table>
+<p><b>Controls & instrumentation:</b> all three log clip_fraction / approx_kl / advantage_std /
+value_loss + corr(reward, lb_loss) per 100 iters (the D2/D3 telemetry that exposed the current
+implementation). A fourth slot re-runs the plain corner recipe fresh under identical code as the
+contemporaneous control. Budget: 4 cells &times; 1500 iters &times; 16 GPUs &asymp; 1.4k GPU-h.
+Decision rule: any pilot beating the corner-family band at matched CP graduates to a 6-cell mini-sweep;
+P1&times;P2 combine naturally (exact per-token differencing + critic-free realization baseline).</p>
+<p><i>Blocked on:</i> disk unpause (same lever as the aux-extension control D5). Implementation of
+diff_lse_load + rloo flags: ~1 day of careful work in rl_trajectory.py, behind default-off switches so
+existing cells are untouched.</p>
+<p><span class="verdict" style="background:#616161">PENDING</span> &nbsp; Designed; awaiting disk unpause + ~1 day implementation of the two new flags.</p>
+<p class="meta">updated 2026-07-11 15:56</p>
 </div>
 </body></html>
