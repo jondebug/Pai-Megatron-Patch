@@ -105,8 +105,25 @@ def read_cp_json(cell, it):
     except Exception:
         return ("", "")
 
+def _dup_suspect(cell, it, limit, hella, arc, wino):
+    # Audit F1 guard (2026-07-11): a NEW eval whose 3-task triple exactly matches a DIFFERENT
+    # iteration of the same cell is almost surely a wrong-checkpoint eval (converter latest-file
+    # race; P(genuine tie) ~1e-4). Reject + log; operator can force by clearing the sibling row.
+    trip=(round(hella*100,2),round(arc*100,2),round(wino*100,2))
+    for (c,i,l),r in idx.items():
+        if c==cell and l==limit and i!=str(int(it)):
+            try:
+                if (float(r.get("hellaswag")),float(r.get("arc_challenge")),float(r.get("winogrande")))==trip:
+                    return i
+            except Exception: pass
+    return None
+
 def upsert(cell, it, limit, hella, arc, wino, ckpt_path, src):
     it=str(int(it)); avg=round((hella+arc+wino)/3*100,2)
+    _d=_dup_suspect(cell,it,limit,hella,arc,wino)
+    if _d is not None:
+        print("SUSPECT-DUP: %s@%s triple identical to @%s -- REJECTED (wrong-ckpt eval?)"%(cell,it,_d))
+        return "suspect-dup"
     clu="nrt" if "/lustre/fs1/" in (ckpt_path or "") else "ord"
     key=(cell,it,limit)
     if key in idx:

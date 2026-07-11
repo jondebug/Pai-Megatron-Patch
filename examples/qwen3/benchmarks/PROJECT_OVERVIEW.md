@@ -7,7 +7,7 @@
 
 **Method.** Freeze the whole model and train **only the router weights** (<1% of params) with PPO. Each token's sequence of per-layer routing decisions is treated as a trajectory, optimized against a dense load-aware reward built from the **critical path (CP)**, the summed busiest-expert load across layers (defined below).
 
-**Results.** On Qwen3-235B-A22B, router-only RL (+aux) **matches the aux-loss baseline through ~52% CP reduction and extends the frontier beyond it** — to ~61% CP reduction at ~3.4pp holdout cost (96.6% retention). Selection uses lm-evaluation-harness (HellaSwag, ARC-Challenge, WinoGrande); headline numbers are reported on a never-selected model-card holdout suite (MMLU, GSM8K, MMLU-Pro, BBH), where both methods are lossless at ≤17.5% reduction.
+**Results.** On Qwen3-235B-A22B, router-only RL (+aux) **matches the aux-loss baseline through ~52% CP reduction and extends the frontier beyond it** — to ~61% CP reduction at ~2.8pp holdout cost (3.4% relative; 96.6% retention; n=1, matched 3000-iter budget). Selection uses lm-evaluation-harness (HellaSwag, ARC-Challenge, WinoGrande); headline numbers are reported on a never-selected model-card holdout suite (MMLU, GSM8K, MMLU-Pro, BBH), where both methods are lossless at ≤17.5% reduction.
 
 
 ## Motivation & Problem Setup
@@ -40,7 +40,7 @@ Aux-only uses the standard Switch-Transformer-style MoE auxiliary loss. It is sm
 
 RL-only optimizes the load-aware reward directly. It can target critical path more naturally than aux loss, because the reward is defined from the loads actually produced by routing decisions. Its weakness is that it has no smooth differentiable load-balancing floor and no explicit quality guard beyond frozen LM weights and benchmark selection.
 
-RL+aux combines the two: aux supplies a stable smooth gradient, while RL pushes against the actual load objective. On the **235B selection-suite frontier, RL+aux is the dominant variant**: it accounts for nearly all non-dominated points across the full ~6%→~61% CP-reduction range (on the unbiased holdout suite the picture is parity through ~52% plus an RL-only-reachable deep end — see R1b/R2). The 30B reference frontier shows the same pattern. RL-only is useful as an ablation and does appear on the high-accuracy frontier, but RL+aux is the practical default.
+RL+aux combines the two: aux supplies a stable smooth gradient, while RL pushes against the actual load objective. On the **235B selection-suite frontier, RL+aux holds most non-dominated points** across the ~6%→~61% CP-reduction range, with aux-only holding frontier points at ~55–58% (on the unbiased holdout suite the picture is parity through ~52% plus an RL-extended deep end — see R1b/R2). The 30B reference frontier shows the same pattern. *(Audit correction 2026-07-11: the RL-only ablation is currently **untested at this scale** — a classification bug had populated the "RL-only" class with RL+aux cells that train with the launcher-default aux 0.01; the registry contains exactly one genuine RL-only full evaluation (74.03 @ CP 5914). Claims that the aux floor is necessary are therefore not yet supported by data.)*
 
 ## Method: PPO formulation & reward design
 **Trajectory.** For each token, its routing decisions across the `L` MoE layers form a length-`L` trajectory `(s_ℓ, a_ℓ, r_ℓ)`:
@@ -126,20 +126,35 @@ retention — the corner is genuinely lossless on benchmarks never selected on, 
 ~50–52% (+0.55, where `aux0.015 seed` dominates r15 on both axes), RL is ahead at ~38% (r33, entropy
 reward, dominates r26 on both axes); point-to-point gaps are comparable to the ±0.3–0.5 replication
 spread. The on-suite mid-band RL margin (+1.0pp at ~35%) does **not** replicate on holdout.
-(iii) **Deep end (~57–61%): RL leads** — r62 (79.19 @ CP 3669) extends the frontier to −60.6% at
-96.6% retention and dominates every aux point below CP 4000; aux tops out at −58.3% and 96.0%.
+(iii) **Deep end (~57–61%): RL extends the maximum achievable reduction** — r62 (79.19 @ CP 3669)
+pushes the frontier from aux's −58.3% to **−60.6%** at comparable retention (96.6% vs aux's
+96.0–97.0% in the band; the point-level gaps are within noise, and the aux `aux0.015 seed rep @3000`
+at 79.56 @ CP 4015 exceeds every RL point in the band on accuracy). This is an **n=1, matched
+3000-iteration-budget** result: no aux configuration was trained past the coefficient grid (≤0.02)
+or budget where it could contest CP < 3800, so "extends" — not "dominates" — is the supported claim
+until the aux-extension control (aux0.02→4000 iters or aux 0.03) runs.
 (iv) Notable: the best mid-band RL holdout point (r33) uses the **entropy reward**, not the
 critical-path reward — reward-shape choice matters more on holdout than on the selection suite.
+(v) *Data-integrity note (2026-07-11):* an audit found a converter race that gave ~20 selection-suite
+rows (10 pairs with bit-identical 3-task scores at different iterations) the wrong checkpoint's
+accuracy, including the aux deep-end point `v18s aux0.02@3000` and the `v18s aux0.001 seed2027`
+corner replicas. These rows are quarantined and re-evaluating under the fixed (serialized) converter;
+**holdout scores were verified unaffected** (distinct per iteration throughout). Four old `v12corner`
+rows are unrecoverable (checkpoints pruned). Numbers in this section may shift slightly when the
+re-evals land.
 
-**R2. RL vs aux-only vs RL+aux.**
-On the **selection suite**, RL+aux owns the entire overall frontier (as of 2026-07-08): the top is
-`v15klcg kl0.001` at **76.37 @ CP 8179** (single seed; family mean 75.73±0.32 @3000 — see R4), which
-unseats the aux-only corner (76.28 @ 8435, n=1) at the point level and holds **iso-accuracy at ~6%
-lower CP** at the family level. Below the corner, RL+aux dominates continuously to **60.6% CP
-reduction** (aux-only max 57.2% on-suite), with the largest on-suite margin (+1.0pp at ~35%
-reduction) from the γ-stabilized `v16cgr rlc0.1 γ0.3` point (75.90 @ 6090). RL-only (no aux floor)
-is dominated everywhere — the combination is what wins. γ (discounting with a critic baseline) is
-productive **only at low rlc** (≤0.25); at rlc=1 it collapses the router.
+**R2. RL vs aux-only vs RL+aux.** *(rewritten 2026-07-11 after registry audit)*
+On the **selection suite**, RL+aux holds the high-accuracy frontier: the top is `v15klcg kl0.001` at
+**76.37 @ CP 8179** (single seed; family mean 75.73±0.32 @3000 — see R4), which unseats the aux-only
+corner (76.28 @ 8435, n=1) at the point level and holds **iso-accuracy at ~6% lower CP** at the
+family level. Below the corner, RL+aux holds most of the frontier, but **not all of it**: aux-only
+retains non-dominated points at ~55% (`r29@2500`: 74.08 @ 4189) and ~58.3% reduction, so RL's
+exclusive on-suite extension is the CP ≈3900→3669 band (to **60.6%** reduction). The largest
+on-suite RL margin (+1.0pp at ~35% reduction, `v16cgr rlc0.1 γ0.3`: 75.90 @ 6090) does not
+replicate on holdout (see R1b). The RL-only ablation (no aux floor) has **n=1** usable evaluation —
+see the class-labeling correction in "RL, Aux-Only, and RL+Aux" — so no conclusion is drawn about
+it. γ (discounting with a critic baseline) is productive **only at low rlc** (≤0.25); at rlc=1 it
+collapses the router.
 
 *Holdout qualification (2026-07-10, see R1b):* part of that on-suite frontier ownership is
 selection-on-test bias. On the never-selected model-card suite the two families are **statistically
@@ -151,11 +166,13 @@ range*, not that it dominates throughout.
 
 **R4. Replication variance.**
 The corner config (`rlc0.5 aux0.001 critic γ0 kl0.001`) was replicated with 3 independent runs to iter
-3000. *(Correction 2026-07-08: a submission bug meant all three runs used the same seed (1234) — these
-bars measure **run-to-run training nondeterminism** at fixed seed, a lower bound on seed variance.
-True distinct-seed replicas (seeds 2027/2028) have since completed and confirm the picture on the
-holdout axis: corner family @3000 = 81.41–81.62 holdout (99.3–99.5% retention), spread consistent
-with the fixed-seed bars; aux-only seed replicas (v18s) land at 99.2–100.3% — see R1b.)*
+3000. *(Correction 2026-07-08, re-corrected 2026-07-11: a submission bug meant all three runs — the
+cells named `seed2027`/`seed2028` included — used the same seed (1234). ALL bars here therefore
+measure **run-to-run training nondeterminism at fixed seed**, a lower bound on true seed variance
+(previously estimated ~1pp). Genuine distinct-seed replicas (seeds 3027/3028) are registered but
+have not completed training; no distinct-seed confirmation exists yet, and Figure 5's corner
+errorbar is likewise a same-seed spread. The corner family @3000 holdout spread at fixed seed is
+81.41–81.62 (99.3–99.5% retention).)*
 Family stats:
 acc mean ± half-range = 75.76±0.53 @1500, 75.47±0.32 @2000, 75.64±0.53 @2500, **75.73±0.32 @3000
 (CP 7950±198)**. The headline 76.37/76.27 points are the original seed's high draws; seed spread exceeds the

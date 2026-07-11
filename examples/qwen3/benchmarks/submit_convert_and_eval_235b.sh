@@ -29,7 +29,7 @@ TRAINED_MEGATRON_CKPT="${TRAINED_MEGATRON_CKPT:?Set TRAINED_MEGATRON_CKPT}"
 ITER_NUM="${ITER_NUM:?Set ITER_NUM}"
 LIMIT="${LIMIT:-}"
 RUN_NAME="${RUN_NAME:-unknown}"
-HF_OUTPUT_DIR="${TRAINED_MEGATRON_CKPT}/hf_converted_iter${ITER_NUM}_cp"
+HF_OUTPUT_DIR="${HF_OVERRIDE:-${TRAINED_MEGATRON_CKPT}/hf_converted_iter${ITER_NUM}_cp}"
 LIMIT_TAG="${LIMIT:-inf}"
 BENCHMARK_DIR="${TRAINED_MEGATRON_CKPT}/benchmark_iter${ITER_NUM}_limit${LIMIT_TAG}"
 
@@ -54,13 +54,27 @@ if [ -f "${BENCHMARK_DIR}/accuracy_summary.json" ]; then
 fi
 
 # STEP 1: Convert (skip if HF already has safetensors)
-if ls "${HF_OUTPUT_DIR}"/*.safetensors 1>/dev/null 2>&1; then
-    echo "HF already converted ($(ls ${HF_OUTPUT_DIR}/*.safetensors | wc -l) shards), skipping convert."
+NSH_EXIST=$(ls "${HF_OUTPUT_DIR}"/*.safetensors 2>/dev/null | wc -l)
+if [ "${NSH_EXIST}" -ge 100 ]; then
+    echo "HF already converted (${NSH_EXIST} shards), skipping convert."
 else
+    if [ "${NSH_EXIST}" -gt 0 ]; then
+        echo "Partial HF (${NSH_EXIST} shards) -- deleting and reconverting (audit T3 fix 2026-07-11)"
+        rm -rf "${HF_OUTPUT_DIR}"
+    fi
     echo "Starting 2-node PP=2 EP=8 convert..."
+    # Audit F4 fix (2026-07-11): converts of the SAME cell must serialize -- they share the cell
+    # latest_checkpointed_iteration.txt, and concurrent writes made hf_iter{A} receive iter B weights
+    # (9 bit-identical eval groups). flock serializes; trap restores on ANY exit incl. set -e paths.
     LATEST_FILE="${TRAINED_MEGATRON_CKPT}/latest_checkpointed_iteration.txt"
+    exec 9>"${TRAINED_MEGATRON_CKPT}/.convert.lock"
+    echo "acquiring per-cell convert lock..."
+    flock 9
+    echo "lock acquired"
     ORIGINAL_LATEST=""
     [ -f "${LATEST_FILE}" ] && ORIGINAL_LATEST=$(cat "${LATEST_FILE}")
+    restore_latest() { [ -n "${ORIGINAL_LATEST}" ] && echo "${ORIGINAL_LATEST}" > "${LATEST_FILE}" || true; }
+    trap restore_latest EXIT
     echo "${ITER_NUM}" > "${LATEST_FILE}"
 
     MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)
@@ -84,7 +98,7 @@ else
              bash scripts/qwen3/run_A22B_16xH20.sh A22B '${TRAINED_MEGATRON_CKPT}' '${HF_OUTPUT_DIR}' true true bf16 '${ORIGINAL_HF}'
          "
     CONV_EXIT=$?
-    [ -n "${ORIGINAL_LATEST}" ] && echo "${ORIGINAL_LATEST}" > "${LATEST_FILE}" || true
+    restore_latest; trap - EXIT
     if [ ${CONV_EXIT} -ne 0 ]; then echo "Convert FAILED exit=${CONV_EXIT}"; exit 1; fi
     NSHARDS=$(ls ${HF_OUTPUT_DIR}/*.safetensors 2>/dev/null | wc -l)
     if [ "${NSHARDS}" -lt 100 ]; then

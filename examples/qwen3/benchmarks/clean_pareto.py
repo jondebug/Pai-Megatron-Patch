@@ -14,7 +14,15 @@ CORNER_SIG="v15klcg_rlc0.5_aux0.001_basecritic_g0_kl0.001"   # corner config fam
 def f(x):
     try: return float(x)
     except: return None
-def cls(n):
+def cls(n, cat=""):
+    # Audit F2 fix (2026-07-11): the name regex misclassified 79 rows (mean_ppo/v6 cells train with
+    # the launcher-default aux=0.01 but carry no "aux" token) -- trust the CSV category column;
+    # fall back to the name only when category is missing. category "other"/"pretrained" -> None.
+    cat=(cat or "").strip()
+    if cat=="aux_only": return "aux"
+    if cat=="rl+aux": return "rl+aux"
+    if cat=="rl_only": return "rl-only"
+    if cat in ("other","pretrained"): return None
     if "norl" in n: return "aux"
     m=re.search(r"aux([0-9.]+)",n)
     return "rl+aux" if (m and float(m.group(1))>0) else "rl-only"
@@ -31,7 +39,8 @@ for r in csv.DictReader(open(B+"/benchmark_results.csv")):
     if HOLDOUT and CORNER_SIG in n:
         it=f(r.get("bench_iteration") or r.get("train_iters"))
         if it and abs(it-3000)<60: corner.append((c,a))
-    pts[cls(n)].append((c,a))
+    _k=cls(n, r.get("category",""))
+    if _k is not None: pts[_k].append((c,a))
 if HOLDOUT and BASE_ACC==76.74: BASE_ACC=82.01   # fallback: our-harness pretrained 4-task mean
 def frontier(ps):  # non-dominated: no other pt with cp<= and acc>= (strictly better once)
     fr=[p for p in ps if not any(q[0]<=p[0] and q[1]>=p[1] and (q[0]<p[0] or q[1]>p[1]) for q in ps)]
