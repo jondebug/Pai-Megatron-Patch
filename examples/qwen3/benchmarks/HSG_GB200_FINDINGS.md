@@ -427,3 +427,37 @@ in this config.
 the eager fringe (0.6s busy in a 20s dec window). MUST pass --cuda-graph-trace=node.
 vLLM serve head node hangs on SIGINT (NCCL teardown) — worker-node traces are the
 reliable artifact; kill-escalation pattern in hsg_scripts/hsg_serve_agrs_nsys.sh.
+
+## §L (2026-07-11): CP existence proof (spec c4de14f) — NULL, with the mechanism visible
+
+Pre-registered experiment: eager hybrid_ep, EP=32 (8N), prefill saturation plen=4096
+gen=1 c=64, ~4k tok/expert (9× GEMM knee). Cells: A/A ×2, r05 ×2, r15, r46.
+
+**Three rounds, two artifacts caught by the §6 gates, one clean null:**
+1. Round 1 NONSENSICAL (gate 3): identical bench prompts hit vLLM prefix caching →
+   4096-token "prefills" in 150ms (implied 80% MFU). Fix: unique per-request prompts.
+2. Round 2 confounded: prompts seeded per-model-name → A and B sides ran different
+   prompt sets → different expert loads. A/A "envelope" ±13.7pp was largely real
+   routing-load difference. The r05 "+7-9% replicated" was this confound. Fix: seed by
+   (rep, idx) — identical sets across sides.
+3. Round 3 (clean): A/A −5.6/+9.5 (envelope ±9.5pp), r05 −7.5/−0.2, r15 +0.1,
+   r46 +1.3. All gates fail → **NULL by the pre-registered decision rule.**
+
+**But the traced pair shows the mechanism at full strength:** on this prompt
+distribution, pretrained concentrates MoE-FFN 42× on one rank (14.0s vs 0.33s/dev in a
+60s window) while r05 is uniform (328±5ms) — the strongest direct evidence yet that
+CP-RL flattens real load. It still does not move wall time because the eager hybrid_ep
+fabric (ag_nvl/dispatch/device_sync incl. spin) fills ~98-99% of every rank timeline
+in BOTH models: imbalance lives inside the spin; flattening relocates waiting without
+shortening the synchronized step.
+
+**Conclusion:** in every regime reachable on this stack, either the comms path is
+balance-insensitive (AG+RS) or the balance-sensitive path is fabric/spin-dominated
+(eager hybrid_ep). CP→e2e-speedup requires a backend where per-rank FFN is a major
+share of the synchronized step — i.e. graphed dispatch/combine (option B: fix hybrid_ep
+CG integration) or kernel-level measurement (option C: deep_ep microbench). Open
+question for follow-up: core-vs-spin split of the 59s/60s fabric time across all 32
+ranks (transfer floor vs straggler wait).
+
+Noise addendum: even with identical prompt sets, job-level A/A variance in this
+fabric-bound regime is ±5-10pp — cell claims below that are uninterpretable here.
