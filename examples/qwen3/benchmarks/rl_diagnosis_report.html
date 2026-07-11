@@ -1,0 +1,39 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>RL-Benefit Diagnosis — Qwen3-235B Router RL</title>
+<style>
+body{font-family:'Segoe UI',Helvetica,Arial,sans-serif;max-width:1080px;margin:24px auto;padding:0 20px;color:#212121;line-height:1.55}
+h1{border-bottom:3px solid #1565c0;padding-bottom:8px} h2{color:#1565c0;margin-top:36px}
+.meta{color:#616161;font-size:0.9em}
+.card{border:1px solid #e0e0e0;border-radius:8px;padding:18px 22px;margin:18px 0;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.verdict{display:inline-block;padding:2px 12px;border-radius:12px;color:#fff;font-weight:600;font-size:0.85em}
+table{border-collapse:collapse;margin:12px 0} td,th{border:1px solid #bdbdbd;padding:5px 10px;font-size:0.92em}
+th{background:#e3f2fd} img{max-width:100%;border:1px solid #eee;margin:8px 0}
+code{background:#f5f5f5;padding:1px 5px;border-radius:3px;font-size:0.9em}
+.hyp{background:#fffde7;border-left:4px solid #f9a825;padding:6px 12px;margin:8px 0;font-size:0.93em}
+</style></head><body>
+<h1>RL-Benefit Diagnosis — Qwen3-235B Router-Only RL vs Aux-Loss</h1>
+<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-11 14:32.
+Spec: <code>docs/superpowers/specs/2026-07-11-rl-benefit-diagnosis-design.md</code>.
+All accuracy/CP data from the audited registry (canonical CP, quarantined rows excluded).</p>
+<div class="card"><h2>0. Overview — hypotheses, diagnostics, decision rule</h2>
+
+<p><b>Question:</b> router-only RL reaches holdout parity with the aux-loss baseline through ~52%% CP
+reduction; its only robust edge is the deep-end extension (&minus;58%%&rarr;&minus;61%%, n=1). WHY —
+and can RL be made to win, or should the claims pivot to what only RL can do?</p>
+<table><tr><th>ID</th><th>Hypothesis</th><th>Discriminating diagnostic</th><th>Status</th></tr>
+<tr><td>H1</td><td>Reward-objective convergence: the winning <code>per_token_load_weighted</code> reward &asymp; the aux objective, so PPO is a noisy optimizer of the same loss</td><td>D2: within-run corr(RL reward, aux loss) across all cells</td><td>mining</td></tr>
+<tr><td>H2</td><td>Broken credit assignment on the true CP reward (token's marginal effect on max is ~always 0 &rarr; sparse, high-variance advantage)</td><td>D3: critic explained-variance / advantage stats, CP-reward vs surrogate cells</td><td>mining</td></tr>
+<tr><td>H3</td><td>Frozen-LM manifold (deep null): accuracy loss is a function of router drift from pretrained, independent of what pushed it</td><td>D1: accuracy-vs-drift and CP-vs-drift curves across ALL evaluated checkpoints, both families</td><td>infra</td></tr>
+<tr><td>H4</td><td>Hyperparameter asymmetry (aux 1 knob fully swept; RL 6 knobs sparsely swept + multiplicity)</td><td>Sweep-density accounting + selection-corrected comparisons</td><td>queued</td></tr>
+<tr><td>H5</td><td>Both methods optimize the same 2048-token proxy batch; nothing differentiates on the eval distribution</td><td>D4: CP generalization of matched-CP RL/aux pairs on unseen batch shapes (seqlen 512/2048, second corpus)</td><td>queued</td></tr>
+</table>
+<p><b>Decision rule:</b> H3 confirmed &rarr; pivot claims (method-independence + deep end + dial-a-CP + systems);
+H1/H2 confirmed &amp; H3 refuted &rarr; build the counterfactual-CP reward (token advantage = &Delta;CP if
+rerouted to 2nd choice — exact, dense credit assignment for a max objective); D4 positive &rarr; new
+headline RL benefit (balance generalization) independent of the Pareto.</p>
+<p>Also running: D5 aux-extension control (aux0.02&rarr;4000 iters — settles whether the deep end is a
+method limit or a budget artifact; queued behind the disk unpause).</p>
+
+<p><span class="verdict" style="background:#616161">PENDING</span> &nbsp; Diagnosis in progress — sections below fill in as results land.</p>
+<p class="meta">updated 2026-07-11 14:31</p>
+</div>
+</body></html>
