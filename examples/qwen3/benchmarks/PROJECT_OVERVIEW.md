@@ -7,7 +7,7 @@
 
 **Method.** Freeze the whole model and train **only the router weights** (<1% of params) with PPO. Each token's sequence of per-layer routing decisions is treated as a trajectory, optimized against a dense load-aware reward built from the **critical path (CP)**, the summed busiest-expert load across layers (defined below).
 
-**Results.** On Qwen3-235B-A22B, router-only RL **load-balancing dominates the aux-loss baseline on the accuracy-vs-CP frontier**: up to ~56% CP reduction at ≲1 pp accuracy cost. Quality is measured with lm-evaluation-harness (HellaSwag, ARC-Challenge, WinoGrande).
+**Results.** On Qwen3-235B-A22B, router-only RL (+aux) **matches the aux-loss baseline through ~52% CP reduction and extends the frontier beyond it** — to ~61% CP reduction at ~3.4pp holdout cost (96.6% retention). Selection uses lm-evaluation-harness (HellaSwag, ARC-Challenge, WinoGrande); headline numbers are reported on a never-selected model-card holdout suite (MMLU, GSM8K, MMLU-Pro, BBH), where both methods are lossless at ≤17.5% reduction.
 
 
 ## Motivation & Problem Setup
@@ -40,7 +40,7 @@ Aux-only uses the standard Switch-Transformer-style MoE auxiliary loss. It is sm
 
 RL-only optimizes the load-aware reward directly. It can target critical path more naturally than aux loss, because the reward is defined from the loads actually produced by routing decisions. Its weakness is that it has no smooth differentiable load-balancing floor and no explicit quality guard beyond frozen LM weights and benchmark selection.
 
-RL+aux combines the two: aux supplies a stable smooth gradient, while RL pushes against the actual load objective. On the **235B frontier — our main result — RL+aux is the dominant variant**: it accounts for nearly all non-dominated points across the full ~6%→~56% CP-reduction range. The 30B reference frontier shows the same pattern. RL-only is useful as an ablation and does appear on the high-accuracy frontier, but RL+aux is the practical default.
+RL+aux combines the two: aux supplies a stable smooth gradient, while RL pushes against the actual load objective. On the **235B selection-suite frontier, RL+aux is the dominant variant**: it accounts for nearly all non-dominated points across the full ~6%→~61% CP-reduction range (on the unbiased holdout suite the picture is parity through ~52% plus an RL-only-reachable deep end — see R1b/R2). The 30B reference frontier shows the same pattern. RL-only is useful as an ablation and does appear on the high-accuracy frontier, but RL+aux is the practical default.
 
 ## Method: PPO formulation & reward design
 **Trajectory.** For each token, its routing decisions across the `L` MoE layers form a length-`L` trajectory `(s_ℓ, a_ℓ, r_ℓ)`:
@@ -76,6 +76,17 @@ Checkpoints are evaluated with lm-evaluation-harness on three tasks — HellaSwa
 
 Each evaluated checkpoint is recorded together with its critical path, so every result is an `(accuracy, CP)` pair — the two axes of the frontier; checkpoints are evaluated from ~1000 training iterations onward. The intended systems metrics — decode throughput, time-to-first-token, and end-to-end latency across expert-parallel degrees — remain to be measured.
 
+**Holdout protocol (unbiased reporting).** All selection decisions (frontier membership, best-config
+claims, retention gates) use the HSw/ARC-C/WG suite above — which makes those same scores subject to
+selection-on-test bias (winner's curse; measurable here: the corner family's selected point reads 76.37
+while its n=3 family mean is 75.73±0.32). To report unbiased numbers, 52 key checkpoints (frontier
+points, corner families incl. seed replicas, per-sweep bests, the full aux-only ladder) were
+re-evaluated on four **Qwen3 model-card benchmarks never used in any selection**: MMLU, GSM8K,
+MMLU-Pro, BBH (unweighted mean; GPQA excluded — dataset gated). The pretrained baseline scores
+**82.01** on this suite under our harness (MMLU 84.93 / GSM8K 85.29 / MMLU-Pro 73.23 / BBH 84.60);
+"retention" is a checkpoint's holdout mean as a percentage of that. Selection continues on the
+original suite; holdout scores are reported once and never selected on.
+
 
 
 ## Results
@@ -89,20 +100,62 @@ Each evaluated checkpoint is recorded together with its critical path, so every 
 
 Canonical frontier (CP-reduction % is relative to the 235B pretrained router, CP = 9320).
 
+**R1b. Holdout evaluation (model-card benchmarks).**
+
+![Figure 5 — Holdout accuracy vs Critical Path Pareto frontier, Qwen3-235B](figures/pareto_235b_holdout.png)
+
+**Figure 5.** Same axes and per-class frontier construction as Figure 4, but y = the 4-task model-card
+holdout mean (MMLU/GSM8K/MMLU-Pro/BBH; see Evaluation → Holdout protocol). Generated with
+`clean_pareto.py --holdout`. Baseline star = pretrained (82.01); grey marker = corner-family seed
+replicas @3000 on the holdout axis.
+
+Retention vs CP-reduction (representative points; full data in `benchmark_results.csv`, columns
+`mmlu, gsm8k, mmlu_pro, bbh, holdout_avg`):
+
+| CP-red | RL(+aux) — holdout (ret.) | Aux-only — holdout (ret.) |
+|---|---|---|
+| ≤17.5% | corner family @3000: 81.41–81.62 (99.3%); v14cg γ0.8 @2361: 82.20 (100.2%) | corner r24@3000: 82.17 (100.2%); v18s replicas: 81.33–82.26 (99.2–100.3%) |
+| ~30–34% | v16cgr γ0.3: 80.86 (98.6%) | r25@3000: 81.27 (99.1%); aux0.005 seed rep: 81.22 (99.0%) |
+| ~38–44% | r33 (entropy rwd) @3000: **80.89** (98.6%); r02: 80.40 (98.0%) | r27@2245: 80.81 (98.5%) |
+| ~48–52% | r15: 79.96 (97.5%) | r27@3000: 80.58 (98.3%); aux0.015 seed rep @2000: 80.51 (98.2%) |
+| ~57–61% | v14cg aux0.02 γ0.8: 79.29 (96.7%); **r62 @3000: 79.19 @ CP 3669 (−60.6%, 96.6%)**; r05: 78.84 (96.1%) | aux0.015 seed rep @3000: 79.56 (97.0%); v18s aux0.02: 78.77 (96.0%) |
+
+**Holdout verdict.** (i) **Corner parity**: at ≤17.5% CP reduction both families sit at 99–100%
+retention — the corner is genuinely lossless on benchmarks never selected on, for both methods.
+(ii) **Mid-band (~30–52%): interleaved within seed noise** — aux is ahead at ~34% (+0.36) and
+~50–52% (+0.55, where `aux0.015 seed` dominates r15 on both axes), RL is ahead at ~38% (r33, entropy
+reward, dominates r26 on both axes); point-to-point gaps are comparable to the ±0.3–0.5 replication
+spread. The on-suite mid-band RL margin (+1.0pp at ~35%) does **not** replicate on holdout.
+(iii) **Deep end (~57–61%): RL leads** — r62 (79.19 @ CP 3669) extends the frontier to −60.6% at
+96.6% retention and dominates every aux point below CP 4000; aux tops out at −58.3% and 96.0%.
+(iv) Notable: the best mid-band RL holdout point (r33) uses the **entropy reward**, not the
+critical-path reward — reward-shape choice matters more on holdout than on the selection suite.
+
 **R2. RL vs aux-only vs RL+aux.**
-RL+aux owns the entire overall frontier (as of 2026-07-08): the top is `v15klcg kl0.001` at **76.37 @ CP 8179**
-(single seed; family mean 75.73±0.32 @3000 — see R4), which unseats the aux-only corner (76.28 @ 8435, n=1)
-on both axes at the point level and holds **iso-accuracy at ~6% lower CP** at the family level. Below the
-corner, RL+aux dominates continuously to **60.6% CP reduction** (aux-only max 57.2%), with the largest margin
-(+1.0pp at ~35% reduction) from the γ-stabilized `v16cgr rlc0.1 γ0.3` point (75.90 @ 6090). RL-only (no aux
-floor) is dominated everywhere — the combination is what wins. γ (discounting with a critic baseline) is
+On the **selection suite**, RL+aux owns the entire overall frontier (as of 2026-07-08): the top is
+`v15klcg kl0.001` at **76.37 @ CP 8179** (single seed; family mean 75.73±0.32 @3000 — see R4), which
+unseats the aux-only corner (76.28 @ 8435, n=1) at the point level and holds **iso-accuracy at ~6%
+lower CP** at the family level. Below the corner, RL+aux dominates continuously to **60.6% CP
+reduction** (aux-only max 57.2% on-suite), with the largest on-suite margin (+1.0pp at ~35%
+reduction) from the γ-stabilized `v16cgr rlc0.1 γ0.3` point (75.90 @ 6090). RL-only (no aux floor)
+is dominated everywhere — the combination is what wins. γ (discounting with a critic baseline) is
 productive **only at low rlc** (≤0.25); at rlc=1 it collapses the router.
+
+*Holdout qualification (2026-07-10, see R1b):* part of that on-suite frontier ownership is
+selection-on-test bias. On the never-selected model-card suite the two families are **statistically
+tied through ~52% CP reduction** (interleaved within the ±0.3–0.5pp replication spread; the +1.0pp
+mid-band margin does not replicate), and RL's robust holdout advantage is confined to the **deepest
+reductions (~57–61%)**, where it extends the frontier beyond aux's reach at equal retention. The
+honest claim is therefore: *RL+aux matches aux everywhere and extends the achievable CP-reduction
+range*, not that it dominates throughout.
 
 **R4. Replication variance.**
 The corner config (`rlc0.5 aux0.001 critic γ0 kl0.001`) was replicated with 3 independent runs to iter
 3000. *(Correction 2026-07-08: a submission bug meant all three runs used the same seed (1234) — these
 bars measure **run-to-run training nondeterminism** at fixed seed, a lower bound on seed variance.
-True distinct-seed replicas (seeds 3027/3028) and aux-only seed replicas (v18s) are training now.)*
+True distinct-seed replicas (seeds 2027/2028) have since completed and confirm the picture on the
+holdout axis: corner family @3000 = 81.41–81.62 holdout (99.3–99.5% retention), spread consistent
+with the fixed-seed bars; aux-only seed replicas (v18s) land at 99.2–100.3% — see R1b.)*
 Family stats:
 acc mean ± half-range = 75.76±0.53 @1500, 75.47±0.32 @2000, 75.64±0.53 @2500, **75.73±0.32 @3000
 (CP 7950±198)**. The headline 76.37/76.27 points are the original seed's high draws; seed spread exceeds the
@@ -111,7 +164,7 @@ strict domination (the aux corner is itself n=1). Figure 4 shows the n=3 mean±�
 
 
 ## Limitations & Threats to Validity
-- Narrow eval set: three multiple-choice tasks; no generative or long-context evaluation.
+- Selection uses three multiple-choice tasks; the 4-task model-card holdout (R1b) mitigates selection bias and adds generative math (GSM8K) and chain-of-thought (BBH), but long-context evaluation is still absent.
 - Seq-len 128 and small global batch — chosen for cheap router adaptation, but not representative of full serving distributions.
 - The load reward (CP) is a surrogate for end-to-end latency; whether CP reductions translate into wall-clock speedups remains to be confirmed by direct systems measurements.
 - Seed variance is non-trivial relative to small frontier gaps; the corner config now has n=3 error bars (R4) — other frontier points remain n=1.
