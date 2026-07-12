@@ -1480,7 +1480,7 @@ pretrained_235b,,,pretrained,False,False,1500,,,,0,0,8800.0,,85.92,65.53,78.77,7
 235bv18s_norl_aux0.001_seed2027_r1,1000,,aux_only,False,True,1000,,,0.001,,,,,,,,,,cponly,,cp_stub,,,,,,8551.5,exact,75.03,train_proxy(rmse1.74),,,,,,,,,,,,,,,,,,,,
 235bv18s_norl_aux0.001_seed2028_r1,1000,,aux_only,False,True,1000,,,0.001,,,,,,,,,,cponly,,cp_stub,,,,,,8886.7,exact,74.17,train_proxy(rmse1.74),,,,,,,,,,,,,,,,,,,,
 235bv18s_norl_aux0.02_seed2027_r1,1000,,aux_only,False,True,1000,,,0.02,,,,,,,,,,cponly,,cp_stub,,,,,,5188.3,exact,73.09,train_proxy(rmse1.74),,,,,,,,,,,,,,,,,,,,
-pretrained_235b,0,,pretrained,False,False,,,,,,,,,,,,,,inf,,;splits_ingested_2026-07-12,,,,,,,,,,87.32,87.38,,83.28,73.96,84.47,86.72,87.47,88.89,87.0,74.11,73.93,85.29,84.27,83.75,83.17,108707.9,119100.7,115562.5,112372.7
+pretrained_235b,0,,pretrained,False,False,,,,,,,,,,,,,,inf,,;splits_ingested_2026-07-12,,,,,,,,,,87.32,87.38,,83.28,73.96,84.47,86.72,87.47,88.89,87.0,74.11,73.93,85.29,84.27,83.75,83.17,,,,
 235bv15klcg_rlc0.5_aux0.001_basecritic_g0_kl0.001_seed3027_r1,500,,rl+aux,True,True,500,per_token_load_weighted,0.5,0.001,0.001,,,,,,,,,cponly,,cp_stub,,,,,,,no_wandb,,none,,,,,,,,,,,,,,,,,,,,
 235bv15klcg_rlc0.5_aux0.001_basecritic_g0_kl0.001_seed3027_r1,536,,rl+aux,True,True,536,per_token_load_weighted,0.5,0.001,0.001,,,,,,,,,cponly,,cp_stub,,,,,,,no_wandb,,none,,,,,,,,,,,,,,,,,,,,
 235bv18s_norl_aux0.001_seed2027_r1,2341,,aux_only,False,True,2341,,,0.001,,,,,,,,,,cponly,,cp_stub,,,,,,8041.4,interp,75.33,train_proxy(rmse1.74),,,,,,,,,,,,,,,,,,,,
