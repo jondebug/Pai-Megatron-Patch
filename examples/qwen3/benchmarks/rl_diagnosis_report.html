@@ -11,7 +11,7 @@ code{background:#f5f5f5;padding:1px 5px;border-radius:3px;font-size:0.9em}
 .hyp{background:#fffde7;border-left:4px solid #f9a825;padding:6px 12px;margin:8px 0;font-size:0.93em}
 </style></head><body>
 <h1>RL-Benefit Diagnosis — Qwen3-235B Router-Only RL vs Aux-Loss</h1>
-<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-11 22:00.
+<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-12 01:59.
 Spec: <code>docs/superpowers/specs/2026-07-11-rl-benefit-diagnosis-design.md</code>.
 All accuracy/CP data from the audited registry (canonical CP, quarantined rows excluded).</p>
 <div class="card"><h2>0. Overview — hypotheses, diagnostics, decision rule</h2>
@@ -162,8 +162,23 @@ P1&times;P2 combine naturally (exact per-token differencing + critic-free realiz
 <p><i>Blocked on:</i> disk unpause (same lever as the aux-extension control D5). Implementation of
 diff_lse_load + rloo flags: ~1 day of careful work in rl_trajectory.py, behind default-off switches so
 existing cells are untouched.</p>
-<p><span class="verdict" style="background:#616161">PENDING</span> &nbsp; Designed; awaiting disk unpause + ~1 day implementation of the two new flags.</p>
-<p class="meta">updated 2026-07-11 15:56</p>
+<p><b>Status update (2026-07-12):</b> design change — P2 (RLOO realization sampling) replaced by a
+<b>P1&times;P3 combination cell</b>: an exact difference reward is its own baseline (Dr.Reinforce), so
+critic-free variance reduction comes along with P1 and separate RLOO machinery adds little for its
+cost. Single-variable isolation preserved: ctrl / P1 / P3 / P1+P3.</p>
+<p><b>Smoke results (60-iter, verify-first-invocation):</b> P1 <code>diff_lse_load</code> PASSED —
+rl_mean_reward = 0.171 (live, finite), centered advantages, clean run (one argparse-choices fix
+needed). P3 PASSED — 935 <code>[PPO MULTI-EPOCH]</code> markers/run: the extra clipped-PPO epoch
+executes every step with nonzero varying loss (it had been invisible: the marker print was gated by
+a hardcoded debug flag, and epoch-1 clip_fraction is 0 by construction — a D3 nuance: the machinery
+works when enabled; it was simply never enabled in any sweep).</p>
+<p><b>All four pilots + both controls are TRAINING</b> (launched on the 41.9 TB freed by the
+approved 0.5&ndash;1.0pp router-preserving prune, 89/89 routers verified): ctrl=30149157,
+P1=30149158, P3=30150305, P1P3=30150306; iter-0 canonical CP baseline (zero-gradient run,
+F5 fix)=30149159; aux0.02&rarr;4000 deep-end control=30149160. Verdicts at the 500-iter grid on
+CP-per-drift vs ctrl.</p>
+<p><span class="verdict" style="background:#ef6c00">PARTIAL</span> &nbsp; Pilots LAUNCHED (ctrl/P1/P3/P1P3 to 1500) + both controls; smokes verified both new mechanisms live. First grid verdicts at iter 500.</p>
+<p class="meta">updated 2026-07-12 01:59</p>
 </div>
 <div class="card"><h2>6. Quarantine final tally — 26 rows resolved, verdict updates</h2>
 <div class="hyp"><b>Hypothesis under test:</b> Data-integrity remediation (audit F1/F4): what did the wrong-checkpoint rows actually hide?</div>
