@@ -11,7 +11,7 @@ code{background:#f5f5f5;padding:1px 5px;border-radius:3px;font-size:0.9em}
 .hyp{background:#fffde7;border-left:4px solid #f9a825;padding:6px 12px;margin:8px 0;font-size:0.93em}
 </style></head><body>
 <h1>RL-Benefit Diagnosis — Qwen3-235B Router-Only RL vs Aux-Loss</h1>
-<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-11 15:56.
+<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-11 19:11.
 Spec: <code>docs/superpowers/specs/2026-07-11-rl-benefit-diagnosis-design.md</code>.
 All accuracy/CP data from the audited registry (canonical CP, quarantined rows excluded).</p>
 <div class="card"><h2>0. Overview — hypotheses, diagnostics, decision rule</h2>
@@ -164,5 +164,37 @@ diff_lse_load + rloo flags: ~1 day of careful work in rl_trajectory.py, behind d
 existing cells are untouched.</p>
 <p><span class="verdict" style="background:#616161">PENDING</span> &nbsp; Designed; awaiting disk unpause + ~1 day implementation of the two new flags.</p>
 <p class="meta">updated 2026-07-11 15:56</p>
+</div>
+<div class="card"><h2>6. Quarantine final tally — 26 rows resolved, verdict updates</h2>
+<div class="hyp"><b>Hypothesis under test:</b> Data-integrity remediation (audit F1/F4): what did the wrong-checkpoint rows actually hide?</div>
+<p><b>Method:</b> Quarantine + re-eval through the flock-serialized EP16/PP1 converter; SUSPECT-DUP ingest guard for provenance.</p>
+
+<p>All 26 corrupted selection-suite rows (F1: 20 exact-duplicate rows; F1B: 2 contaminated siblings
+discovered when a fresh re-eval's triple matched an unquarantined row; +4 v12corner/v5b rows
+unrecoverable, checkpoints pruned) are now resolved. Every recoverable row re-evaluated through the
+serialized EP16/PP1 converter; the SUSPECT-DUP ingest guard caught two live wrong-value attempts
+during the process.</p>
+<table><tr><th>Point</th><th>corrupt</th><th>authentic</th><th>&Delta;</th><th>meaning</th></tr>
+<tr><td>aux0.001 s2027 @1500</td><td>75.26</td><td>75.56</td><td>+0.30</td><td rowspan=4>aux corner replica ladder was
+carrying @3000/@1500 scores shuffled across iters; authentic ladder 75.56/75.30/75.98/75.72</td></tr>
+<tr><td>aux0.001 s2027 @2000</td><td>75.72</td><td>75.30</td><td>&minus;0.42</td></tr>
+<tr><td>aux0.001 s2027 @2500</td><td>75.63</td><td>75.98</td><td>+0.35</td></tr>
+<tr><td>aux0.001 s2027 @3000</td><td>75.26</td><td>75.72</td><td>+0.46</td></tr>
+<tr><td><b>aux0.02 s2027 @3000 (deep end)</b></td><td>73.40</td><td><b>72.89</b></td><td><b>&minus;0.51</b></td>
+<td>the aux on-suite deep-end frontier point drops half a point</td></tr>
+<tr><td>aux0.02 s2027 @2500</td><td>73.40</td><td>73.71</td><td>+0.31</td><td></td></tr>
+<tr><td>v16cgr g0.3 @2500 / @2873</td><td>75.50 / 75.50</td><td>75.83 / 75.30</td><td>+0.33 / &minus;0.20</td>
+<td rowspan=2>RL near-corner points improve</td></tr>
+<tr><td>v16cgr g0.5 @1835 / @2000</td><td>75.43 / 75.43</td><td>75.81 / 75.63</td><td>+0.38 / +0.20</td></tr>
+<tr><td>r33 @2392 / r72 @3000</td><td>74.86 / 74.25</td><td>74.93 / 74.06</td><td>+0.07 / &minus;0.19</td><td>small honest corrections</td></tr></table>
+<p><b>Verdict updates:</b> (i) on-suite <b>corner parity is exact</b> — aux replica @2500/@3000 =
+75.98/75.72 vs RL corner family 75.73&plusmn;0.32; (ii) the on-suite <b>deep end strengthens for RL</b>:
+the aux point at CP 3887 drops from 73.40 to 72.89, so RL points (r05 73.28@3797-region, r62) now
+clear it rather than tie it; (iii) both families' honest values are mostly HIGHER than the corrupted
+registry — the converter race had been dragging both sides down; the frontier is tighter and higher.
+Note: the holdout (Figure 5 / R1b) was never affected — all holdout rows were verified distinct
+throughout.</p>
+<p><span class="verdict" style="background:#c62828">CONFIRMED</span> &nbsp; Cleanup complete. Corner: exact parity. Deep end: shifts toward RL on-suite (aux 3887-point 73.40->72.89).</p>
+<p class="meta">updated 2026-07-11 19:11</p>
 </div>
 </body></html>
