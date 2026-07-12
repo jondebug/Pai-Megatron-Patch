@@ -11,7 +11,7 @@ code{background:#f5f5f5;padding:1px 5px;border-radius:3px;font-size:0.9em}
 .hyp{background:#fffde7;border-left:4px solid #f9a825;padding:6px 12px;margin:8px 0;font-size:0.93em}
 </style></head><body>
 <h1>RL-Benefit Diagnosis — Qwen3-235B Router-Only RL vs Aux-Loss</h1>
-<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-12 01:59.
+<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-12 03:00.
 Spec: <code>docs/superpowers/specs/2026-07-11-rl-benefit-diagnosis-design.md</code>.
 All accuracy/CP data from the audited registry (canonical CP, quarantined rows excluded).</p>
 <div class="card"><h2>0. Overview — hypotheses, diagnostics, decision rule</h2>
@@ -274,5 +274,24 @@ CONFIRM RL), iter-0 canonical CP baseline (audit F5, fixes the reduction denomin
 completed (HF conversions are recreatable; standing HF lifecycle policy).</i></p>
 <p><span class="verdict" style="background:#c62828">CONFIRMED</span> &nbsp; Diagnosis complete. Parity is mechanistically explained (inert PPO + no token credit + surrogate reward + drift manifold). RL territory: deep end + dial-a-CP + flexibility. Pilots are worthwhile but should target CP-per-drift, not bulk domination. Awaiting: disk unpause for pilots + controls.</p>
 <p class="meta">updated 2026-07-11 22:00</p>
+</div>
+<div class="card"><h2>10. F5 closed — measured pretrained canonical CP validates the 9320 denominator</h2>
+<div class="hyp"><b>Hypothesis under test:</b> Audit F5: the CP-reduction denominator (9320) had no canonical measurement behind it.</div>
+<p><b>Method:</b> Zero-gradient 210-iter run at the corner recipe scaffolding (aux=0, no RL, KL=0); canonical eval at iters 200/210.</p>
+
+<p>Audit F5 closed by measurement: a zero-gradient run (<code>235bv20_cpbaseline_r1</code>: RL off,
+aux coeff 0, KL 0, router-only training &rArr; router weights mathematically static at pretrained
+values) evaluated the canonical protocol at iterations 200 and 210:</p>
+<table><tr><th>eval window</th><th>num_tokens_on_critical_path</th></tr>
+<tr><td>iter 200 (50 eval batches)</td><td>9427.8</td></tr>
+<tr><td>iter 210 (50 eval batches)</td><td>9078.5</td></tr>
+<tr><td><b>pretrained canonical CP</b></td><td><b>9253 &plusmn; 175</b></td></tr></table>
+<p><b>Verdict:</b> the working constant BASE_CP = 9320 lies within the measured band (0.7% from the
+midpoint; action threshold was 2%) — all published reduction percentages stand, now with a
+measurement-backed denominator. The legacy 8800 value is confirmed wrong (5% low). Secondary
+finding: canonical eval CP carries ~&plusmn;2% between eval windows at fixed router — this is the
+error bar on every CP axis point and should accompany Figure 4/5 captions.</p>
+<p><span class="verdict" style="background:#2e7d32">REFUTED</span> &nbsp; F5 RESOLVED: measured pretrained CP = 9253 +/- 175; BASE_CP 9320 validated (0.7% off midpoint, < 2% threshold). No axis regeneration required. CP-axis error bar ~ +/-2% documented.</p>
+<p class="meta">updated 2026-07-12 03:00</p>
 </div>
 </body></html>
