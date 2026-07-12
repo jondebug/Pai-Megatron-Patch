@@ -1530,4 +1530,4 @@ pretrained_235b,0,,pretrained,False,False,,,,,,,,,,,,,,inf,,;splits_ingested_202
 235bv19pilot_ctrl_r1,1500,,,,,1500,,,,,,,,,,,,,cponly,,cp_stub,,,,,,,no_wandb,,none,,,,,,,,,,,,,,,,,,,,
 235bv19pilot_p1difflse_r1,1500,,,,,1500,,,,,,,,,,,,,cponly,,cp_stub,,,,,,,no_wandb,,none,,,,,,,,,,,,,,,,,,,,
 235bv19pilot_p1p3_r1,1500,,,,,1500,,,,,,,,,,,,,cponly,,cp_stub,,,,,,,no_wandb,,none,,,,,,,,,,,,,,,,,,,,
-235bv19pilot_p3ppo2_r1,1500,,,,,1500,,,,,,,,,,,,,cponly,,cp_stub,,,,,,,no_wandb,,none,,,,,,,,,,,,,,,,,,,,
+235bv19pilot_p3ppo2_r1,1500,,rl_only,True,False,1500,per_token_load_weighted,,,,,,,,,,,,cponly,,cp_stub,,,,,,,no_wandb,,none,,,,,,,,,,,,,,,,,,,,
