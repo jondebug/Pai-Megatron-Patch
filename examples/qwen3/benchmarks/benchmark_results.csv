@@ -1518,3 +1518,4 @@ pretrained_235b,0,,pretrained,False,False,,,,,,,,,,,,,,inf,,;splits_ingested_202
 235bv19pilot_p3ppo2_r1,500,,rl_only,True,False,500,per_token_load_weighted,,,,,,,85.41,63.65,79.79,76.28,,inf,2026-07-12 06:36,ingested:ordlog,/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/output_router_finetuning/235bv19pilot_p3ppo2_r1/checkpoint/pretrain-mcore-qwen3-moe-megatron-A22B-lr-1e-4-minlr-1e-6-bs-1-gbs-16-seqlen-128-pr-bf16-tp-1-pp-1-cp-1-ac-sel-do-true-sp-true-ti-1500-wi-5/hf_converted_iter500_cp,ord,,,,,,,none,,,,,,,,,,,,,,,,,,,,
 235bv19pilot_p1p3_r1,539,,,,,539,,,,,,,,,,,,,cponly,,cp_stub,,,,,,,no_wandb,,none,,,,,,,,,,,,,,,,,,,,
 235bv19pilot_p3ppo2_r1,552,,rl_only,True,False,552,per_token_load_weighted,,,,,,,,,,,,cponly,,cp_stub,,,,,,,no_wandb,,none,,,,,,,,,,,,,,,,,,,,
+235bv18s_norl_aux0.02_seed2027_r1,2782,,,,,2782,,,,,,,,,,,,,cponly,,cp_stub,,,,,,3976.5,exact,,,,,,,,,,,,,,,,,,,,,,
