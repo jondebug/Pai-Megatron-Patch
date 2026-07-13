@@ -129,10 +129,15 @@ spread. The on-suite mid-band RL margin (+1.0pp at ~35%) does **not** replicate 
 (iii) **Deep end (~57–61%): RL extends the maximum achievable reduction** — r62 (79.19 @ CP 3669)
 pushes the frontier from aux's −58.3% to **−60.6%** at comparable retention (96.6% vs aux's
 96.0–97.0% in the band; the point-level gaps are within noise, and the aux `aux0.015 seed rep @3000`
-at 79.56 @ CP 4015 exceeds every RL point in the band on accuracy). This is an **n=1, matched
-3000-iteration-budget** result: no aux configuration was trained past the coefficient grid (≤0.02)
-or budget where it could contest CP < 3800, so "extends" — not "dominates" — is the supported claim
-until the aux-extension control (aux0.02→4000 iters or aux 0.03) runs.
+at 79.56 @ CP 4015 exceeds every RL point in the band on accuracy). This is an **n=1** result, now backed by a **budget-matched control** (2026-07-13): a clean aux-only
+continuation of aux0.02 (RL off) was trained into the same deep-CP territory. At matched CP ~3660
+(r62's 3669) it reaches **holdout 78.56**, still below r62's **79.19**, and — decisively — training
+aux *further* **lowered** its holdout (78.77 @3000 → 78.59 → 78.56), i.e. aux over-extension
+overfits the balance objective, buying CP and *selection-suite* accuracy while *degrading*
+generalization. So "aux tops out at −58%" was a selection-metric artifact, but on the trusted
+holdout aux **cannot reach r62's quality at matched CP even given the extra budget** — the deep-end
+RL edge is real (though small: ~0.6pp, ~1.5× the ±0.3–0.4pp holdout noise, n=1). "Extends" — not
+"dominates" — remains the supported wording.
 (iv) Notable: the best mid-band RL holdout point (r33) uses the **entropy reward**, not the
 critical-path reward — reward-shape choice matters more on holdout than on the selection suite.
 (v) *Data-integrity note (2026-07-11):* an audit found a converter race that gave ~20 selection-suite
