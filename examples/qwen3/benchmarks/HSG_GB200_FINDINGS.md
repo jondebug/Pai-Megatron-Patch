@@ -497,3 +497,37 @@ show null e2e? if yes, balance itself is not an e2e lever on this hardware/model
 deep_ep-level microbench for the theoretical ceiling; late-arrival core-vs-spin
 decomposition. These are characterization, not optimization — no measured path
 suggests CP-RL buys latency on GB200 serving stacks today.
+
+## §N (2026-07-13): The balance ceiling — perfect-routing simulation + external EPLB confirmation
+
+**Perfect-balance ceiling (VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random vs same-job
+pre, FP4 + flashinfer_nvlink_one_sided, 3-rep medians):**
+
+| EP | dec tok/s Δ | std Δ |
+|---|---|---|
+| 8  | **+6.1%** | **+18.6%** |
+| 32 | **+3.5%** | +3.3% |
+
+Above the ±1-4pp A/A envelope → perfect balance has a real, nonzero ceiling on the
+production stack. Caveats: uniform_random changes routing CONTENT (bundles balance with
+locality effects) → upper bound; bench prompts (number salad) ≠ RL training distribution.
+
+**External confirmation (Glean, 2026-07-13)** — S. Nordmann's completed GB200 EPLB
+evaluation, Nemotron Ultra, SAME stack/geometry class (FlashInfer one-sided + CG, TP=1
+DP=EP=8, 2N GB200): EPLB **regressed e2e −3.0%** (793 vs 817 tok/s) despite +14.9%
+expert-compute improvement — dispatch +25.3% worse, late-arrival +9.5%/+35.8%
+(dispatch/combine), plus a hang in 8-API-server topology during rearrangement and a
+3.53s migration pause. Recommendation there: do not enable EPLB by default. B200 is
+different: DeepSeek-class EPLB wins of +7-10% reported (SA sweeps) — the GB200 NVL72
+fabric economics, not balance per se, is what suppresses the payoff here.
+
+**The campaign's final quantitative statement:**
+- Ceiling of ANY balance intervention (measured, this stack/op-point): **+3-6% decode**.
+- Achieved by router-RL (r05, ~57% train CP cut, load-flattening verified 42×→uniform): **~0%**.
+- Achieved by EPLB (NVIDIA internal, same class): **−3%** (overheads exceed the prize).
+
+Conclusion: expert-load balance on GB200 NVL72 serving is a small-ceiling optimization
+(≤6%) that no current intervention captures; the 42× per-rank load imbalance is priced
+at single-digit percent by the synchronized comms step. Router-RL CP reduction is not
+an inference-latency play on this hardware class; residual value hypotheses are
+training-time balance, capacity headroom, and B200-class fabrics.
