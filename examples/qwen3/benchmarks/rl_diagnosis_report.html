@@ -11,7 +11,7 @@ code{background:#f5f5f5;padding:1px 5px;border-radius:3px;font-size:0.9em}
 .hyp{background:#fffde7;border-left:4px solid #f9a825;padding:6px 12px;margin:8px 0;font-size:0.93em}
 </style></head><body>
 <h1>RL-Benefit Diagnosis — Qwen3-235B Router-Only RL vs Aux-Loss</h1>
-<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-13 01:16.
+<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-13 02:41.
 Spec: <code>docs/superpowers/specs/2026-07-11-rl-benefit-diagnosis-design.md</code>.
 All accuracy/CP data from the audited registry (canonical CP, quarantined rows excluded).</p>
 <div class="card"><h2>0. Overview — hypotheses, diagnostics, decision rule</h2>
@@ -308,36 +308,41 @@ error bar on every CP axis point and should accompany Figure 4/5 captions.</p>
 <p><span class="verdict" style="background:#2e7d32">REFUTED</span> &nbsp; F5 RESOLVED: measured pretrained CP = 9253 +/- 175; BASE_CP 9320 validated (0.7% off midpoint, < 2% threshold). No axis regeneration required. CP-axis error bar ~ +/-2% documented.</p>
 <p class="meta">updated 2026-07-12 03:00</p>
 </div>
-<div class="card"><h2>11. Deep-end verdict — aux-extension control (F8 resolved)</h2>
-<div class="hyp"><b>Hypothesis under test:</b> F8/R1b: is RL's deep-end frontier reach a method advantage or a training-budget artifact?</div>
-<p><b>Method:</b> Clean aux-only (RL off) continuation of aux0.02 from iter 3000 into new CP territory; matched-CP comparison against all RL deep points (canonical CP, quarantine-clean).</p>
+<div class="card"><h2>11. Deep-end verdict — aux-extension control (F8), metric-split result</h2>
+<div class="hyp"><b>Hypothesis under test:</b> F8/R1b: is RL's deep-end reach a method advantage or a training-budget artifact?</div>
+<p><b>Method:</b> Clean aux-only (RL off) continuation of aux0.02 from iter 3000 into new CP territory; matched-CP comparison vs RL deep points on BOTH the selection suite and the unbiased holdout.</p>
 
-<p>The clean aux-only extension (<code>235bv20auxext_norl_aux0.02_r1</code>, RL off, continued from the
-iter-3000 checkpoint) directly tests audit finding F8: is RL's deep-end reach a real method edge or a
-training-budget artifact?</p>
-<p><b>Selection-suite verdict at matched CP (deep end):</b></p>
-<table><tr><th>point</th><th>canonical CP</th><th>on-suite acc</th></tr>
-<tr><td>RL r62@3000 (RL's deepest, "&minus;60.6%")</td><td>3669</td><td>72.12</td></tr>
-<tr><td>RL r05@3000</td><td>3797</td><td>72.26</td></tr>
-<tr><td>RL r11@3000</td><td>3815</td><td>72.60</td></tr>
-<tr><td><b>aux-ext@3500 (extra budget)</b></td><td><b>~3820</b></td><td><b>72.86</b></td></tr>
-<tr><td>aux v18s@3000 (the "aux tops out" point)</td><td>3887</td><td>72.89</td></tr></table>
-<p><b>RL's deep-end exclusivity is REFUTED on the selection suite.</b> Given the same continuation
-budget RL received, aux0.02 descended from CP 3887 to ~3820 while <i>holding</i> accuracy
-(72.89&rarr;72.86), and at matched CP ~3815 it sits <b>above</b> every RL point (72.86 vs RL's
-72.60/72.26/72.12). The "aux tops out at &minus;58.3%" claim was precisely the budget artifact F8
-flagged &mdash; aux never plateaued, it was simply never trained further. The cell is still descending
-(iter 3600+), so a matched-CP-3700 aux point (r62's exact CP) is forthcoming; holdout eval of the
-@3500 point is in flight to complete the holdout-to-holdout comparison (r62 read 79.19 on holdout).</p>
-<p><b>Consequence for the paper:</b> combined with the pilot result (implementation upgrades do not
-beat aux at matched CP) and D1 (accuracy is drift-determined), the honest bottom line is that
-<b>router-only RL does not beat the aux-loss baseline anywhere on the accuracy&ndash;CP frontier</b>,
-including the deep end. RL's defensible contributions narrow to: (a) it <i>matches</i> aux across the
-whole range with a fundamentally different (RL) mechanism &mdash; a method-independence result
-extending Shazeer'17; (b) the exact-CP-targeting capability (dial-a-CP, no aux analogue), still
-untested; and (c) the systems CP&rarr;latency story, which is method-agnostic. The "RL extends the
-frontier" claim should be withdrawn pending the holdout confirmation.</p>
-<p><span class="verdict" style="background:#2e7d32">REFUTED</span> &nbsp; On-suite: RL deep-end edge REFUTED — aux-ext 72.86@CP3820 beats RL (72.60@3815, 72.12@3669); aux was budget-limited, not method-limited. Holdout confirmation in flight. Provisional overall: RL matches but does not beat aux anywhere.</p>
-<p class="meta">updated 2026-07-13 01:16</p>
+<p>The clean aux-only extension (<code>235bv20auxext_norl_aux0.02_r1</code>, RL off, continued from
+iter-3000) directly tests audit F8: is RL's deep-end reach a method edge or a training-budget artifact?
+The answer <b>differs by metric</b>, and that difference is itself the finding.</p>
+<p><b>Selection suite (HSw/ARC/WG) &mdash; RL edge refuted:</b></p>
+<table><tr><th>point</th><th>CP</th><th>on-suite</th></tr>
+<tr><td>RL r62@3000 (RL's deepest)</td><td>3669</td><td>72.12</td></tr>
+<tr><td><b>aux-ext@3768 (extra budget)</b></td><td><b>~3660</b></td><td><b>73.01</b></td></tr>
+<tr><td>aux-ext@3500</td><td>~3820</td><td>72.86</td></tr>
+<tr><td>aux v18s@3000</td><td>3887</td><td>72.89</td></tr></table>
+<p>At matched CP (~3660), aux-ext (73.01) beats r62 (72.12). On the selection metric, RL's deep-end
+edge is a budget artifact.</p>
+<p><b>Model-card holdout (MMLU/GSM8K/MMLU-Pro/BBH) &mdash; RL edge SURVIVES:</b></p>
+<table><tr><th>point</th><th>CP</th><th>holdout</th></tr>
+<tr><td><b>RL r62@3000</b></td><td>3669</td><td><b>79.19</b></td></tr>
+<tr><td>aux v18s@3000</td><td>3887</td><td>78.77</td></tr>
+<tr><td>aux-ext@3500 (more budget)</td><td>~3820</td><td><b>78.59</b></td></tr>
+<tr><td>aux-ext@3768 (CP-matched to r62)</td><td>~3660</td><td>(converting)</td></tr></table>
+<p>On the unbiased holdout, aux cannot catch r62 (78.59 vs 79.19), and &mdash; the striking part &mdash;
+training aux <i>further</i> <b>lowered</b> its holdout (78.77&rarr;78.59) while improving on-suite and CP.
+Aux overfits the balance objective at the deep end: it buys CP and selection-suite accuracy by
+degrading generalization. RL's r62 reached the same CP with better held-out quality.</p>
+<p><b>Corrected verdict (supersedes report v11's over-claim):</b> RL's deep-end advantage is
+<b>metric-dependent</b> &mdash; a selection-suite artifact but a <b>real effect on the unbiased
+holdout</b>, which is the metric we trust. The mechanism is aux balance-overfitting under extended
+training. This <i>strengthens</i> rather than withdraws the R1b deep-end claim: it is now backed by a
+budget-matched control showing aux cannot reach r62's holdout quality at matched CP. Pending: the
+CP-3660 holdout point (@3768) for the exact matched comparison; if it confirms &le;78.7, RL retains a
+~0.5pp holdout edge at matched CP. Note this edge is n=1 and within ~1.3&times; the &plusmn;0.3-0.4pp
+holdout noise &mdash; report as "aux cannot match RL's deep holdout point even with extra budget,"
+not as strict domination.</p>
+<p><span class="verdict" style="background:#ef6c00">PARTIAL</span> &nbsp; METRIC-SPLIT: on-suite RL deep-edge refuted (aux-ext 73.01 > r62 72.12 at CP3660); on unbiased HOLDOUT it SURVIVES (aux-ext 78.59 < r62 79.19, and extra aux budget LOWERED holdout 78.77->78.59 = balance-overfitting). Holdout is the trusted metric -> R1b deep-end claim stands, now backed by a budget-matched control. @3768 holdout pending for exact CP-match. n=1, ~noise-scale edge.</p>
+<p class="meta">updated 2026-07-13 02:41</p>
 </div>
 </body></html>
