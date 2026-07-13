@@ -461,3 +461,39 @@ ranks (transfer floor vs straggler wait).
 
 Noise addendum: even with identical prompt sets, job-level A/A variance in this
 fabric-bound regime is ±5-10pp — cell claims below that are uninterpretable here.
+
+## §M (2026-07-13): FP4 production backend (flashinfer_nvlink_one_sided) — best stack yet, CP-RL still NULL
+
+Backend pivot per I. Rosenfeld Rauch: hybrid_ep is archived/dead; the intended GB200
+dispatch path is flashinfer_nvlink_one_sided, which is nvfp4-only (confirmed vLLM
+0.19.2rc1; flashinfer_nvlink_two_sided bf16 still crashes NoneType .dim — upstream bug).
+
+**Stack**: official nvidia/Qwen3-235B-A22B-NVFP4 (modelopt 0.33, NVFP4 + FP8-KV); ALL
+94 mlp.gate routers are in exclude_modules (high-precision) → router-swap technique
+carries over unchanged. FP4 swap variants built by patching gate tensors in checkpoint
+copies (fp4_router_swap.py, verified tensor-equal).
+
+**Performance**: fastest serving config of the campaign — ITL 13.7-14.4ms @ EP=8 c=64
+(vs 19ms AG+RS bf16, 37ms eager hybrid_ep), dec ~3950 tok/s, CUDA graphs active,
+load-proportional dispatch, A/A envelope only ±1-4pp.
+
+**CP ladder (dec tok/s delta vs same-job FP4 pre):**
+| EP | A/A | r05 (~57% cut) | r15 | r46 (control) |
+|---|---|---|---|---|
+| 8  | −1.1% | −1.5% | −2.6% (first job −7.5% did NOT replicate) | −0.7% |
+| 16 | +3.8% | −3.1% | — | — |
+| 32 | −2.0% | +2.6% / std −5.0% | — | — |
+
+No cell exceeds its A/A envelope, no dose-response, signs flip across EP and regime.
+**NULL on the production backend** — the same verdict as TP=EP+AR, naive, AG+RS, and
+eager hybrid_ep. Combined with §L (mechanism real: 42× FFN flatten; fabric absorbs it)
+the campaign conclusion is now complete across every serving path on GB200:
+**router-RL CP reduction demonstrably flattens per-rank expert load but does not
+change end-to-end serving performance in any reachable configuration; effects are
+bounded by per-config A/A envelopes (±1-10pp depending on stack).**
+
+Remaining ideas (decreasing promise): EPLB comparison (does placement rebalancing also
+show null e2e? if yes, balance itself is not an e2e lever on this hardware/model);
+deep_ep-level microbench for the theoretical ceiling; late-arrival core-vs-spin
+decomposition. These are characterization, not optimization — no measured path
+suggests CP-RL buys latency on GB200 serving stacks today.
