@@ -11,7 +11,7 @@ code{background:#f5f5f5;padding:1px 5px;border-radius:3px;font-size:0.9em}
 .hyp{background:#fffde7;border-left:4px solid #f9a825;padding:6px 12px;margin:8px 0;font-size:0.93em}
 </style></head><body>
 <h1>RL-Benefit Diagnosis — Qwen3-235B Router-Only RL vs Aux-Loss</h1>
-<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-12 03:00.
+<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-12 22:51.
 Spec: <code>docs/superpowers/specs/2026-07-11-rl-benefit-diagnosis-design.md</code>.
 All accuracy/CP data from the audited registry (canonical CP, quarantined rows excluded).</p>
 <div class="card"><h2>0. Overview — hypotheses, diagnostics, decision rule</h2>
@@ -177,8 +177,22 @@ approved 0.5&ndash;1.0pp router-preserving prune, 89/89 routers verified): ctrl=
 P1=30149158, P3=30150305, P1P3=30150306; iter-0 canonical CP baseline (zero-gradient run,
 F5 fix)=30149159; aux0.02&rarr;4000 deep-end control=30149160. Verdicts at the 500-iter grid on
 CP-per-drift vs ctrl.</p>
-<p><span class="verdict" style="background:#ef6c00">PARTIAL</span> &nbsp; Pilots LAUNCHED (ctrl/P1/P3/P1P3 to 1500) + both controls; smokes verified both new mechanisms live. First grid verdicts at iter 500.</p>
-<p class="meta">updated 2026-07-12 01:59</p>
+<p><b>Preliminary iter-1000 datapoint (NOT a verdict — shallow-CP regime):</b></p>
+<table><tr><th>pilot</th><th>acc @1000</th><th>eval-CP @1000</th><th>CP reduction</th></tr>
+<tr><td>ctrl</td><td>76.0</td><td>8514</td><td>8.6%</td></tr>
+<tr><td>P1 diff-reward</td><td>75.77</td><td>8525</td><td>8.5%</td></tr>
+<tr><td>P3 real-PPO</td><td>75.70</td><td>8517</td><td>8.6%</td></tr>
+<tr><td>P1+P3</td><td>75.30</td><td>8522</td><td>8.5%</td></tr></table>
+<p>At iter 1000 all four sit at <b>identical CP within the &plusmn;2% eval-CP noise floor</b>, with the
+control marginally ahead on accuracy. No upgrade yet shows the CP-per-drift advantage it was designed
+to produce — consistent with the D1 manifold result, but iter 1000 is only ~8.6% reduction (the top of
+the frontier where all methods coincide). The differentiating comparison is at iter 1500&ndash;3000
+(CP &lt; 7000); pilots continuing. Note also: the aux-extension deep-end control was caught contaminated
+(the continuation script injected RL onto the aux-only cell) and relaunched clean
+(<code>235bv20auxext_norl_aux0.02_r1</code>, USE_RL=0, now in new territory past iter 3000) &mdash;
+before any contaminated checkpoint entered the registry.</p>
+<p><span class="verdict" style="background:#ef6c00">PARTIAL</span> &nbsp; Pilots at iter 1000: no CP-per-drift advantage yet (all at ~8520 CP, ctrl marginally best on acc) — too early (shallow CP); real comparison at 1500-3000. Aux-ext control fixed + clean.</p>
+<p class="meta">updated 2026-07-12 22:51</p>
 </div>
 <div class="card"><h2>6. Quarantine final tally — 26 rows resolved, verdict updates</h2>
 <div class="hyp"><b>Hypothesis under test:</b> Data-integrity remediation (audit F1/F4): what did the wrong-checkpoint rows actually hide?</div>
