@@ -11,7 +11,7 @@ code{background:#f5f5f5;padding:1px 5px;border-radius:3px;font-size:0.9em}
 .hyp{background:#fffde7;border-left:4px solid #f9a825;padding:6px 12px;margin:8px 0;font-size:0.93em}
 </style></head><body>
 <h1>RL-Benefit Diagnosis — Qwen3-235B Router-Only RL vs Aux-Loss</h1>
-<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-13 03:24.
+<p class="meta">Living report — sections appended as diagnostics land. Regenerated 2026-07-13 04:56.
 Spec: <code>docs/superpowers/specs/2026-07-11-rl-benefit-diagnosis-design.md</code>.
 All accuracy/CP data from the audited registry (canonical CP, quarantined rows excluded).</p>
 <div class="card"><h2>0. Overview — hypotheses, diagnostics, decision rule</h2>
@@ -191,8 +191,23 @@ the frontier where all methods coincide). The differentiating comparison is at i
 (the continuation script injected RL onto the aux-only cell) and relaunched clean
 (<code>235bv20auxext_norl_aux0.02_r1</code>, USE_RL=0, now in new territory past iter 3000) &mdash;
 before any contaminated checkpoint entered the registry.</p>
-<p><span class="verdict" style="background:#ef6c00">PARTIAL</span> &nbsp; Pilots at iter 1000: no CP-per-drift advantage yet (all at ~8520 CP, ctrl marginally best on acc) — too early (shallow CP); real comparison at 1500-3000. Aux-ext control fixed + clean.</p>
-<p class="meta">updated 2026-07-12 22:51</p>
+<p><b>FINAL pilot verdict (2026-07-13, through iter 2000):</b></p>
+<table><tr><th>iter</th><th>ctrl</th><th>P1 diff-reward</th><th>P3 real-PPO</th><th>P1+P3</th><th>CP (all)</th></tr>
+<tr><td>500</td><td>76.10</td><td>76.17</td><td>76.28</td><td>75.97</td><td>~8700</td></tr>
+<tr><td>1000</td><td>76.00</td><td>75.77</td><td>75.70</td><td>75.30</td><td>~8520</td></tr>
+<tr><td>1500</td><td>76.14</td><td>76.14</td><td>75.63</td><td>75.87</td><td>~8310</td></tr>
+<tr><td>2000</td><td>75.41</td><td>75.46</td><td>75.71</td><td>75.51</td><td><b>8148&ndash;8151</b></td></tr></table>
+<p>At iter 2000 all four cells sit at <b>identical CP within 3 tokens (0.04%)</b> with an accuracy
+spread of 0.30pp, and the leader <b>flips at every checkpoint</b> (P3 @500, ctrl @1000, ctrl=P1 @1500,
+P3 @2000) &mdash; the signature of pure run-to-run noise with no underlying signal. <b>The exact
+per-token difference reward (P1) and real multi-epoch PPO (P3) produce no CP-per-drift advantage over
+the naive control at matched CP.</b> This is the direct experimental confirmation of D1: at a frozen
+backbone the accuracy&ndash;CP trade is set by router drift magnitude, <i>independent of reward design
+or PPO machinery</i>. Fixing the implementation (sections 1&ndash;3 showed it was inert REINFORCE with
+no token credit) makes RL <b>correct</b>, not <b>better than aux</b>. Pilots continue to 3000 for the
+corner point, but the verdict is settled at matched CP.</p>
+<p><span class="verdict" style="background:#c62828">CONFIRMED</span> &nbsp; SETTLED: at matched CP (8150 @ iter2000), P1/P3/P1P3 tie the control within noise, leader flips every checkpoint — no CP-per-drift advantage from either the exact difference reward or real PPO. Confirms D1 empirically: the accuracy-CP trade is drift-determined, reward/algorithm-independent. Implementation fixes make RL correct, not better than aux.</p>
+<p class="meta">updated 2026-07-13 04:56</p>
 </div>
 <div class="card"><h2>6. Quarantine final tally — 26 rows resolved, verdict updates</h2>
 <div class="hyp"><b>Hypothesis under test:</b> Data-integrity remediation (audit F1/F4): what did the wrong-checkpoint rows actually hide?</div>
@@ -286,8 +301,19 @@ CONFIRM RL), iter-0 canonical CP baseline (audit F5, fixes the reduction denomin
 </ul>
 <p><i>Housekeeping: the two fenced _d4 HF dirs (~940 GB) were deleted after D4 measurements
 completed (HF conversions are recreatable; standing HF lifecycle policy).</i></p>
-<p><span class="verdict" style="background:#c62828">CONFIRMED</span> &nbsp; Diagnosis complete. Parity is mechanistically explained (inert PPO + no token credit + surrogate reward + drift manifold). RL territory: deep end + dial-a-CP + flexibility. Pilots are worthwhile but should target CP-per-drift, not bulk domination. Awaiting: disk unpause for pilots + controls.</p>
-<p class="meta">updated 2026-07-11 22:00</p>
+<hr><p><b>Diagnosis COMPLETE (2026-07-13).</b> All battery items + both interventions resolved:
+D1 manifold (accuracy drift-determined), D2/D3 (inert REINFORCE, no token credit), D4 (balance
+generalizes similarly), literature (H2 best-supported), quarantine (26 rows fixed), F5 (baseline CP
+measured 9253), <b>upgrade pilots (no CP-per-drift advantage &mdash; implementation fixes make RL
+correct not better)</b>, and the <b>deep-end control (metric-split: on-suite refuted, holdout edge
+CONFIRMED &mdash; aux over-extension overfits balance)</b>. Final paper-ready story: <i>router-only RL
+matches the aux baseline across the whole accuracy&ndash;CP frontier via a fundamentally different
+mechanism (method-independence, extends Shazeer'17), holds a small but real held-out deep-end edge
+because aux over-extends into balance-overfitting, and offers the untested dial-a-CP capability plus a
+method-agnostic systems story.</i> Campaign can wind to steady-state; remaining work is writing +
+optional replication (true seeds, dial-a-CP demo, systems CP&rarr;latency).</p>
+<p><span class="verdict" style="background:#c62828">CONFIRMED</span> &nbsp; Diagnosis COMPLETE. RL matches aux everywhere (method-independence), small real holdout deep-end edge (aux over-extends), dial-a-CP + systems remain. Ready to write up.</p>
+<p class="meta">updated 2026-07-13 04:56</p>
 </div>
 <div class="card"><h2>10. F5 closed — measured pretrained canonical CP validates the 9320 denominator</h2>
 <div class="hyp"><b>Hypothesis under test:</b> Audit F5: the CP-reduction denominator (9320) had no canonical measurement behind it.</div>
