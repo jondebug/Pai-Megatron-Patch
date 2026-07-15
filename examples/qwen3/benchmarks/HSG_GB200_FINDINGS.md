@@ -531,3 +531,34 @@ Conclusion: expert-load balance on GB200 NVL72 serving is a small-ceiling optimi
 at single-digit percent by the synchronized comms step. Router-RL CP reduction is not
 an inference-latency play on this hardware class; residual value hypotheses are
 training-time balance, capacity headroom, and B200-class fabrics.
+
+## §O (2026-07-15): Serving-time routing distribution — the arithmetic that closes the story
+
+Measured via vLLM --enable-return-routed-experts (mechanism from O. Ullman Argov's
+snippet 15741; upstream vllm/vllm-openai:latest container — the April fork's recording
+is unwired for the FlashInfer-FP4 MoE path and returns all-zero IDs; HTTP surfacing
+also postdates the fork). FP4 checkpoints, campaign number-salad prompts, 128 reqs,
+3 reps (reproducible to 3 decimals). Busiest-rank/mean-rank load (contiguous mapping):
+
+| EP | pre | r05 | reduction |
+|---|---|---|---|
+| 8  | 2.13× | 1.88× | −12% |
+| 16 | 3.33× | 2.77× | −17% |
+| 32 | 5.22× | 4.24× | −19% |
+| 64 | 8.58× | 7.08× | −17% |
+
+Two conclusions:
+1. **Router-RL does flatten serving-time load on unseen data** — 12-19% imbalance
+   reduction, monotone in EP, perfectly reproducible.
+2. **But the e2e null is now arithmetic, not mystery**: the FULL distance to uniform
+   (1.0×) is worth +3-6% e2e (§N ceiling); r05 covers ~1/5 of that distance → expected
+   e2e gain ≲1%, far below the ±1-4pp A/A envelope. The measured 0% is exactly what
+   the ceiling × achieved-flattening product predicts.
+
+Note also pre's imbalance growth with EP (2.13×→8.58×): even at 8.6× busiest-rank load
+at EP=64, e2e was flat — independent confirmation that the reachable stacks price rank
+imbalance at almost nothing (fixed-size collectives / fabric absorption, §J/§L).
+
+Campaign equation, final form:
+e2e gain ≈ (balance ceiling: 3-6%) × (fraction of imbalance removed: ~0.2 for r05)
+        ≈ <1.5%  →  unmeasurable. Consistent across 5 backends, 3 EPs, and EPLB (−3%).
