@@ -1557,3 +1557,4 @@ pretrained_235b,0,,pretrained,False,False,,,,,,,,,,,,,,inf,,;splits_ingested_202
 235bv19pilot_p1p3_r1,3000,,,,,3000,,,,,,,,,,,,,cponly,,cp_stub,,,,,,,no_wandb,,none,,,,,,,,,,,,,,,,,,,,,,,,,,,,
 test_cell,100,,,,,,,,,,,,,,,,,,inf,,;mathsplits_acc_ingested;mathsplits_acc_ingested;mathsplits_acc_ingested,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,100.0,100.0,,,,100.0,,
 235B_pretrained_base,0,,,,,,,,,,,,,,,,,,inf,,;mathsplits_full_ingested,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,24.74,86.66,8468.0,7862.6,0.0,51.96,8544.5,7879.3
+235bv21math_aux0.001_r1,500,,,,,,,,,,,,,,,,,,inf,,;mathsplits_full_ingested,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,80.31,87.89,8431.0,7190.0,0.0,51.52,8134.6,7196.1
