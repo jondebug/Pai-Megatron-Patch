@@ -1569,3 +1569,4 @@ test_cell,100,,,,,,,,,,,,,,,,,,inf,,;mathsplits_acc_ingested;mathsplits_acc_inge
 235bv21math_p1difflse_ppo2_r1,500,,rl_only,True,False,,per_token_load_weighted,,,,,,,,,,,,inf,,;mathsplits_full_ingested,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,82.79,87.41,8434.6,7189.1,0.0,52.4,8147.0,7209.9
 235bv21math_p1difflse_ppo4_r1,500,,rl_only,True,False,,per_token_load_weighted,,,,,,,,,,,,inf,,;mathsplits_full_ingested,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,81.43,87.36,8423.4,7161.3,0.0,52.16,8151.0,7213.3
 235bv21math_p1difflse_r1,500,,,,,,,,,,,,,,,,,,inf,,;mathsplits_full_ingested,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,80.52,87.21,8428.9,7188.6,0.0,52.29,8149.5,7203.2
+235bv21math_cpreward_r1,500,,,,,,,,,,,,,,,,,,inf,,;mathsplits_full_ingested,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,81.5,86.32,8431.1,7166.9,0.0,52.08,8162.2,7214.0
