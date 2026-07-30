@@ -535,7 +535,7 @@ def get_patch_args(parser):
                       help='Hidden dimensions for critic network layers (default: 256). Examples: "256" for 1 layer, "256 64 32" for 3 layers')
     group.add_argument('--rl-reward-type', type=str, default='expert0',
                       choices=['expert0', 'entropy', 'topn_load', 'critical_path',
-                               'per_token_topn_binary', 'per_token_load_weighted'],
+                               'per_token_topn_binary', 'per_token_load_weighted', 'diff_lse_load'],
                       help='Reward function type: expert0 (focus on expert 0), entropy (load balance entropy), '
                            'topn_load (avg/topN load ratio), critical_path (directly targets max expert load), '
                            'per_token_topn_binary (per-token: -1 if hot expert, +1 otherwise), '
@@ -558,6 +558,15 @@ def get_patch_args(parser):
                       help='Coefficient (beta) for per-token LM cross-entropy reward. '
                            '0 = disabled. When > 0, adds -cross_entropy(token) as an additional '
                            'reward component to all layers, centered per-batch.')
+    group.add_argument('--rl-no-advantage-norm', action='store_true', default=False,
+                      help='[experiment] Skip zero-mean/unit-variance standardization of per-token '
+                           'advantages in the per-token REINFORCE loss, preserving the reward calibrated '
+                           'magnitude. Default False = current behavior (standardize).')
+    group.add_argument('--rl-credit-counterfactual', action='store_true', default=False,
+                      help='[experiment] Directed per-token credit: use logP(e_src) - logP(e_cf) '
+                           '(primary-chosen minus best-unchosen expert) instead of summed chosen '
+                           'log-probs, moving probability toward the counterfactual destination. '
+                           'For diff_lse_load-style rewards. Default False = current behavior.')
     group.add_argument('--rl-ppo-clip-ratio', type=float, default=0.2,
                       help='PPO clipping ratio for policy updates (default: 0.2). '
                            'Lower values are more conservative, higher allow larger updates.')

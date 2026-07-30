@@ -348,6 +348,8 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.ppo_extra_lr = getattr(args, 'rl_ppo_extra_lr', 1e-4)
     trajectory_tracker.ppo_legacy_mode = getattr(args, 'rl_ppo_legacy_mode', False)
     trajectory_tracker.gae_lambda = getattr(args, 'rl_gae_lambda', 1.0)
+    trajectory_tracker.no_advantage_norm = getattr(args, 'rl_no_advantage_norm', False)
+    trajectory_tracker.credit_counterfactual = getattr(args, 'rl_credit_counterfactual', False)
     print(f"[RL CONFIG] reward_type={trajectory_tracker.reward_type}, "
           f"baseline_type={trajectory_tracker.baseline_type}, "
           f"per_token_rewards={trajectory_tracker.per_token_rewards}, "
@@ -592,7 +594,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
                     "rl_loss_scaled":float((rl_loss * loss[1]).item()),
                     "lm_loss_avg":float((loss[0]/loss[1]).item()),
                     "combined_loss_avg":float(((loss[0] + rl_loss * loss[1])/loss[1]).item())}}
-    with open("/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing/Pai-Megatron-Patch/.cursor/debug-63a0ae.log","a") as _f: _f.write(json.dumps(_dbg)+"\n")
+    pass  # disabled 2026-07-12: per-step all-rank writes to one lustre file grew to 14.5GB (IO hazard)
     # #endregion
 
     # Scale RL loss to match the LM loss scale (RL loss is averaged, LM loss is summed)

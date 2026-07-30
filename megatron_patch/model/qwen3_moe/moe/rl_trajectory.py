@@ -369,6 +369,12 @@ class RouterTrajectoryTracker:
             latent_token_representations (torch.Tensor) - state space
             routing_map (torch.Tensor): Token routing assignments - action space
         """
+        # [FIX 2026-07-30] Honor the paused flag: during the KL reference forward (torch.no_grad) the
+        # router still calls this method and would overwrite the trajectory's in-graph logits with
+        # detached ones -> rl_loss.requires_grad=False -> RL policy gradient severed (no-op). Mirrors
+        # the _kl_state['capture_disabled'] guard already used for KL logit capture.
+        if getattr(self, 'paused', False):
+            return
         # CRITICAL: Check gradient flow - if routing_logits doesn't require grad, policy gradient will be zero!
         if layer_num == 1 and not routing_logits.requires_grad and torch.is_grad_enabled():
             import warnings
@@ -393,7 +399,7 @@ class RouterTrajectoryTracker:
                 self._ema_expert_loads = (1 - self._ema_momentum) * self._ema_expert_loads + self._ema_momentum * batch_loads
 
         # Auto-set per_token_rewards for reward types that are inherently per-token
-        _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "expert0"}
+        _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "expert0", "diff_lse_load"}
         if self.reward_type in _PER_TOKEN_REWARD_TYPES:
             self.per_token_rewards = True
 
@@ -420,6 +426,8 @@ class RouterTrajectoryTracker:
             reward = self.per_token_topn_binary_reward(routing_map)
         elif self.reward_type == "per_token_load_weighted":
             reward = self.per_token_load_weighted_reward(routing_map)
+        elif self.reward_type == "diff_lse_load":
+            reward = self.diff_lse_load_reward(routing_map, routing_logits)
         else:  # "expert0" (default)
             reward = self.focus_tokens_on_expert_0_reward(routing_map)
         
@@ -654,6 +662,44 @@ class RouterTrajectoryTracker:
         # Linear scale: 1 (no hot experts) to -1 (all hot experts)
         reward = 1.0 - 2.0 * (num_hot / num_chosen)
         
+        return reward
+
+    def diff_lse_load_reward(self, routing_map: torch.Tensor, routing_logits: torch.Tensor) -> torch.Tensor:
+        """P1 pilot (2026-07-12): exact per-token DIFFERENCE reward on a smoothed max-load objective.
+
+        Objective: R(loads) = -tau * logsumexp(loads / tau) (smooth proxy of -max_e load; LogSumExp
+        gives non-bottleneck tokens nonzero credit — the Dr.Reinforce max-objective caveat).
+        Counterfactual per token: move its PRIMARY assignment (highest-logit chosen expert) to its
+        best UNCHOSEN expert (by its own logits — where the router would actually send it).
+        Difference reward D_t = R(loads) - R(loads_cf), exact and critic-free: negative when the
+        token sits on a hot expert with a cooler alternative, so the policy gradient lowers the
+        probability of the hot assignment. Scale-stable via log-ratio * mean load.
+        """
+        with torch.no_grad():
+            rm = routing_map.float()
+            loads = rm.sum(dim=(0, 1))                                  # [E]
+            mean_load = loads.mean().clamp(min=1.0)
+            tau = mean_load * float(getattr(self, "diff_lse_tau", 0.25))
+            z = loads / tau
+            zmax = z.max()
+            S = torch.exp(z - zmax).sum()                               # stable partition
+
+            logits = routing_logits.float()
+            neg_inf = float("-inf")
+            # primary chosen expert (source) and best unchosen expert (destination) per token
+            chosen_logits = logits.masked_fill(~routing_map.bool(), neg_inf)
+            e_src = chosen_logits.argmax(dim=-1)                        # [seq, batch]
+            unchosen_logits = logits.masked_fill(routing_map.bool(), neg_inf)
+            e_cf = unchosen_logits.argmax(dim=-1)                       # [seq, batch]
+            l_src = loads[e_src]                                        # [seq, batch]
+            l_cf = loads[e_cf]
+
+            def ex(l):
+                return torch.exp(l / tau - zmax)
+            dS = ex((l_src - 1).clamp(min=0.0)) - ex(l_src) + ex(l_cf + 1.0) - ex(l_cf)
+            S_cf = (S + dS).clamp(min=1e-30)
+            # D = R - R_cf = tau * (log S_cf - log S); rescale to O(1) per-mean-load units
+            reward = (torch.log(S_cf) - torch.log(S)) * mean_load
         return reward
 
     def per_token_load_weighted_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
@@ -893,11 +939,13 @@ class RouterTrajectoryTracker:
             layer_advantages[layer_num] = (layer_returns[layer_num] - layer_baselines[layer_num]).detach()
         
         # Normalize advantages across all tokens and layers to zero mean, unit variance
-        all_advs = torch.cat([layer_advantages[ln].flatten() for ln in sorted_layers])
-        adv_mean = all_advs.mean()
-        adv_std = all_advs.std().clamp(min=1e-8)
-        for ln in sorted_layers:
-            layer_advantages[ln] = (layer_advantages[ln] - adv_mean) / adv_std
+        # [experiment flag] --rl-no-advantage-norm skips this to preserve the reward calibrated scale.
+        if not getattr(self, 'no_advantage_norm', False):
+            all_advs = torch.cat([layer_advantages[ln].flatten() for ln in sorted_layers])
+            adv_mean = all_advs.mean()
+            adv_std = all_advs.std().clamp(min=1e-8)
+            for ln in sorted_layers:
+                layer_advantages[ln] = (layer_advantages[ln] - adv_mean) / adv_std
         
         total_loss = torch.tensor(0.0, device=device)
         total_tokens = 0
@@ -907,8 +955,22 @@ class RouterTrajectoryTracker:
             advantages = layer_advantages[layer_num]  # [seq_length, batch_size]
             
             log_probs = torch.nn.functional.log_softmax(routing_logits, dim=-1)
-            chosen_log_probs = log_probs * routing_map.float()
-            per_token_log_prob = chosen_log_probs.sum(dim=-1)  # [seq_length, batch_size]
+            if getattr(self, 'credit_counterfactual', False):
+                # [experiment flag] directed credit toward the counterfactual destination:
+                # per_token_log_prob = logP(primary-chosen e_src) - logP(best-unchosen e_cf).
+                # loss = -per_token_log_prob*A ; diff_lse_load sign (A<0 => beneficial move) =>
+                # this lowers P(e_src) and raises P(e_cf) for tokens that should move.
+                _neg_inf = float('-inf')
+                _chosen = routing_logits.masked_fill(~routing_map.bool(), _neg_inf)
+                _e_src = _chosen.argmax(dim=-1, keepdim=True)
+                _unchosen = routing_logits.masked_fill(routing_map.bool(), _neg_inf)
+                _e_cf = _unchosen.argmax(dim=-1, keepdim=True)
+                _lp_src = torch.gather(log_probs, -1, _e_src).squeeze(-1)
+                _lp_cf = torch.gather(log_probs, -1, _e_cf).squeeze(-1)
+                per_token_log_prob = _lp_src - _lp_cf  # [seq_length, batch_size]
+            else:
+                chosen_log_probs = log_probs * routing_map.float()
+                per_token_log_prob = chosen_log_probs.sum(dim=-1)  # [seq_length, batch_size]
             
             per_token_loss = -per_token_log_prob * advantages
             
@@ -1248,11 +1310,13 @@ class RouterTrajectoryTracker:
                 layer_advantages[layer_num] = (layer_returns[layer_num] - layer_baselines[layer_num]).detach()
         
         # Normalize advantages across all tokens and layers to zero mean, unit variance
-        all_advs = torch.cat([layer_advantages[ln].flatten() for ln in sorted_layers])
-        adv_mean = all_advs.mean()
-        adv_std = all_advs.std().clamp(min=1e-8)
-        for ln in sorted_layers:
-            layer_advantages[ln] = (layer_advantages[ln] - adv_mean) / adv_std
+        # [experiment flag] --rl-no-advantage-norm skips this to preserve the reward calibrated scale.
+        if not getattr(self, 'no_advantage_norm', False):
+            all_advs = torch.cat([layer_advantages[ln].flatten() for ln in sorted_layers])
+            adv_mean = all_advs.mean()
+            adv_std = all_advs.std().clamp(min=1e-8)
+            for ln in sorted_layers:
+                layer_advantages[ln] = (layer_advantages[ln] - adv_mean) / adv_std
         
         total_loss = torch.tensor(0.0, device=device)
         total_policy_loss = torch.tensor(0.0, device=device)
@@ -1363,6 +1427,9 @@ class RouterTrajectoryTracker:
             _, routing_map, _, _ = self.old_layer_decisions[layer_num]
             if self.reward_type == 'per_token_load_weighted':
                 reward = self.per_token_load_weighted_reward(routing_map)
+            elif self.reward_type == 'diff_lse_load':
+                _, _, _rl_logits, _ = self.old_layer_decisions[layer_num]
+                reward = self.diff_lse_load_reward(routing_map, _rl_logits)
             elif self.reward_type == 'per_token_topn_binary':
                 reward = self.per_token_topn_binary_reward(routing_map)
             elif self.reward_type == 'topn_load':
@@ -1565,7 +1632,7 @@ class RouterTrajectoryTracker:
             self._ppo_optimizer.step()
 
         opt_name = self._ppo_optimizer.__class__.__name__ if self._ppo_optimizer is not None else "None"
-        wrap_print_rank_0(f"[PPO MULTI-EPOCH] Ran {self.ppo_epochs - 1} extra epochs "
+        print(f"[PPO MULTI-EPOCH] Ran {self.ppo_epochs - 1} extra epochs "
                          f"(lr={extra_lr:.2e}, opt={opt_name}, legacy={legacy_mode}, buf={len(replay_rollouts)}), "
                          f"last_loss={total_loss.item():.6f}")
 
