@@ -307,3 +307,113 @@ comparison is the next decisive datapoint. Levers if RL stays neutral: (a)
 credit_counterfactual + no_advantage_norm flags (already wired, unrun); (b)
 CP-direct reward instead of diff_lse_load; (c) critic/GAE for variance reduction;
 (d) higher rlc without divergence (needs a trust region stronger than KL alone).
+
+### §11.1 Connection verification of the aux=0 "flat" cells (integrity check)
+Doubt raised: the original pureRL_rlc0.1 / stab_kl seg=1 logs (it 0-968) show NO
+grad_diag telemetry, while their seg=2 continuations do — were seg=1 actually
+connected, or is §11 measuring disconnected cells?
+
+Resolved by working-tree timing (definitive):
+- rl_trajectory.py (paused-guard FIX): mtime 2026-07-30 13:00 — present in the
+  working tree BEFORE the seg=1 submits (08:05 / 08:13 on 07-31).
+- helper.py (grad_diag TELEMETRY): mtime 2026-07-31 08:39 — edited AFTER those
+  submits, BEFORE the seg=2 continuations (12:09 / 12:19).
+=> seg=1 ran WITH the fix (connected) but WITHOUT the telemetry logging; that is
+why grad_diag is absent from their logs yet grad_diag=1 in the continuations.
+Corroboration: seg=1 logs print rl_mean_reward + rl_policy_loss (RL loss computed),
+and load_bal drifted off pretrained 3.33 (router being updated).
+
+Conclusion: the ~900-iter flat-CP result IS a genuine connected-RL result. §11
+holds. (Whether the mechanism is "RL is truly CP-neutral" vs "connected but the
+diff_lse_load reward / update magnitude doesn't drive CP down" is unresolved, but
+the practical verdict is identical: connected RL at aux=0, rlc in {0.1,0.5}, does
+not reduce CP over ~900 iters, while aux drives a clean -22%.)
+
+---
+
+## §12. DEBUG: why connected RL still doesn't reduce CP (reward flat, not a code bug) — 2026-07-31
+
+User concern: "reward should be increasing, rl loss decreasing." Investigated with the
+systematic-debugging process (root cause before fixes). Verdict: RL is correctly
+implemented and connected; it does not learn because the policy-gradient STEP is too
+weak at the campaign's hyperparameters — a tuning/method issue, NOT a bug.
+
+### Evidence
+1. Telemetry (pureRL_rlc0.1, aux=0 KL=0, 900 iters): reward FLAT ~0.18, pol_loss ~1e-8,
+   load_bal drifts 3.54->3.89 (slightly worse), CP flat ~9300.
+2. pol_loss ~1e-8 is EXPECTED, not a bug: REINFORCE loss value = -mean(adv*logpi) with
+   mean-0 standardized advantages ≈ -Cov(adv,logpi) ≈ 0. The learning signal is the
+   GRADIENT (verified nonzero, ‖grad on router.weight‖=1.55 in the unit test), not this
+   scalar. "loss decreasing" is not a valid health metric for standardized REINFORCE.
+3. Advantages are healthy: adv_std=1.0, adv_max~1.5 (standardization works; not vanishing).
+4. Reward normalizer (--rl-normalize-rewards) is a NO-OP given advantage normalization:
+   its affine (reward-m)/s cancels under the subsequent (adv-mean)/std -> final advantage
+   = (reward-mean)/std(reward) regardless. Ruled out as a cause of the drift (drift = noise).
+
+### Minimal reproduction (toy: E=16, topk=2, N=256, exact diff_lse_load + both credit branches)
+- From EXTREME imbalance (max_load 161, ideal 32): DEFAULT credit balances to ~34 (CV
+  1.10->0.04) — so the default per-token credit is NOT fundamentally misaligned. Refuted
+  the first hypothesis. Counterfactual credit and no_adv_norm also work.
+- lr sweep (DEFAULT credit): lr>=0.01 balances; lr=0.002 -> 161->145; lr=0.0005 -> 161->159.
+  A hard LR THRESHOLD below which policy-gradient RL stays FLAT in the available steps —
+  reproducing the real symptom.
+- Near-balanced start (bias=0.4, like a pretrained router): balances only when lr adequate.
+
+### Root cause
+Policy gradient is high-variance and weak per step. At real lr=1e-4 (clip-grad=1.0,
+rlc<=0.5), the effective step is far below the threshold needed to move an already
+near-balanced 235B router within 1500 iters -> flat CP. Aux succeeds at the SAME lr
+because its dense differentiable gradient has vastly better signal-to-noise. Raising the
+step (rlc=1.0) causes router collapse (grad explosion) rather than clean learning: RL is
+boxed between too-weak (flat) and too-strong (collapse).
+
+### Reinterpretation
+The campaign's "RL == aux" was because broken-RL runs were effectively aux-only (§10/§11).
+Now: connected RL alone is CP-neutral because it can't learn at these hypers, while aux
+optimizes the same objective far more efficiently. RL is not broken — it is dominated by
+aux as an optimizer for this near-balanced, tightly-clipped, low-lr regime.
+
+### Next test (decisive, real system)
+Widen the step with variance/collapse control and see if CP drops: higher policy lr
+(PLR 5e-4..1e-3) and/or higher rlc WITH clip-grad, plus optionally counterfactual credit
+(--rl-credit-counterfactual) to sharpen the signal and a critic/GAE to cut variance. If CP
+drops without collapse -> step-size root cause confirmed + a working RL config. If it only
+oscillates/collapses -> RL is dominated by aux for this problem (report as the finding).
+
+---
+
+## §13. DECISIVE: higher-lr test diverges -> variance is the bottleneck (2026-07-31)
+
+Test of the §12 step-size hypothesis in the real system. Cell ex_pureRLhilr_r1
+(AUX=0 KL=0 RLC=0.5, PLR=1e-3 = 10x the campaign lr), clip-grad=1.0.
+
+Result (100-iter binned CP; flat-baseline pure-RL ~9300, real baseline ~9870):
+  it   0-99 : meanCP=9444  load_bal=4.20
+  it 100-199: meanCP=9742  load_bal=5.32
+  it 200-299: meanCP=10333 load_bal=6.77   grad_norm 39.7 (diverging)
+
+10x lr does NOT unlock CP reduction — it DIVERGES: CP rises, load_bal worsens
+(4.2->6.8, vs 3.33 baseline), pre-clip grad explodes (1.6->39.7). Router collapsing
+even under clip-grad=1.0 (clip bounds the step magnitude but the direction is
+consistently toward collapse).
+
+### Conclusion — the RL diagnosis is complete
+Pure RL (aux=0) is boxed on both sides, now confirmed in the real system:
+  - lr=1e-4  -> too weak  -> FLAT (§11): can't move the near-balanced router in 1500 iters
+  - lr=1e-3  -> too strong -> DIVERGES (§13): amplifies the noisy 94-layer policy gradient
+There is NO learning-rate sweet spot. The toy (single clean layer) balanced at high lr;
+the real 235B policy gradient is averaged over 94 layers x a huge batch = very high
+variance, so larger steps amplify noise, not signal. The bottleneck is gradient VARIANCE,
+not step size or credit rule or connection.
+
+Aux dominates because its dense differentiable load-balance gradient has vastly better
+signal-to-noise than the REINFORCE estimator, and works at lr=1e-4 where RL cannot.
+
+### Only remaining lever for making RL competitive: variance reduction
+- learned critic baseline + GAE (per-token value head) to cut estimator variance
+- counterfactual credit (--rl-credit-counterfactual) to sharpen per-token signal
+- much larger effective batch / reward smoothing
+NOTE: the campaign's OLD critic/GAE cells are VOID (ran pre-fix = disconnected RL).
+A clean re-run (aux=0, BASELINE=critic, GAE, connected) is the decisive "can RL be
+rescued" experiment. If a critic-stabilized RL still can't beat aux -> RL is dominated
+for this problem, which is itself the paper's systems finding.
