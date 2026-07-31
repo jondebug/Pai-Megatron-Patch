@@ -199,3 +199,111 @@ this is now the real open question, not a bug.
    actually moves CP now (the first honest test).
 3. **Re-derive the RL vs aux comparison** — the prior verdict is void; connected RL must be re-measured.
 4. Finish the dev→test **validation-selected** Pareto (MATH dev re-eval landing).
+
+---
+
+## 9. Connected pure-RL DIVERGES — trend analysis + stabilization plan (2026-07-31)
+
+First connected pure-RL run (`ex_pureRL`: aux=0, kl=0, rlc=1.0, diff_lse_load) trained to 1500 on the
+fixed code. Verdict: **RL is connected and initially works, then diverges via gradient explosion.**
+
+Binned 0->1500 trend (plots: /workspace/plots/rl_divergence/):
+
+| phase | iters | load_bal | CP | lm_loss | grad_norm |
+|---|---|---|---|---|---|
+| RL working   | 1-200   | 3.3->3.2  | 9873->8968 | 1.70->1.16 | ~1.5 |
+| instability  | 300-500 | oscillate | oscillate  | 1.7->1.9   | 1.6->6.6 |
+| grad blow-up | 600-900 | 4.1->5.4  | ->10.7k    | 2.0->2.4   | 8->59 |
+| divergence   | 900-1500| ->10.9    | ->11.7k    | ->2.7      | 214->80 |
+
+Key: early on RL genuinely reduced imbalance AND improved lm_loss (1.70->1.16) with aux=0 — proof RL is
+connected and doing real work (the old broken campaign never moved CP via RL). Then grad_norm climbs
+1.5->6.6->59->214 and load_bal/CP/lm_loss collapse in lockstep. Failure mode: classic RL instability —
+rlc=1.0 with NO trust region and NO anchor (aux=0, kl=0), nothing bounds the router's drift. Confound:
+the continuation mechanism re-warms the LR at each segment boundary (LR jumps back to ~1e-4 at iter ~991,
+coincides with a grad spike) — the continuation should carry ONE continuous LR schedule to 1500; but grad
+already grew 1.5->59 within the first segment, so the LR restart is aggravating, not the sole cause.
+
+### Divergence hypotheses
+- H-a rlc too hot (overshoot) -> lower rlc.
+- H-b no trust region -> re-enable KL to the pretrained reference (now safe post paused-fix).
+- H-c no balance anchor -> small aux floor to keep the router in a sane region.
+- H-d advantage renorm amplifies noise as the reward decays -> keep the calibrated reward scale.
+- H-e LR warmup restart per continuation segment -> make the continuation LR-continuous (infra fix).
+
+### Stabilization experiment plan (queued in math_throttle, fix + rl_grad_diag telemetry, all rlc=0.5 to isolate)
+- rlc sweep: 0.1 / 0.5 / 1.0(done) / 2.0 (aux=0,kl=0) -- coefficient / stability curve.
+- ex_stab_kl0.001:    AUX=0 KL=0.001 RLC=0.5          -- KL trust region.
+- ex_stab_aux0.001:   AUX=0.001 KL=0 RLC=0.5          -- small aux anchor.
+- ex_stab_std:        AUX=0.001 KL=0.001 RLC=0.5      -- standard config (both anchors), CONNECTED.
+- ex_stab_noadvnorm:  AUX=0 KL=0 RLC=0.5 NO_ADV_NORM=1 -- keep reward calibrated scale.
+
+Success = sustained CP/load-balance reduction to iter 1500 WITHOUT grad_norm blow-up or lm_loss rise,
+and rl_grad_norm_on_logits scaling monotonically with rlc (connection + responsiveness).
+TODO (infra): fix LR-schedule restart across continuation segments.
+
+---
+
+## §10. PRODUCTION CONFIRMATION under KL>0 (2026-07-31)
+
+The unit test proved the paused-guard fix reconnects the RL gradient in isolation.
+This is the **live 235B confirmation under the exact condition that broke it**.
+
+Cell `235bv21math_ex_stab_std_r1` runs the **standard campaign config**:
+`AUX=0.001 KL=0.001 RLC=0.5 REWARD=diff_lse_load BASELINE=mean` — the same config
+whose RL was a silent no-op across the whole prior sweep, because `kl_coeff>0`
+triggers `_run_reference_forward()`, whose detached logits overwrote the RL
+trajectory (tracker.paused was set but never honored by the live router).
+
+Fresh telemetry at iter 7:
+- `rl_loss_requires_grad = 1.0`  (rl_loss is on the autograd graph)
+- `rl_grad_diag = 1.0`           (autograd.grad(rl_loss, router_logits) succeeds, non-None)
+- `rl_grad_norm_on_logits = 9.06e-05`  (nonzero gradient on the pre-softmax router logits)
+
+=> The fix holds in production **with KL on** — the precise reference-forward path
+that detached RL before. Verdict: RL is now connected in the standard config, not
+just in the aux=0 pure-RL cells. All prior "RL == aux" / "RL is a no-op" campaign
+conclusions are confirmed VOID and are now being re-measured with a live gradient.
+
+Open question tracked next: does aux-anchor (0.001) + connected RL at rlc=0.5+KL
+reduce CP **without diverging**? aux=0 cells (rlc0.1, rlc0.5+KL) are stable
+(grad_norm flat ~1.3-1.6) but hold CP ~baseline; stab_std is the aux-anchored test.
+
+---
+
+## §11. ATTRIBUTION: connected RL alone does NOT reduce CP; aux does (2026-07-31)
+
+With RL provably connected (§10), we can finally ask the real question the broken
+gradient hid for the whole campaign: **does RL reduce CP?**
+
+Binned mean CP over training (canonical BS=1 seqlen-128 probe, baseline ~9870):
+
+| cell (config)                    | CP trajectory (mean per 150-iter window)     | verdict          |
+|----------------------------------|----------------------------------------------|------------------|
+| pureRL_rlc0.1 (aux=0, RL, conn.) | 9185→9392→9281→9423→9263→9324 over 0-900     | FLAT ~9300       |
+| stab_kl (aux=0, rlc0.5+KL, conn.)| 9216→9455→9370→9528→9373 over 0-750          | FLAT ~9400       |
+| aux0.001 ALONE (no RL)           | ...→8116→7887→7887→7693 over 900-1500         | SUSTAINED -22%   |
+| stab_std (aux0.001+rlc0.5+KL)    | 9003→8775 over 0-300 (early, declining)       | aux-like so far  |
+
+Two independent aux=0 cells, connected RL, ~750-900 iters each: **mean CP pinned
+near baseline.** Per-iter CP swings hard (minCP dips to ~5600, other iters >11000),
+so RL *is* perturbing the router — but with NO sustained direction. High-variance
+noise, not optimization. Aux, by contrast, drives a clean sustained -22%.
+
+### Reinterpretation of the campaign's "RL == aux" result
+Prior "RL" runs were `aux0.001 + DISCONNECTED RL`, i.e. effectively **aux-alone** —
+so they matched aux trivially. Now that RL is genuinely connected, **pure RL (aux=0)
+is WORSE than aux, not equal.** Fixing the gradient did not make RL beneficial; it
+exposed that connected RL *with the current reward* (`diff_lse_load`) is CP-neutral.
+
+### Implication
+The bottleneck was never only the disconnected gradient — it is the reward /
+credit-assignment signal (matches the original "no token credit on the true
+objective" diagnosis). Connecting the gradient is necessary but not sufficient.
+
+Open: does stab_std (aux anchor + connected RL) beat aux-alone's ~7700 at iter
+1000-1500? If < 7700 => RL adds value on top of aux. If ~7700 => RL neutral. That
+comparison is the next decisive datapoint. Levers if RL stays neutral: (a)
+credit_counterfactual + no_advantage_norm flags (already wired, unrun); (b)
+CP-direct reward instead of diff_lse_load; (c) critic/GAE for variance reduction;
+(d) higher rlc without divergence (needs a trust region stronger than KL alone).
