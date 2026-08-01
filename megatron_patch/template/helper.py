@@ -418,6 +418,9 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         loss_dict["rl_advantage_max"] = torch.tensor(components.get('advantage_max', 0.0))
         loss_dict["rl_approx_kl"] = torch.tensor(components.get('approx_kl', 0.0))
         loss_dict["rl_clip_fraction"] = torch.tensor(components.get('clip_fraction', 0.0))
+        loss_dict["rl_ptlp_std"] = torch.tensor(components.get('ptlp_std', 0.0))
+        loss_dict["rl_cov_ptlp_adv"] = torch.tensor(components.get('cov_ptlp_adv', 0.0))
+        loss_dict["rl_raw_reward_std"] = torch.tensor(components.get('raw_reward_std', 0.0))
         
         # Critical metrics for policy and value loss
         critical_metrics['critical/policy_loss'] = policy_loss.item() if hasattr(policy_loss, 'item') else float(policy_loss)

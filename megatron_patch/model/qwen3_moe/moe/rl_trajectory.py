@@ -433,6 +433,7 @@ class RouterTrajectoryTracker:
         
         # Apply reward normalization if enabled (expands compressed reward ranges)
         raw_reward_summary = reward.mean().item() if reward.dim() > 0 else reward.item()
+        self._last_raw_reward_std = float(reward.std().item()) if (reward.dim() > 0 and reward.numel() > 1) else 0.0
         if self.normalize_rewards:
             reward = self._reward_normalizer.normalize(reward)
         
@@ -903,6 +904,7 @@ class RouterTrajectoryTracker:
     
     def _compute_reinforce_loss_per_token(self, trajectory_data: Dict, discount_factor: float = 0.9) -> torch.Tensor:
         """Compute REINFORCE loss with per-token rewards."""
+        self._dg_ptlp = []; self._dg_adv = []
         if len(trajectory_data) == 0:
             return torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
             
@@ -973,6 +975,7 @@ class RouterTrajectoryTracker:
                 per_token_log_prob = chosen_log_probs.sum(dim=-1)  # [seq_length, batch_size]
             
             per_token_loss = -per_token_log_prob * advantages
+            self._dg_ptlp.append(per_token_log_prob.detach().flatten()); self._dg_adv.append(advantages.detach().flatten())
             
             layer_loss = per_token_loss.sum()
             total_loss += layer_loss
@@ -988,6 +991,13 @@ class RouterTrajectoryTracker:
         mean_reward = sum(r.mean().item() for r in layer_rewards.values()) / max(1, len(layer_rewards))
         
         # Store loss components for logging (topn_load not applicable for per-token)
+        try:
+            _pp = torch.cat(self._dg_ptlp); _aa = torch.cat(self._dg_adv)
+            _ptlp_std = float(_pp.std().item()); _adv_std_used = float(_aa.std().item())
+            _cov = float(((_pp - _pp.mean()) * (_aa - _aa.mean())).mean().item())
+            _rrstd = float(getattr(self, '_last_raw_reward_std', 0.0))
+        except Exception:
+            _ptlp_std = _adv_std_used = _cov = _rrstd = 0.0
         self.last_loss_components = {
             'policy_loss': total_loss.item(),
             'value_loss': 0.0,
@@ -995,6 +1005,10 @@ class RouterTrajectoryTracker:
             'mean_advantage': 0.0,
             'mean_reward': mean_reward,
             'avg_topn_load': 0.0,
+            'ptlp_std': _ptlp_std,
+            'adv_std_used': _adv_std_used,
+            'cov_ptlp_adv': _cov,
+            'raw_reward_std': _rrstd,
         }
         
         wrap_print_rank_0(f"REINFORCE (per-token) DEBUG: total_loss={total_loss.item():.6f}, total_tokens={total_tokens}")
