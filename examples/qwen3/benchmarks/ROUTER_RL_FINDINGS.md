@@ -515,3 +515,46 @@ variance is the bottleneck. Cell cancelled after the verdict was unambiguous.
 
 Pure-aux (auxklNoRL) in parallel: smooth 9096->8343 (it 0-350), load_bal 3.41->3.04,
 grad 1.1 — clean descent to ~7800, no oscillation. RL-vs-aux question fully closed.
+
+---
+
+## §16. CORRECTION: RL+aux DOES beat aux — on HOLDOUT at matched CP, mid-band (2026-08-01)
+
+§11-§15 concluded "RL adds nothing beyond noise." That was OVER-GENERALIZED from the wrong
+regime/metric. User correction: there were real scenarios where RL+aux > aux. Re-examined
+the trusted-holdout Pareto (benchmark_results.csv):
+
+Holdout mean by CP band — connected-RL+aux vs aux-only:
+  CP 6000-6499:  connRL 80.71  vs  aux 79.53   (+1.2pp)
+  CP 6500-6999:  connRL 81.53  vs  aux 80.37   (+1.2pp)
+  CP 7000-7499:  connRL 82.34  vs  aux 80.59   (+1.75pp)
+  CP 7500-7999:  connRL 82.54  vs  aux 81.94   (+0.6pp)
+  CP 3500-4499:  ~parity (deep-end RL edge is weak/n=1, NOT the main effect)
+
+=> The real, repeatable "RL+aux > aux" is the MID-BAND (CP ~6000-7500), ~1-1.75pp holdout,
+CONSISTENT across 3 bands. NOT the deep end (parity/noisy).
+
+### Why §11-§15 missed it
+1. Metric: measured TRAINING-time CP/load_bal. Aux trivially wins at reducing CP (it
+   optimizes balance directly). RL's value is HOLDOUT ACCURACY at matched CP — a different
+   axis. CP-reduction != the metric that reveals RL.
+2. Reward: used diff_lse_load. The holdout winners use per_token_load_weighted (dense
+   "how overloaded is your chosen expert" signal). r33 mid-band used the entropy reward.
+3. Regime: tested aux=0/0.001 at moderate CP; the edge lives at connected RL+aux mid-band.
+
+### Mechanism (why RL+aux generalizes better at matched CP)
+aux-only, to hit a target CP, drives a BALANCE-OVERFIT router: buys CP + selection-suite
+accuracy but DEGRADES holdout generalization. RL+aux hits the same CP, but RL optimizes the
+actual discrete load objective WITH EXPLORATION, landing on a better-generalizing router.
+
+### Reconciliation with the disconnection finding (§10)
+The BEST holdout cells (top of Pareto) were CONNECTED (KL=0): 235bv5b, 235bv14cg, 235bv16cgr.
+The recent campaign focus 235bv15klcg was DISCONNECTED (KL>0) -> its RL was a no-op, so its
+"RL" runs couldn't show the edge. The fix matters MOST here: re-running the klcg/v16cgr/v18s
+families CONNECTED with per_token_load_weighted, mid-band, should recover/strengthen the
++1-1.75pp holdout edge.
+
+### Corrected next experiment
+Connected RL+aux, reward=per_token_load_weighted, aux0.001-0.005 + rlc0.5, target CP
+~6000-7500, evaluate HOLDOUT at matched CP vs aux-only seed-replicated controls. Expect
+~1-1.75pp edge. (Honest caveats: n small per band; seed noise ~1pp; deep-end edge weak.)
