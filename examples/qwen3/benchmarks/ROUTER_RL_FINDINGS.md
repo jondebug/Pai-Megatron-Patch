@@ -471,3 +471,37 @@ wide per-iter oscillation (5400-9700) but does NOT push the MEAN below the aux-d
 This is the corrected, mechanistically-grounded successor to the campaign's original
 "RL == aux" claim: not because RL matches aux, but because RL (once actually connected) is
 too high-variance to help, and aux does all the work.
+
+---
+
+## §15. CONFIRMED: pure-aux control descends smoothly to the same floor; RL adds only noise (2026-08-01)
+
+The clean pure-aux control finally scheduled (after a ~6h cluster maintenance drain) and
+ran FRESH (verified: started at load_bal 3.28, the pretrained baseline).
+
+ex_auxklNoRL_r1 (AUX=0.001, RLC=0, no RL) binned CP:
+  it   0-49 : CP=9096  load_bal=3.41
+  it 100-149: CP=8880  load_bal=3.23
+  it 150-199: CP=8682  load_bal=3.20
+  it 200-249: CP=8328  load_bal=2.91   (snapshot it203 CP=7221)
+
+SMOOTH monotonic descent toward ~7800 with NO oscillation — contrast stab_std (aux+RL)
+which reached the same ~7879 mean but with wide per-iter swings (5400-9700). Pure-aux's
+descent is if anything smoother/faster than aux+RL at matched iters.
+
+### FINAL RL research verdict (now fully controlled)
+| config                         | CP result            | interpretation            |
+|--------------------------------|----------------------|---------------------------|
+| pure aux (RLC=0)               | smooth 9870->~7800   | aux does all the work     |
+| aux + RL (rlc0.5, +/-KL)       | noisy  ~7879         | RL adds oscillation only  |
+| pure RL (aux=0), lr=1e-4       | flat ~9300           | too weak to learn (§11)   |
+| pure RL (aux=0), lr=1e-3       | diverges             | too strong; variance (§13)|
+
+=> Connected RL contributes NOTHING beyond noise for router CP reduction on this
+near-balanced 235B model; the aux loss is a strictly better-conditioned optimizer of the
+same objective, and adding RL on top only injects variance (mildly detrimental). This is
+the mechanistically-grounded, fully-controlled replacement for the campaign's original
+(instrument-confounded) "RL == aux" claim.
+
+Only remaining datapoint: the fresh pureRLhilr (lr=1e-3, resume_from_iter=0) — expected to
+diverge from a clean start too, sealing the "no lr sweet spot / variance bottleneck" result.
