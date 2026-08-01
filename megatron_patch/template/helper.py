@@ -350,6 +350,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.gae_lambda = getattr(args, 'rl_gae_lambda', 1.0)
     trajectory_tracker.no_advantage_norm = getattr(args, 'rl_no_advantage_norm', False)
     trajectory_tracker.credit_counterfactual = getattr(args, 'rl_credit_counterfactual', False)
+    trajectory_tracker.rl_disconnect_repro = getattr(args, 'rl_disconnect_repro', False)
     print(f"[RL CONFIG] reward_type={trajectory_tracker.reward_type}, "
           f"baseline_type={trajectory_tracker.baseline_type}, "
           f"per_token_rewards={trajectory_tracker.per_token_rewards}, "
@@ -431,32 +432,34 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
             loss_dict["rl_avg_topn_load"] = torch.tensor(avg_topn)
             critical_metrics['critical/avg_topn_load'] = float(avg_topn)
 
-    # Gradient magnitude diagnostic: compute RL gradient norms on routing logits
-    # Uses layer_decisions (current iteration) since rl_loss was computed from them.
-    # Previously this used old_layer_decisions which are from the previous iteration
-    # and have no computational connection to rl_loss, so gradients were always None.
+    # RL health telemetry — computed on ALL ranks so the keys survive the cross-rank loss_dict
+    # reduction (rank-0-only keys get dropped). rl_loss_requires_grad=1 => RL plumbed into the graph;
+    # rl_grad_diag: 1 ok / 0 no-layers / -1 loss-detached / -2 logits-no-grad_fn / -3 grad-None /
+    # -4 grad-error. rl_grad_norm_on_logits = how hard RL pushes the router (0.0 if not computable).
     try:
-        from megatron.core import parallel_state as mpu
-        if mpu.get_data_parallel_rank() == 0:
-            print_rank_0(f"[RL DEBUG] rl_loss={rl_loss.item():.4e}, lm_loss={averaged_loss.item():.4e}", override_debug_mode=False)
-            
-            # Compute gradient norms of RL loss w.r.t. routing logits (sample first layer)
-            if rl_loss.requires_grad and len(trajectory_tracker.layer_decisions) > 0:
-                sample_layer = min(trajectory_tracker.layer_decisions.keys())
-                _, _, routing_logits_sample, _ = trajectory_tracker.layer_decisions[sample_layer]
-                if routing_logits_sample.requires_grad and routing_logits_sample.grad_fn is not None:
-                    try:
-                        rl_grads = torch.autograd.grad(
-                            rl_loss, routing_logits_sample,
-                            retain_graph=True, allow_unused=True
-                        )
-                        if rl_grads[0] is not None:
-                            rl_grad_norm = rl_grads[0].norm().item()
-                            rl_grad_mean = rl_grads[0].abs().mean().item()
-                            loss_dict["rl_grad_norm_on_logits"] = torch.tensor(rl_grad_norm)
-                            loss_dict["rl_grad_mean_on_logits"] = torch.tensor(rl_grad_mean)
-                    except Exception:
-                        pass  # Don't crash training for diagnostic logging
+        _gn = 0.0; _gm = 0.0; _diag = 0.0
+        if len(trajectory_tracker.layer_decisions) == 0:
+            _diag = 0.0
+        elif not rl_loss.requires_grad:
+            _diag = -1.0
+        else:
+            _sl = min(trajectory_tracker.layer_decisions.keys())
+            _rlogits = trajectory_tracker.layer_decisions[_sl][2]
+            if not (getattr(_rlogits, "requires_grad", False) and getattr(_rlogits, "grad_fn", None) is not None):
+                _diag = -2.0
+            else:
+                try:
+                    _g = torch.autograd.grad(rl_loss, _rlogits, retain_graph=True, allow_unused=True)[0]
+                    if _g is None:
+                        _diag = -3.0
+                    else:
+                        _gn = _g.norm().item(); _gm = _g.abs().mean().item(); _diag = 1.0
+                except Exception:
+                    _diag = -4.0
+        loss_dict["rl_loss_requires_grad"] = torch.tensor(1.0 if rl_loss.requires_grad else 0.0)
+        loss_dict["rl_grad_diag"] = torch.tensor(float(_diag))
+        loss_dict["rl_grad_norm_on_logits"] = torch.tensor(float(_gn))
+        loss_dict["rl_grad_mean_on_logits"] = torch.tensor(float(_gm))
     except Exception:
         pass
 

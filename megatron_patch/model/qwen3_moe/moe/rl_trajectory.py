@@ -373,7 +373,7 @@ class RouterTrajectoryTracker:
         # router still calls this method and would overwrite the trajectory's in-graph logits with
         # detached ones -> rl_loss.requires_grad=False -> RL policy gradient severed (no-op). Mirrors
         # the _kl_state['capture_disabled'] guard already used for KL logit capture.
-        if getattr(self, 'paused', False):
+        if getattr(self, 'paused', False) and not getattr(self, 'rl_disconnect_repro', False):
             return
         # CRITICAL: Check gradient flow - if routing_logits doesn't require grad, policy gradient will be zero!
         if layer_num == 1 and not routing_logits.requires_grad and torch.is_grad_enabled():

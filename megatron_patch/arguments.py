@@ -567,6 +567,11 @@ def get_patch_args(parser):
                            '(primary-chosen minus best-unchosen expert) instead of summed chosen '
                            'log-probs, moving probability toward the counterfactual destination. '
                            'For diff_lse_load-style rewards. Default False = current behavior.')
+    group.add_argument('--rl-disconnect-repro', action='store_true', default=False,
+                      help='[experiment/control] Reproduce the pre-fix disconnection: bypass the '
+                           'paused-guard so the KL reference forward overwrites the RL trajectory with '
+                           'detached logits (rl_loss.requires_grad=False). Matched connected-vs-'
+                           'disconnected controls only. Default False = connected (fixed).')
     group.add_argument('--rl-ppo-clip-ratio', type=float, default=0.2,
                       help='PPO clipping ratio for policy updates (default: 0.2). '
                            'Lower values are more conservative, higher allow larger updates.')

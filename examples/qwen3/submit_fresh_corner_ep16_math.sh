@@ -89,6 +89,7 @@ if [ "$USE_RL" = "1" ]; then
     --rl-gae-lambda $GAE_LAMBDA --rl-ppo-epochs ${PPO_EPOCHS:-1} --rl-ppo-extra-lr $EXTRA_LR \
     --rl-lm-reward-coeff $LM"
   [ "${NO_ADV_NORM:-0}" = "1" ] && RL_FLAGS="$RL_FLAGS --rl-no-advantage-norm"
+[ "${DISCONNECT_REPRO:-0}" = "1" ] && RL_FLAGS="$RL_FLAGS --rl-disconnect-repro"
   [ "${CREDIT_CF:-0}" = "1" ] && RL_FLAGS="$RL_FLAGS --rl-credit-counterfactual"
 else
   RL_FLAGS=""
