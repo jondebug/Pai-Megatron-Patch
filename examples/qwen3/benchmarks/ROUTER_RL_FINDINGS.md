@@ -505,3 +505,13 @@ the mechanistically-grounded, fully-controlled replacement for the campaign's or
 
 Only remaining datapoint: the fresh pureRLhilr (lr=1e-3, resume_from_iter=0) — expected to
 diverge from a clean start too, sealing the "no lr sweet spot / variance bottleneck" result.
+
+### §15.1 SEALED: fresh pureRLhilr diverges too (2026-08-01)
+The guaranteed-fresh pureRLhilr (AUX=0 KL=0 RLC=0.5 lr=1e-3, resume_from_iter=0) diverges
+from a CLEAN start: load_bal 3.94->4.71->5.71->6.32, CP 9377->9879, grad_norm ->47 over
+~200 iters. So §13's higher-lr divergence was REAL, not the checkpoint-resume confound.
+Confirmed: pure RL has no lr sweet spot (flat at 1e-4, divergent at 1e-3) — gradient
+variance is the bottleneck. Cell cancelled after the verdict was unambiguous.
+
+Pure-aux (auxklNoRL) in parallel: smooth 9096->8343 (it 0-350), load_bal 3.41->3.04,
+grad 1.1 — clean descent to ~7800, no oscillation. RL-vs-aux question fully closed.
