@@ -646,3 +646,85 @@ OPEN (blocked):
 Honest status: the flat-loss bug is LOCALIZED (advantage/reward, not connection or credit)
 but not yet ROOT-CAUSED to a specific line; both remaining steps are blocked on GPU
 contention + the metrics-logging gap.
+
+---
+
+## §19. CORRECTION to §17-§18 + REAL bug: normalization suppresses RL by 94x (2026-08-01)
+
+External expert review (correctly) refuted §17-§18's inference. The near-zero signed policy
+loss (~1e-8) is EXPECTED under centered on-policy advantages and PPO's first-epoch ratio~=1
+(loss ~= -mean(A) ~= 0 by construction); it is NOT evidence of a dead advantage/reward.
+Decisive counter-evidence I already had: rl_grad_norm_on_logits ~1e-3 is NONZERO -> advantage
+is NOT ~0. Reward degeneracy is UNPROVEN. My §18 "reward is dead" conclusion is WITHDRAWN.
+
+### The real, confirmed bug: reduction over-normalization (single-process FP64 test)
+loss = -mean over ALL (layer,token) of (A * per_token_log_prob), i.e. total_loss/total_tokens
+where total_tokens = 94 layers x tokens. Analytic-gradient + reduction-scaling test:
+  A production /total_tokens          -> ||RL weight-grad|| = 0.0147
+  B sum (no averaging)                -> 44.2   (B/A = 3008 = total_tokens, exact)
+  C /tokens only                      -> 1.38   (C/A = 94 = num_layers)
+  D per-layer mean, then SUM layers   -> 1.38   (D/A = 94 = num_layers)
+Autograd == analytic to 1e-17 (gradient math correct). => /total_tokens divides the RL
+gradient by an EXTRA 94x vs the intended per-layer treatment (each of the 94 layers is a
+separate routing decision). Aux loss is accumulated PER LAYER (summed over 94), so RL ends up
+~94x weaker than aux at matched coeff -> RL optimizer-visible update ~0.1% of aux (matches
+the measured rl_grad_norm_on_logits 0.001 vs total 1.0-1.5).
+
+### Second real issue (methodological): deterministic top-k is not a REINFORCE sample
+per_token_log_prob is the log-prob of the argmax top-k action, not an action sampled from the
+categorical policy. So the "policy gradient" is a biased straight-through surrogate, not valid
+on-policy PG. Fix = sample top-k without replacement during training, OR explicitly label the
+objective a routing surrogate.
+
+### Fix plan
+1. Normalization: reduce RL loss PER LAYER (mean over that layer's tokens) then SUM over layers
+   -> matches aux's per-layer accumulation, ~94x larger RL gradient (verify vs aux scale, and
+   check Megatron's [loss,denom] handling doesn't divide again by microbatches/tokens).
+2. Add unsigned-signal telemetry (term_abs_mean, term_rms, per-layer cov) + component grad norms
+   (RL/aux/KL/LM) + ||dW||/||W|| before clipping (per reviewer).
+3. (Separate) evaluate stochastic top-k sampling vs surrogate labeling.
+NOTE: cells run PPO (_compute_ppo_loss_per_token), so the fix goes there (and REINFORCE).
+The global-load/reward work (§ earlier) is DEPRIORITIZED (reward degeneracy unproven).
+
+---
+
+## §20. SYSTEMATIC CLAIM BATTERY — every hypothesis tested in isolation (2026-08-01)
+
+Compiled all claims from three sources (this investigation, external reviewer, external
+research report) and tested each separately (single-process, FP64 where analytic).
+
+| # | Claim | Source | VERDICT (test) |
+|---|-------|--------|----------------|
+| C1 | RL grad severed by KL ref-forward | mine | CONFIRMED + fixed (unit + prod grad_diag=1) |
+| C2 | Flat loss ~1e-8 => dead advantage/reward | mine §18 | **REFUTED** (nonzero grad; C4) -> §18 withdrawn |
+| C3 | Flat loss = BF16 log_softmax truncation | report | **REFUTED**: BF16 (stable AND naive) preserves ptlp_std to conf-gap 50, 0% chosen-logprob rounds to 0. PyTorch log_softmax upcasts; router is high-entropy anyway |
+| C4 | Flat signed loss EXPECTED (centered adv + PPO ratio=1) | reviewer | **CONFIRMED**: loss=1.7e-17 but grad=0.078 (alive) |
+| C5 | RL grad suppressed 94x by /total_tokens | reviewer | **CONFIRMED**: sum-vs-mean ratio exactly 94 = num_layers; analytic grad matches to 1e-17 |
+| C6 | 94-layer REINFORCE variance => weak/divergent | report | CONFIRMED (empirical: flat@lr1e-4, diverge@lr1e-3; mechanism = C11) |
+| C7 | Deterministic top-k != REINFORCE sample => biased surrogate | both | **CONFIRMED**: cos(true PG, argmax surrogate)=0.44 mean, 17% anti-aligned |
+| C8 | Advantage standardization erases scale | early | PARTIAL: changes grad direction ~11deg (cos 0.98) — a symptom of C7 (baseline only cancels for a SAMPLED action) |
+| C9 | Default credit misdirects token credit | early | **REFUTED**: lowers hot-expert logit for 100% of overloaded tokens (== CF) |
+| C10 | Reward uses local per-rank load (no EP all-gather) | mine | code-CONFIRMED; signal-degradation UNPROVEN (toy reward std ~0.12, not degenerate) -> minor |
+| C11 | Router-shift => volatile IS => divergence | report (RSPO) | **CONFIRMED**: step 0.05 -> 9.3% top-k flip, IS std 767, max 34573, 88% out of clip band |
+| C13 | Mid-band RL+aux +1-1.75pp holdout edge | mine §16 + report | CONFIRMED (historical holdout data) |
+
+### The real, tested diagnosis (why connected RL fails to optimize CP)
+Three CONFIRMED causes, in priority:
+1. **Over-normalization (C5)**: /total_tokens divides the RL gradient by an extra num_layers=94x
+   vs aux's per-layer accumulation -> RL update ~0.1% of aux. FIX = --rl-perlayer-norm (done).
+2. **Biased surrogate (C7)**: deterministic argmax top-k is not sampled from the categorical
+   policy, so the "policy gradient" is only ~0.44-cos aligned with the true PG (17% wrong-way).
+   FIX = stochastic top-k sampling (Gumbel/sequential) during training, or label a surrogate.
+3. **Variance + router-shift (C6/C11)**: high-variance estimator; tiny param steps flip top-k ->
+   IS ratios explode -> bursty clipping -> divergence at any lr strong enough to matter.
+   FIX = RSPO (router-shift trust region) + variance reduction (critic/GAE, larger effective batch).
+
+REFUTED as causes: dead advantage (C2), BF16 (C3), credit misdirection (C9). The near-zero
+signed loss is benign (C4). Minor: standardization (C8, symptom of C7), local load (C10).
+
+### Strategic alternative (report §7): auxiliary-loss-free load balancing (DeepSeek-V3)
+Detached, graph-free per-expert BIAS updated by a fixed step from measured load — zero gradient
+interference, preserves specialization, sidesteps the REINFORCE-variance trap entirely. Strong
+candidate to replace the RL-vs-aux tradeoff outright.
+
+### Fix order to validate end-to-end (GPU): (1) --rl-perlayer-norm; (2) stochastic top-k; (3) RSPO.
