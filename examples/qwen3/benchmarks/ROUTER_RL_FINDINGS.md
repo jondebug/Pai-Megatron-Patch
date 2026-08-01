@@ -728,3 +728,19 @@ interference, preserves specialization, sidesteps the REINFORCE-variance trap en
 candidate to replace the RL-vs-aux tradeoff outright.
 
 ### Fix order to validate end-to-end (GPU): (1) --rl-perlayer-norm; (2) stochastic top-k; (3) RSPO.
+
+### §20 addendum — code-level corroboration + empirical baseline (2026-08-01)
+
+**C7 corroborated at the code level.** `--rl-stochastic-routing` (Gumbel-noise-before-topk) and
+`--rl-stochastic-temperature` exist in arguments.py but are a **defined-but-unwired STUB** — zero
+consumers in backends/ router.py or megatron_patch/model/. So the production forward genuinely uses
+deterministic argmax top-k (confirms C7 independently of the analytic test). The C7 fix is therefore
+unimplemented, not merely disabled.
+
+**Empirical C5 baseline** (klcgC_s3031: connected RL, DEFAULT /total_tokens norm, per_token_load_weighted,
+aux0.001 kl0.001 rlc0.5, seed3031, 1362 iters): `rl_grad_diag=1.0` (connected ✓), but
+`rl_grad_norm_on_logits≈1.2e-3` (the 94×-suppressed gradient), `rl_mean_reward 0.35→0.16` and
+`load_balancing_loss 3.20→3.94` (balance DEGRADING over training), `num_tokens_on_critical_path 8763→8221`
+(CP falls only ~6%, aux-driven). This is the C5 failure mode made visible: RL is connected but too weak to
+help. The `--rl-perlayer-norm` A/B (NORM1 vs GL0) should show ~94× larger RL gradient and a steeper CP drop
+with improving (not degrading) balance. Analysis harness: benchmarks/../norm_ab_analyze.py.
