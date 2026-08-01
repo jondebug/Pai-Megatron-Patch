@@ -558,3 +558,44 @@ families CONNECTED with per_token_load_weighted, mid-band, should recover/streng
 Connected RL+aux, reward=per_token_load_weighted, aux0.001-0.005 + rlc0.5, target CP
 ~6000-7500, evaluate HOLDOUT at matched CP vs aux-only seed-replicated controls. Expect
 ~1-1.75pp edge. (Honest caveats: n small per band; seed noise ~1pp; deep-end edge weak.)
+
+---
+
+## §17. FLAT-LOSS BUG: RL loss collapses to -Cov(ptlp,adv)~1e-8 -> gradient ~0.1% of aux (2026-08-01)
+
+User directive: efficient RL should show reward growing + loss decreasing; if not, find + fix.
+It doesn't -> investigated with telemetry.
+
+### Measured facts (production, klcgC per_token_load_weighted, connected, grad_diag=1)
+- rl_policy_loss pinned at ~1e-8 (range 2e-9..4e-8), NOT decreasing, for ALL cells/rewards.
+- rl_grad_norm_on_logits ~1.0e-3; rl_grad_mean_on_logits ~3e-6 (per-layer, gradient of rl_loss
+  wrt router logits).
+- Total (aux+RL) grad norm ~1.0-1.5 (clip-grad=1.0). => RL contributes ~0.1% of the router step;
+  it literally cannot move the router. Aux (and the LM loss) dominate.
+
+### Mechanism (from the code)
+REINFORCE loss = -mean(per_token_log_prob * advantage). Advantage is standardized to EXACTLY
+mean-0, so loss = -Cov(per_token_log_prob, advantage). Observed ~1e-8 = an EXACT structural
+zero (sampling noise of a real Cov would be ~1e-3, not 1e-8). So per_token_log_prob is either
+~constant across tokens, or ~exactly uncorrelated with the standardized advantage.
+
+### What was RULED OUT (controlled CPU sims + static reads)
+- Default credit formula: toy gives real loss (-0.12..-0.31) + gradient (0.2-0.4). Not the formula.
+- EMA loads, global-vs-per-layer advantage standardization, multi-layer aggregation, content-vs-
+  load-correlated routing: every combination still yields healthy loss (~0.01-0.3). None reproduce ~1e-8.
+- Live router call site passes RAW logits + binary top-k routing_map (correct); routing_map is a
+  mask, not soft probs (so ptlp != -entropy). Reward sign is correct (overloaded -> negative reward).
+=> The collapse is PRODUCTION-SPECIFIC (real pretrained router / bf16 / real data), not a formula bug.
+
+### Fix hypothesis (staged, live A/B)
+Counterfactual credit (--rl-credit-counterfactual): per_token_log_prob = logP(e_src) - logP(e_cf)
+= logit_src - logit_cf (the logsumexp CANCELS), a per-token MARGIN with real variance regardless
+of router entropy AND directed at the load-balancing move. Toy CF ptlp std ~1.2 (real). Running
+klcgCF_s1234 (CF) vs klcgC_s3031 (default): if CF yields a non-trivial, moving rl_policy_loss +
+better CP, the default credit's collapse is the bug and CF is the fix. (GPU-contention-gated.)
+NOTE: even with CF, the /total_tokens(94-layer) normalization keeps the RL gradient ~100x below
+aux; a scale fix (per-layer norm or higher rlc) is likely also needed for RL to compete.
+
+### Added telemetry (committed 39adcd9)
+rl_ptlp_std, rl_cov_ptlp_adv, rl_raw_reward_std -> confirms constant-ptlp vs dead-reward once a
+fresh telemetry-enabled cell logs (pending GPU + a metric-registration check).
