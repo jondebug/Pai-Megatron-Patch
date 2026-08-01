@@ -417,3 +417,57 @@ NOTE: the campaign's OLD critic/GAE cells are VOID (ran pre-fix = disconnected R
 A clean re-run (aux=0, BASELINE=critic, GAE, connected) is the decisive "can RL be
 rescued" experiment. If a critic-stabilized RL still can't beat aux -> RL is dominated
 for this problem, which is itself the paper's systems finding.
+
+### §13.1 CORRECTION — the higher-lr result above is CONFOUNDED (2026-07-31)
+Integrity check: the throttle log shows ex_pureRLhilr_r1 was submitted with
+resume_from_iter=997, NOT fresh. Its ckpt dir was created Jul 30 20:43 (prior session,
+when the cell was the OLD RLC=1.0 config). The throttle's latest_iter() found that
+checkpoint and RESUMED it. So §13 measured "continue an already-diverging RLC=1.0
+checkpoint at lr=1e-3" (it started at load_bal 4.2, not the pretrained ~3.3) — NOT a
+clean fresh higher-lr test.
+
+=> §13's "higher lr diverges" is INCONCLUSIVE. The step-size-vs-variance question is
+NOT yet answered. Re-running pureRLhilr FRESH (cleared stale checkpoint, resume_from_iter=0
+from pretrained) to cleanly test whether lr=1e-3 from a clean start diverges (=> variance
+is the bottleneck, §12/§13 thesis holds) or reduces CP (=> step-size was the issue after
+all, and the campaign's lr=1e-4 was simply too low).
+
+§11 is unaffected: pureRL_rlc0.1 and stab_kl both verified resume_from_iter=0 (fresh,
+started at load_bal ~3.3). Only pureRLhilr carried a stale Jul-30 checkpoint.
+
+### §13.2 Follow-up: log evidence + guaranteed-fresh re-run (2026-07-31)
+Re-examined: pureRLhilr's log shows "iteration 1/1500", adlr_autoresume=False, and NO
+checkpoint-load message -> it most likely ran FRESH from the pretrained base despite the
+anomalous resume_from_iter=997 flag (which pointed at an empty/invalid ckpt dir and was
+inert). The load_bal 4.2 in bin 0-99 is fast early divergence at 10x lr, not a degraded
+start. So §13's "fresh lr=1e-3 diverges" is probably valid — but to remove all doubt the
+stale Jul-30 ckpt/log/tensorboard dirs for pureRLhilr AND auxklNoRL were moved aside and
+both cells reset to TODO. The guaranteed-fresh re-run (resume_from_iter=0, load_bal starts
+~3.3) is the definitive test of step-size vs variance. Watching load_bal from iteration 1.
+
+---
+
+## §14. aux+RL completes at CP~7879 = aux-path; RL adds noise, not improvement (2026-07-31)
+
+stab_std (AUX=0.001 RLC=0.5 KL=0.001, the standard config) ran to iter 1499:
+  it 900-999 :  meanCP=8030  load_bal=2.89
+  it 1300-1399: meanCP=7781  load_bal=2.85
+  it 1400-1499: meanCP=7879  load_bal=2.87  (minCP 5442, maxCP 9711 -> wide RL oscillation)
+
+Final mean CP ~7879 == the aux+RL control (30758349, KL=0) ~7693. The RL component adds
+wide per-iter oscillation (5400-9700) but does NOT push the MEAN below the aux-driven
+~7700-7900. KL makes no difference (7879 vs 7693).
+
+### RL research conclusion (strongly indicated; pure-aux control auxklNoRL still GPU-queued)
+- Aux drives the CP reduction: 9870 -> ~7800 (-20%), clean and sustained.
+- RL alone (aux=0): useless — flat at lr=1e-4 (§11), diverges at lr=1e-3 (§13); variance
+  bottleneck (§12).
+- RL on top of aux: adds noisy oscillation, not a lower mean (§14). aux+RL ~7879 ~=
+  aux+RL-control ~7693; both ~= what aux alone is expected to give.
+=> Aux dominates RL as the optimizer for router load-balancing / CP on this near-balanced
+   235B model. The clean confirmation is the pure-aux (RLC=0) cell auxklNoRL reaching ~7800
+   too (=> RL contributes nothing beyond noise). That cell is Priority-queued.
+
+This is the corrected, mechanistically-grounded successor to the campaign's original
+"RL == aux" claim: not because RL matches aux, but because RL (once actually connected) is
+too high-variance to help, and aux does all the work.
