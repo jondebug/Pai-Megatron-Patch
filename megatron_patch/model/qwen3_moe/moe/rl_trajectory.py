@@ -992,7 +992,7 @@ class RouterTrajectoryTracker:
             per_token_loss = -per_token_log_prob * advantages
             self._dg_ptlp.append(per_token_log_prob.detach().flatten()); self._dg_adv.append(advantages.detach().flatten())
             
-            layer_loss = per_token_loss.sum()
+            layer_loss = per_token_loss.mean() if getattr(self, 'perlayer_norm', False) else per_token_loss.sum()
             total_loss += layer_loss
             total_tokens += per_token_loss.numel()
             
@@ -1000,7 +1000,7 @@ class RouterTrajectoryTracker:
                 wrap_print_rank_0(f"REINFORCE (per-token) Layer {layer_num}: advantages_mean={advantages.mean().item():.4f}, adv_std={advantages.std().item():.4f}")
         
         # Average over all tokens across all layers
-        total_loss = total_loss / max(1, total_tokens)
+        total_loss = total_loss if getattr(self, 'perlayer_norm', False) else total_loss / max(1, total_tokens)
         
         # Compute mean reward for logging
         mean_reward = sum(r.mean().item() for r in layer_rewards.values()) / max(1, len(layer_rewards))
@@ -1405,7 +1405,7 @@ class RouterTrajectoryTracker:
             # Combined per-token loss
             per_token_loss = per_token_policy_loss + value_coeff * per_token_value_loss - entropy_coeff * per_token_entropy
             
-            layer_loss = per_token_loss.sum()
+            layer_loss = per_token_loss.mean() if getattr(self, 'perlayer_norm', False) else per_token_loss.sum()
             total_loss += layer_loss
             total_policy_loss += per_token_policy_loss.sum()
             total_value_loss += per_token_value_loss.sum()
@@ -1420,7 +1420,7 @@ class RouterTrajectoryTracker:
                 wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) Layer {layer_num}: advantages_mean={advantages.mean().item():.4f}, ratio_mean={ratio.mean().item():.4f}")
         
         # Normalize
-        total_loss = total_loss / max(1, total_tokens)
+        total_loss = total_loss if getattr(self, 'perlayer_norm', False) else total_loss / max(1, total_tokens)
         
         logged_value_loss = self._last_critic_loss if hasattr(self, '_last_critic_loss') else (total_value_loss / max(1, total_tokens)).item()
         all_advs_log = torch.cat([layer_advantages[ln].flatten() for ln in sorted_layers])

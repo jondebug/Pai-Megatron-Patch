@@ -91,6 +91,7 @@ if [ "$USE_RL" = "1" ]; then
   [ "${NO_ADV_NORM:-0}" = "1" ] && RL_FLAGS="$RL_FLAGS --rl-no-advantage-norm"
 [ "${DISCONNECT_REPRO:-0}" = "1" ] && RL_FLAGS="$RL_FLAGS --rl-disconnect-repro"
 [ "${GLOBAL_LOAD:-0}" = "1" ] && RL_FLAGS="$RL_FLAGS --rl-global-load"
+[ "${PERLAYER_NORM:-0}" = "1" ] && RL_FLAGS="$RL_FLAGS --rl-perlayer-norm"
   [ "${CREDIT_CF:-0}" = "1" ] && RL_FLAGS="$RL_FLAGS --rl-credit-counterfactual"
 else
   RL_FLAGS=""

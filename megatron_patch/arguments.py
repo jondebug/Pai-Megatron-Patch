@@ -572,6 +572,10 @@ def get_patch_args(parser):
                            'paused-guard so the KL reference forward overwrites the RL trajectory with '
                            'detached logits (rl_loss.requires_grad=False). Matched connected-vs-'
                            'disconnected controls only. Default False = connected (fixed).')
+    group.add_argument('--rl-perlayer-norm', action='store_true', default=False,
+                      help='[fix] Reduce RL loss PER LAYER (mean over that layer tokens) then SUM over '
+                           'layers, matching aux per-layer accumulation. Default False = /total_tokens '
+                           '(divides RL gradient by an extra num_layers=94x).')
     group.add_argument('--rl-global-load', action='store_true', default=False,
                       help='[fix] All-reduce per-expert loads across the data-parallel group so the '
                            'RL reward uses the TRUE global expert load, not each rank 1/DP-token local '
