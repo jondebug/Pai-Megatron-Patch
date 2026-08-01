@@ -351,6 +351,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.no_advantage_norm = getattr(args, 'rl_no_advantage_norm', False)
     trajectory_tracker.credit_counterfactual = getattr(args, 'rl_credit_counterfactual', False)
     trajectory_tracker.rl_disconnect_repro = getattr(args, 'rl_disconnect_repro', False)
+    trajectory_tracker.global_load = getattr(args, 'rl_global_load', False)
     print(f"[RL CONFIG] reward_type={trajectory_tracker.reward_type}, "
           f"baseline_type={trajectory_tracker.baseline_type}, "
           f"per_token_rewards={trajectory_tracker.per_token_rewards}, "

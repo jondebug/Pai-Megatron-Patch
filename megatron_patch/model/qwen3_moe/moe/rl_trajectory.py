@@ -393,6 +393,14 @@ class RouterTrajectoryTracker:
         # Update EMA expert loads for stable reward computation
         with torch.no_grad():
             batch_loads = routing_map.sum(dim=(0, 1)).float()
+            if getattr(self, 'global_load', False):
+                try:
+                    from megatron.core import parallel_state as _ps
+                    _grp = _ps.get_data_parallel_group()
+                    if torch.distributed.is_initialized() and torch.distributed.get_world_size(group=_grp) > 1:
+                        torch.distributed.all_reduce(batch_loads, group=_grp)
+                except Exception:
+                    pass
             if self._ema_expert_loads is None:
                 self._ema_expert_loads = batch_loads.clone()
             else:
@@ -434,6 +442,13 @@ class RouterTrajectoryTracker:
         # Apply reward normalization if enabled (expands compressed reward ranges)
         raw_reward_summary = reward.mean().item() if reward.dim() > 0 else reward.item()
         self._last_raw_reward_std = float(reward.std().item()) if (reward.dim() > 0 and reward.numel() > 1) else 0.0
+        if layer_num == 1:
+            try:
+                _r0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+                if _r0 and reward.dim() > 0 and reward.numel() > 1:
+                    print(f'[RL REWARD DEBUG] raw_reward std={reward.std().item():.4e} mean={reward.mean().item():.4e} min={reward.min().item():.4e} max={reward.max().item():.4e} numel={reward.numel()} global_load={getattr(self,"global_load",False)}', flush=True)
+            except Exception:
+                pass
         if self.normalize_rewards:
             reward = self._reward_normalizer.normalize(reward)
         
