@@ -599,3 +599,50 @@ aux; a scale fix (per-layer norm or higher rlc) is likely also needed for RL to 
 ### Added telemetry (committed 39adcd9)
 rl_ptlp_std, rl_cov_ptlp_adv, rl_raw_reward_std -> confirms constant-ptlp vs dead-reward once a
 fresh telemetry-enabled cell logs (pending GPU + a metric-registration check).
+
+---
+
+## §18. FIX-TEST RESULT: counterfactual credit does NOT fix it -> the bug is the ADVANTAGE, not the credit (2026-08-01)
+
+Ran klcgCF (CREDIT_CF=1, counterfactual credit) vs klcgC (default), both connected,
+per_token_load_weighted, aux0.001+KL0.001, telemetry code.
+
+RESULT: klcgCF rl_policy_loss stays ~1e-8 across 50 iters (1.1e-8, 1.8e-8, 3.3e-8, 1.3e-8,
+1.4e-8, 1.9e-9) -- IDENTICAL to the default's ~1e-8. Counterfactual credit does NOT restore
+a moving loss.
+
+### Interpretation (decisive redirect)
+loss = -Cov(per_token_log_prob, advantage). The ADVANTAGE is identical for both arms; only
+ptlp differs (default: sum of chosen log-softmax; CF: logit_src - logit_cf). Both give ~1e-8
+=> the collapse is NOT in the credit/ptlp. It is in the ADVANTAGE being ~0, i.e. the
+per-token reward carries ~no usable per-token signal in production. The bug is UPSTREAM of
+the credit, in the reward/advantage.
+
+### What is CONFIRMED vs OPEN
+CONFIRMED:
+- RL is connected (grad_diag=1) but not learning; loss ~1e-8, grad ~0.1% of aux (§17).
+- The credit formula is NOT the cause (CF refuted; §18).
+- => the advantage is degenerate; the per-token reward gives no learnable signal.
+OPEN (blocked):
+- The EXACT production reason. My controlled toys (single/multi-layer, EMA, global-std,
+  content-vs-load routing, low-vs-high load entropy) ALL produce healthy reward std (~0.12)
+  and loss (~0.1-1). None reproduce the ~1e-8 collapse -> it is specific to the real
+  pretrained router / bf16 / real load dynamics.
+- The added diagnostic telemetry (rl_raw_reward_std, rl_ptlp_std, rl_cov_ptlp_adv) is NOT
+  reaching the training log line (the rl-metrics logging path apparently doesn't carry the
+  new loss_dict keys) -> could not read the raw-reward spread directly. Needs the logging
+  path fixed, then a fresh cell, to see whether raw_reward_std ~= 0 (dead reward) definitively.
+
+### Next steps to fully resolve (GPU + logging gated)
+1. Fix the rl-metrics logging so rl_raw_reward_std / rl_ptlp_std reach the log; relaunch one
+   cell -> definitively see if the per-token reward variance is ~0 in production.
+2. If reward variance is dead: design a reward with genuine per-token signal on a near-
+   balanced router (e.g. per-token PRIMARY-expert load percentile / rank, or a sharper
+   counterfactual on the max-load bottleneck), rather than an average-over-k-experts load.
+3. Independent of reward: the RL gradient is also /total_tokens(94-layer)-normalized to ~100x
+   below aux; a per-layer normalization or much higher rlc is needed for RL to compete even
+   with a good reward.
+
+Honest status: the flat-loss bug is LOCALIZED (advantage/reward, not connection or credit)
+but not yet ROOT-CAUSED to a specific line; both remaining steps are blocked on GPU
+contention + the metrics-logging gap.
