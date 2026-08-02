@@ -33,7 +33,7 @@ CONTAINER_IMAGE=/lustre/fsw/portfolios/nvr/users/jonathanp/containers/pai-megatr
 mkdir -p "${BENCHMARK_DIR}"
 if [ -n "${LIMIT}" ]; then LIMIT_ARG="--limit ${LIMIT}"; else LIMIT_ARG=""; fi
 
-echo "LM-EVAL (1-node vLLM TP=8, minimal args): run=${RUN_NAME} iter=${ITER_NUM} limit=${LIMIT_TAG} tasks=${TASKS}"
+echo "LM-EVAL (1-node HF parallelize 8-GPU, expandable_segments): run=${RUN_NAME} iter=${ITER_NUM} limit=${LIMIT_TAG} tasks=${TASKS}"
 echo "HF=${HF_DIR}"
 echo "OUT=${BENCHMARK_DIR}"
 echo "Start: $(date)"
@@ -57,15 +57,17 @@ srun --ntasks=1 --nodes=1 \
          export VLLM_NO_USAGE_STATS=1
          export DO_NOT_TRACK=1
          export XDG_CONFIG_HOME=\${TMPDIR}/xdg
+         # 235B HF-parallelize load was only ~4GB short (all 8 ranks ~75/79GB): reduce allocator
+         # fragmentation so it fits. vLLM is not installed in this container, so use --model hf.
+         export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
          mkdir -p \${HF_HOME} \${HF_DATASETS_CACHE} \${TMPDIR} \${TORCHINDUCTOR_CACHE_DIR} \${VLLM_CACHE_ROOT} \${XDG_CONFIG_HOME}/vllm
          touch \${XDG_CONFIG_HOME}/vllm/do_not_track 2>/dev/null
-         # 235B (A22B): vLLM shards the MoE experts across TP=8 natively (HF parallelize=True
-         # OOMs on GPU0 for 235B). Use MINIMAL vLLM model_args -- this container's lm_eval VLLM
-         # wrapper rejects enforce_eager/max_model_len as kwargs, so pass only the core ones.
-         python3 -m lm_eval --model vllm \
-             --model_args pretrained='${HF_DIR}',tensor_parallel_size=8,dtype=bfloat16,gpu_memory_utilization=0.90,trust_remote_code=True \
+         # 235B (A22B) sharded across 8 GPUs via HF accelerate (parallelize=True). vLLM is absent
+         # from the container and the 1-node convert OOMs (needs 2-node PP2, already done -> HF ready).
+         python3 -m lm_eval --model hf \
+             --model_args pretrained='${HF_DIR}',trust_remote_code=True,dtype=bfloat16,parallelize=True \
              --tasks ${TASKS} ${LIMIT_ARG} \
-             --batch_size auto \
+             --batch_size 8 \
              --output_path '${BENCHMARK_DIR}'
          echo \"lm-eval exit: \$?\"
          python3 -c \"
