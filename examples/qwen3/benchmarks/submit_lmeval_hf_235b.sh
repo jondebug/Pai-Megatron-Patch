@@ -56,7 +56,7 @@ srun --ntasks=1 --nodes=1 \
          mkdir -p \${HF_HOME} \${HF_DATASETS_CACHE} \${TMPDIR} \${XDG_CONFIG_HOME}/vllm
          touch \${XDG_CONFIG_HOME}/vllm/do_not_track 2>/dev/null
          python3 -m lm_eval --model vllm \
-             --model_args pretrained='${HF_DIR}',tensor_parallel_size=8,dtype=bfloat16,enforce_eager=True,gpu_memory_utilization=0.85,max_model_len=2048,trust_remote_code=True \
+             --model_args pretrained='${HF_DIR}',tensor_parallel_size=8,dtype=bfloat16,gpu_memory_utilization=0.85,max_model_len=2048,trust_remote_code=True \
              --tasks ${TASKS} ${LIMIT_ARG} \
              --output_path '${BENCHMARK_DIR}' \
              --log_samples
