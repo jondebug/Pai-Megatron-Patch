@@ -167,13 +167,14 @@ def _allreduce_counts(counts, group):
     try:
         import torch.distributed as d
         if group is not None and d.is_available() and d.is_initialized() and d.get_world_size(group=group) > 1:
-            for ln in counts:
+            # sorted() => identical collective order on every rank (avoids a mismatch/deadlock)
+            for ln in sorted(counts):
                 d.all_reduce(counts[ln], op=d.ReduceOp.SUM, group=group)
     except Exception:
         pass
 
 
-def _probe_once(model, tracker, group, k):
+def _probe_once(model, tracker, group, k, E):
     """Run the deterministic probe over ALL frozen batches; return CP + per-layer
     GLOBAL (DP-all-reduced) expert counts, plus (rank-0) per-token top-k SETS and dense
     router logits for the P4 churn/KL metrics.
@@ -184,11 +185,13 @@ def _probe_once(model, tracker, group, k):
     topk         : {layer -> [T_total, k]} rank-0 deterministic top-k sets (fixed states).
     logits       : {layer -> [T_total, E]} rank-0 dense router logits (for categorical KL)."""
     router_modules = tracker._router_modules
+    layer_ids = sorted(router_modules.keys())  # IDENTICAL on every rank => lockstep all-reduce
     per_batch_cp = []
     agg = {}
     r0 = _is_rank0()
     topk = {}
     logits = {}
+    dev = torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
     for (tokens, pos, attn, pack) in _PROBE['batches']:
         captured = {}
         handles = _register_hooks(router_modules, captured, capture_logits=r0)
@@ -200,12 +203,19 @@ def _probe_once(model, tracker, group, k):
         finally:
             for h in handles:
                 h.remove()
-        batch_counts = {ln: cap['rm'].float().sum(dim=0) for ln, cap in captured.items()}  # [E] local
-        _allreduce_counts(batch_counts, group)                                             # [E] GLOBAL
-        if batch_counts:
-            per_batch_cp.append(sum(float(c.max().item()) for c in batch_counts.values()))
-        for ln, c in batch_counts.items():
-            agg[ln] = c.clone() if ln not in agg else (agg[ln] + c)
+        # Key over the FULL sorted layer set (zeros for any layer a hook missed) so every rank
+        # all-reduces the same layers in the same order.
+        batch_counts = {}
+        for ln in layer_ids:
+            cap = captured.get(ln)
+            if cap is not None:
+                batch_counts[ln] = cap['rm'].float().sum(dim=0)                 # [E] local
+            else:
+                batch_counts[ln] = torch.zeros(E, device=dev, dtype=torch.float32)
+        _allreduce_counts(batch_counts, group)                                  # [E] GLOBAL
+        per_batch_cp.append(sum(float(batch_counts[ln].max().item()) for ln in layer_ids))
+        for ln in layer_ids:
+            agg[ln] = batch_counts[ln].clone() if ln not in agg else (agg[ln] + batch_counts[ln])
         if r0:
             for ln, cap in captured.items():
                 # deterministic top-k SET on this rank's fixed tokens (the actual routing decision)
@@ -217,19 +227,19 @@ def _probe_once(model, tracker, group, k):
     return {'per_batch_cp': per_batch_cp, 'counts': agg, 'topk': topk, 'logits': logits, 'k': k}
 
 
-def _probe_once_with_theta0(model, tracker, group, k):
+def _probe_once_with_theta0(model, tracker, group, k, E):
     """Deterministic probe with the INITIAL router theta0 swapped in (weight swap
     exactly like _run_reference_forward), then restore current weights."""
     theta0 = _PROBE['theta0_weights']
     if not theta0:
-        return _probe_once(model, tracker, group, k)
+        return _probe_once(model, tracker, group, k, E)
     saved = {}
     try:
         for name, p in model.named_parameters():
             if name in theta0:
                 saved[name] = p.data.clone()
                 p.data.copy_(theta0[name])
-        return _probe_once(model, tracker, group, k)
+        return _probe_once(model, tracker, group, k, E)
     finally:
         for name, p in model.named_parameters():
             if name in saved:
@@ -325,8 +335,8 @@ def run_probe(model, tracker, iteration):
         kl_prev = _set_kl_capture(True)
 
         if _PROBE['baseline'] is None:
-            _PROBE['baseline'] = _probe_once_with_theta0(model, tracker, group, k)
-        cur = _probe_once(model, tracker, group, k)
+            _PROBE['baseline'] = _probe_once_with_theta0(model, tracker, group, k, E)
+        cur = _probe_once(model, tracker, group, k, E)
         _emit(iteration, _PROBE['baseline'], cur, k, E)
         _run_churn(iteration, _PROBE['baseline'], cur, k)  # P4: old-vs-new deterministic top-k churn
         _PROBE['prev'] = cur
