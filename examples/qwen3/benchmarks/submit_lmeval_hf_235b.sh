@@ -33,7 +33,7 @@ CONTAINER_IMAGE=/lustre/fsw/portfolios/nvr/users/jonathanp/containers/pai-megatr
 mkdir -p "${BENCHMARK_DIR}"
 if [ -n "${LIMIT}" ]; then LIMIT_ARG="--limit ${LIMIT}"; else LIMIT_ARG=""; fi
 
-echo "LM-EVAL (1-node vLLM TP=8): run=${RUN_NAME} iter=${ITER_NUM} limit=${LIMIT_TAG} tasks=${TASKS}"
+echo "LM-EVAL (1-node HF parallelize across 8 GPU): run=${RUN_NAME} iter=${ITER_NUM} limit=${LIMIT_TAG} tasks=${TASKS}"
 echo "HF=${HF_DIR}"
 echo "OUT=${BENCHMARK_DIR}"
 echo "Start: $(date)"
@@ -55,11 +55,15 @@ srun --ntasks=1 --nodes=1 \
          export XDG_CONFIG_HOME=\${TMPDIR}/xdg
          mkdir -p \${HF_HOME} \${HF_DATASETS_CACHE} \${TMPDIR} \${XDG_CONFIG_HOME}/vllm
          touch \${XDG_CONFIG_HOME}/vllm/do_not_track 2>/dev/null
-         python3 -m lm_eval --model vllm \
-             --model_args pretrained='${HF_DIR}',tensor_parallel_size=8,dtype=bfloat16,gpu_memory_utilization=0.85,max_model_len=2048,trust_remote_code=True \
+         # 235B (A22B) does NOT fit on one GPU: use --model hf with parallelize=True (HF
+         # accelerate shards the model across all 8 GPUs). This is the canonical 235B path
+         # (submit_batch_benchmark_235b.sh); the container's lm_eval vLLM wrapper rejects the
+         # engine kwargs (enforce_eager/max_model_len).
+         python3 -m lm_eval --model hf \
+             --model_args pretrained='${HF_DIR}',trust_remote_code=True,dtype=bfloat16,parallelize=True \
              --tasks ${TASKS} ${LIMIT_ARG} \
-             --output_path '${BENCHMARK_DIR}' \
-             --log_samples
+             --batch_size auto \
+             --output_path '${BENCHMARK_DIR}'
          echo \"lm-eval exit: \$?\"
          python3 -c \"
 import json
