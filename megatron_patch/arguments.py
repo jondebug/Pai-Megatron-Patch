@@ -601,6 +601,24 @@ def get_patch_args(parser):
                            '(J = logsumexp(beta*n)/beta). At 235B scale the per-expert counts n are '
                            'large, so beta*n must be O(1): use ~0.03. Default 0.3 = small-scale '
                            'reference beta (preserves prior behavior when the flag is absent).')
+    # --- P2/P3/P4 measurement infrastructure (defaults OFF => no behavior change) ---
+    group.add_argument('--rl-probe-interval', type=int, default=0,
+                      help='[P2/P4] Run the FIXED deterministic-CP probe every N updates (0 = OFF). '
+                           'The probe re-routes an IMMUTABLE set of held-out probe batches with '
+                           'DETERMINISTIC full-128 argmax top-k (no Gumbel, eval mode), computes the '
+                           'exact critical path CP = sum_l max_e n_{l,e}, and reports it paired vs the '
+                           'INITIAL router theta0 (R_probe, per-layer CP change, load CV, churn). This '
+                           'is the noise-free signal the on-policy CP lacks. Emits [PROBE] rank-0 lines.')
+    group.add_argument('--rl-probe-batches', type=int, default=16,
+                      help='[P2] Number of immutable probe microbatches captured from the first steps '
+                           'and frozen for the deterministic-CP probe (default 16; reviewer range 16-32). '
+                           'Averaged across for mean CP + CI.')
+    group.add_argument('--rl-audit-interval', type=int, default=0,
+                      help='[P3] Run the frozen-rollout causal audit every N updates (0 = OFF). Before '
+                           'the optimizer step it snapshots the sampled actions / pools / advantages; '
+                           'after the step it recomputes the SAME action log-prob under the updated '
+                           'router and checks the audit loss L=-E[A_old.logpi_theta(a_old)] decreased, '
+                           'E[dlogpi|A>0]>0 and E[dlogpi|A<0]<0. Emits [AUDIT] rank-0 lines.')
     group.add_argument('--rl-ppo-clip-ratio', type=float, default=0.2,
                       help='PPO clipping ratio for policy updates (default: 0.2). '
                            'Lower values are more conservative, higher allow larger updates.')

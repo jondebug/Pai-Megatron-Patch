@@ -760,10 +760,37 @@ def forward_step(data_iterator, model):
     if not _kl_state['initialized']:
         _init_kl_state(model, snapshot_weights=(kl_loss_coeff > 0))
 
+    # --- P2/P3: measurement infrastructure. Cheap/idempotent; all no-ops unless the
+    # probe/audit intervals are set. snapshot_theta0 runs on the very first forward_step,
+    # BEFORE the first optimizer step, so it captures the INITIAL router theta0. ---
+    try:
+        from megatron_patch.model.qwen3_moe.moe import rl_probe
+        rl_probe.configure(args)
+        if getattr(args, 'use_rl_loss', False) and (rl_probe.probe_enabled() or rl_probe.audit_enabled()):
+            rl_probe.snapshot_theta0(model)
+    except Exception as _e_probe_cfg:
+        rl_probe = None
+
+    # P3: run the frozen-rollout causal audit for the PREVIOUS step's rollout. The
+    # optimizer step for that rollout has completed by the top of this forward_step, so
+    # recomputing the frozen action's log-prob here reflects the post-step router.
+    _probe_iter = getattr(args, 'curr_iteration', getattr(args, 'iteration', 0)) or 0
+    if rl_probe is not None and rl_probe.audit_enabled() and torch.is_grad_enabled():
+        try:
+            from megatron_patch.model.qwen3_moe.moe.rl_trajectory import get_trajectory_tracker
+            rl_probe.run_audit(get_trajectory_tracker(), _probe_iter)
+        except Exception as _e_audit:
+            print_rank_0(f"[AUDIT] WARNING: audit failed: {_e_audit}")
+
     # Get the batch.
     timers("batch-generator", log_level=2).start()
     tokens, labels, loss_mask, attention_mask, position_ids, num_seqs, packed_seq_params = get_batch(data_iterator)
     timers("batch-generator").stop()
+
+    # P2: freeze the first N training microbatches as the immutable probe set.
+    if rl_probe is not None and getattr(args, 'use_rl_loss', False) and torch.is_grad_enabled():
+        rl_probe.maybe_capture(
+            (tokens, labels, loss_mask, attention_mask, position_ids, num_seqs, packed_seq_params))
 
     # Clear previous logits
     _kl_state['current_logits'] = None
@@ -850,6 +877,15 @@ def forward_step(data_iterator, model):
                                 forward_step._bench_last_checkpoint_iter = bench_iter
         except Exception as e:
             print(f"[BENCHMARK] WARNING: failed to launch: {e}", flush=True)
+
+    # P2: fixed deterministic-CP probe (runs its own eval/no_grad forwards on the frozen
+    # probe set; temporarily swaps in theta0 for the baseline). Best-effort; never fatal.
+    if rl_probe is not None and torch.is_grad_enabled() and rl_probe.should_probe(_probe_iter):
+        try:
+            from megatron_patch.model.qwen3_moe.moe.rl_trajectory import get_trajectory_tracker
+            rl_probe.run_probe(model, get_trajectory_tracker(), _probe_iter)
+        except Exception as _e_probe:
+            print_rank_0(f"[PROBE] WARNING: probe failed: {_e_probe}")
 
     # Choose loss function based on CLI arg parsed by Megatron
     use_rl_loss = getattr(args, 'use_rl_loss', False) and torch.is_grad_enabled()
