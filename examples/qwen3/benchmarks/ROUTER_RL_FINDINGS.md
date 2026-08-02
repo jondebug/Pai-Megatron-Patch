@@ -744,3 +744,61 @@ aux0.001 kl0.001 rlc0.5, seed3031, 1362 iters): `rl_grad_diag=1.0` (connected �
 (CP falls only ~6%, aux-driven). This is the C5 failure mode made visible: RL is connected but too weak to
 help. The `--rl-perlayer-norm` A/B (NORM1 vs GL0) should show ~94× larger RL gradient and a steeper CP drop
 with improving (not degrading) balance. Analysis harness: benchmarks/../norm_ab_analyze.py.
+
+---
+
+## §21. Reviewer response + isolated-sim corroboration + verified C7 fix (2026-08-02)
+
+External reviewer returned a detailed assessment. Confirmed: C5's ×94 is experimentally established;
+near-zero-loss and BF16 correctly rejected; full-strength RL is demonstrably destructive. **Key correction
+(accepted):** the norm A/B does NOT isolate C7 — it *jointly* exposes deterministic-action bias (C7),
+router shift (C11), variance (C6), and local-reward mismatch (C10). Our "decisive confirmation that C7 is
+binding" was too strong. Withdrawn.
+
+### Isolated sims corroborate the "jointly exposes" caveat — no single factor reproduces divergence
+Single-process load-balancing games (shared linear router, per_token_load_weighted reward, deployed
+objective = global argmax max-load):
+- **c7_fix_test**: deterministic-argmax surrogate CONVERGES (max-load 113→33), even beating sampled PG
+  (→44). Surrogate *bias ≠ divergence*.
+- **c10_test**: local per-rank (1/16) load also CONVERGES (→40), only mildly worse than global (→33).
+- **gain_sweep**: the clean model is ROBUST across effective gains 1×–94× (only mild wobble at high
+  base_lr×gain); never the GPU's ×4-load / +34%-CP explosion.
+**Conclusion:** the GPU divergence is a *system-level interaction* (top-k=8 + PPO clip + EMA loads + reward
+normalization + KL/aux co-train + 94 coupled layers), not any one isolated defect. This is exactly why the
+reviewer's incremental order (one validated component at a time) is right, and why our single-factor
+attribution was premature.
+
+### C7 fix CORE verified (reviewer spec): hard Gumbel-top-k + ordered Plackett-Luce score function
+`log π(e_1..e_k) = Σ_j [ z_{e_j}/τ − logsumexp_{e∉{e_1..e_{j-1}}}(z_e/τ) ]`. `pl_verify.py` (E=8,k=3,
+exact enumeration of all 336 ordered tuples):
+- (a) Σπ = 1.0000000000 — valid distribution.
+- (b) Gumbel-top-k and sequential-sampling oracle both match closed-form π (TV≈0.065 = sampling noise) —
+  same distribution, as the reviewer predicted.
+- (c) ‖E_π[∇log π]‖ = 1.5e-16 (score integrates to 0); grad E[R] vs score-fn estimator cos=1.00000000,
+  ‖diff‖=5.5e-16 → **exactly unbiased policy gradient**.
+Ready to port into the router forward. Deploy/eval deterministic argmax; anneal τ; monitor sampled-vs-argmax
+overlap. Do NOT use straight-through Gumbel-softmax (another biased estimator).
+
+### Reviewer's ORDERED fix sequence (supersedes our normalize-first plan)
+1. Policy-consistent sampling (C7, Gumbel-top-k + PL) — math verified.
+2. Global EP-aggregated loads (C10) — before interpreting any further full-strength run.
+3. Verify sampled-action log-prob analytically — DONE (pl_verify.py).
+4. Per-layer normalization as a GAIN SWEEP (1×,4×,16×,32×,94×), scaled back — not a jump to 94×.
+5. Router-shift trust region — for fresh single-epoch on-policy, start SIMPLER than RSPO: per-token
+   old-vs-new categorical KL, top-k flip rate, max update ratio, early-stop on flip threshold.
+6. Critic only if measured variance still requires it.
+
+### Reward redesign (reviewer): dense counterfactual, global
+Not local-dense-vs-global-sparse. EP-all-reduce counts; per-layer `J_l = LSE_β(n_l,1..n_l,E)` (or exact
+max); detached counterfactual `r_{l,t} = J_l(n_l) − J_l(n_l − Δ_src + Δ_dst)`. Preserves token credit,
+aligns with global CP. CP is additive across layers → layer-LOCAL baselines; GAE not auto-justified.
+
+### Aux-loss-free bias + publication bar
+Run aux-loss-free bias (DeepSeek-V3) as a PRIMARY systems baseline. Decisive 4-way at matched deterministic
+CP: {aux-only, aux-free-bias, RL+aux, RL+aux-free-bias} → compare holdout. For the mid-band +1–1.75pp RL
+edge to be publishable: ≥3–5 paired seeds, identical start ckpt+data order, dev-selected/official-test-once,
+deterministic routing for every eval, CIs, continuous matched-CP regression (not coarse bins), ablations
+(sampling/global-reward/norm/trust-region), and evidence RL changes specialization rather than adding
+selection noise. Strongest framing: *auxiliary objectives are the better-conditioned CP mechanism; RL may
+add holdout generalization at matched mid-band CP only when routing + estimator validity are handled
+correctly* — a contribution inside the CP–accuracy Pareto story, not yet a standalone RL result.
