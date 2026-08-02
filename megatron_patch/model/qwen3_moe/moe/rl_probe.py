@@ -70,6 +70,39 @@ def audit_enabled():
     return _PROBE['audit_interval'] > 0 and not _PROBE['audit_disabled']
 
 
+def banner_once(args):
+    """P1 banner emitted from the TRAINING path (reliably flushed to the .out, unlike
+    model_provider's early-setup stdout). Names the sampling vs scoring distribution so the
+    H1 mismatch is visible. The fail-fast assert itself lives in model_provider."""
+    if _PROBE.get('_banner_done'):
+        return
+    _PROBE['_banner_done'] = True
+    try:
+        if not getattr(args, 'use_rl_loss', False):
+            return
+        samp = getattr(args, 'rl_sampling', 'argmax')
+        algo = getattr(args, 'rl_algorithm', 'reinforce')
+        if samp == 'hard_gumbel_pl' and algo == 'reinforce':
+            scoring = 'ordered_plackett_luce(rl_ordered_logprob, per-token REINFORCE)'
+        elif algo == 'reinforce':
+            scoring = 'summed_independent_softmax(log_softmax chosen, per-token REINFORCE)'
+        else:
+            scoring = 'summed_independent_softmax(log_softmax chosen, PPO ratio)'
+        pool = int(getattr(args, 'rl_candidate_pool', 0)) or 'ALL_EXPERTS'
+        nepochs = int(getattr(args, 'rl_ppo_epochs', 1)) if algo == 'ppo' else 1
+        _print0(
+            "[RL CONFIG BANNER] "
+            f"sampling_distribution={samp} | scoring_distribution={scoring} | "
+            f"candidate_pool_size={pool} | algorithm={algo} | num_policy_epochs={nepochs} | "
+            f"reward_type={getattr(args, 'rl_reward_type', 'expert0')} | "
+            f"loo_beta={getattr(args, 'rl_loo_beta', 0.3)} | "
+            f"global_loads={getattr(args, 'rl_global_loads', False)} | "
+            f"perlayer_norm={getattr(args, 'rl_perlayer_norm', False)} | "
+            f"rl_loss_coeff={getattr(args, 'rl_loss_coeff', 0.0)}")
+    except Exception:
+        pass
+
+
 # -----------------------------------------------------------------------------
 # Capture: freeze the first n_target training microbatches as the immutable probe
 # set, and snapshot theta0 router weights before the first optimizer step.

@@ -777,6 +777,7 @@ def forward_step(data_iterator, model):
     try:
         from megatron_patch.model.qwen3_moe.moe import rl_probe
         rl_probe.configure(args)
+        rl_probe.banner_once(args)  # P1 banner on the reliably-flushed training path
         if getattr(args, 'use_rl_loss', False) and (rl_probe.probe_enabled() or rl_probe.audit_enabled()):
             rl_probe.snapshot_theta0(model)
     except Exception as _e_probe_cfg:
