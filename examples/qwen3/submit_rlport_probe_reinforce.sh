@@ -59,7 +59,8 @@ LOO_BETA="${LOO_BETA:-0.01}"              # task: beta=0.01
 PROBE_INTERVAL="${PROBE_INTERVAL:-10}"
 PROBE_BATCHES="${PROBE_BATCHES:-16}"
 AUDIT_INTERVAL="${AUDIT_INTERVAL:-1}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-100000}"  # huge (belt); real disabler is --save= below
+SAVE_CKPT="${SAVE_CKPT:-1}"               # 1 = write checkpoint (run_mcore's real --save path); 0 = no checkpoint
+SAVE_INTERVAL="${SAVE_INTERVAL:-150}"     # save once at iter 150 (run_mcore uses --no-save-optim => model-only)
 EVAL_ITERS="${EVAL_ITERS:-0}"             # eval OFF
 EVAL_INTERVAL="${EVAL_INTERVAL:-100000}"
 EXIT_MINS="${EXIT_MINS:-55}"
@@ -112,6 +113,16 @@ else
   DATA_OVERRIDE=""
 fi
 
+# Checkpoint save toggle. SAVE_CKPT=1 (default) keeps run_mcore_qwen3.sh's real
+# --save ${OUTPUT_BASEPATH}/checkpoint/${NAME} (with --no-save-optim => model-only ~470GB),
+# saving at --save-interval (150 => once at the final iter) so the accuracy eval can convert
+# it. SAVE_CKPT=0 appends a trailing --save= that blanks args.save (probe-only, no checkpoint).
+if [ "$SAVE_CKPT" = "1" ]; then
+  SAVE_OVERRIDE=""
+else
+  SAVE_OVERRIDE="--save="
+fi
+
 srun --container-image="$CONTAINER_IMAGE" \
      --container-mounts="$HOME:$HOME,/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing:/lustre/fsw/portfolios/nvr/users/jonathanp/rl_token_routing" \
      --container-workdir="$WORKDIR" \
@@ -134,7 +145,7 @@ srun --container-image="$CONTAINER_IMAGE" \
            --moe-aux-loss-coeff $AUX \\
            --exit-duration-in-mins $EXIT_MINS --train-iters $RL_TRAIN_ITERS \\
            --save-interval $SAVE_INTERVAL --eval-interval $EVAL_INTERVAL --eval-iters $EVAL_ITERS \\
-           --save= \\
+           $SAVE_OVERRIDE \\
            --empty-unused-memory-level 2 \\
            --wandb-run-tags $WANDB_TAGS $DATA_OVERRIDE
      "
