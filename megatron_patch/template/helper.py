@@ -332,7 +332,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.reward_topn = getattr(args, 'rl_reward_topn', 12)
     trajectory_tracker.per_token_rewards = getattr(args, 'rl_per_token_rewards', False)
     # Auto-detect per_token_rewards for reward types that are inherently per-token
-    _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted"}
+    _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "loo_smoothmax"}
     if trajectory_tracker.reward_type in _PER_TOKEN_REWARD_TYPES:
         trajectory_tracker.per_token_rewards = True
     trajectory_tracker.ppo_entropy_coeff = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
@@ -353,6 +353,11 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.rl_disconnect_repro = getattr(args, 'rl_disconnect_repro', False)
     trajectory_tracker.global_load = getattr(args, 'rl_global_load', False)
     trajectory_tracker.perlayer_norm = getattr(args, 'rl_perlayer_norm', False)
+    # --- H1/H2 port config (defaults OFF => current behavior) ---
+    trajectory_tracker.rl_sampling = getattr(args, 'rl_sampling', 'argmax')
+    trajectory_tracker.rl_candidate_pool = getattr(args, 'rl_candidate_pool', 0)
+    trajectory_tracker.rl_stochastic_temperature = getattr(args, 'rl_stochastic_temperature', 1.0)
+    trajectory_tracker.global_loads = getattr(args, 'rl_global_loads', False)
     print(f"[RL CONFIG] reward_type={trajectory_tracker.reward_type}, "
           f"baseline_type={trajectory_tracker.baseline_type}, "
           f"per_token_rewards={trajectory_tracker.per_token_rewards}, "

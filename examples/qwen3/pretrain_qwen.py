@@ -415,6 +415,13 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
         
         from megatron_patch.model.qwen3_moe.moe.rl_trajectory import get_trajectory_tracker
         tracker = get_trajectory_tracker()
+        # --- H1/H2 port: set sampling/reward config on the tracker BEFORE the first forward so the
+        # router reads it during routing (helper.py re-affirms these at loss time). Defaults OFF. ---
+        tracker.rl_sampling = getattr(args, 'rl_sampling', 'argmax')
+        tracker.rl_candidate_pool = getattr(args, 'rl_candidate_pool', 0)
+        tracker.rl_stochastic_temperature = getattr(args, 'rl_stochastic_temperature', 1.0)
+        tracker.global_loads = getattr(args, 'rl_global_loads', False)
+        tracker.reward_type = getattr(args, 'rl_reward_type', 'expert0')
         for module in model.modules():
             if 'router' in module.__class__.__name__.lower():
                 module.config.moe_router_use_trajectory_tracking = True

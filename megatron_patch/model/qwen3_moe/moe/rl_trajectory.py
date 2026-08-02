@@ -13,6 +13,136 @@ def wrap_print_rank_0(str):
         print(f"{str}")
 
 
+# =============================================================================
+# H1 (Gumbel-top-k + ordered Plackett-Luce) + H2 (global leave-one-out smooth-max
+# reward). PORT of the reviewer-verified single-process reference in
+# ~/rl_repro_5b9/{pl_verify,unit_gates,g7_test}.py (7/7 gates pass).
+#
+# These module-level functions are the FP32 "RL island": exact, importable,
+# stateless algorithms validated by the acceptance gates (port_gates.py imports
+# THESE). They are only reached when --rl-sampling hard_gumbel_pl and/or
+# --rl-reward loo_smoothmax are set; defaults preserve current behavior.
+# See rl_reviewer_docs/PORT_SPEC.md.
+# =============================================================================
+
+RL_PL_DEFAULT_TAU = 1.0        # Plackett-Luce temperature (reference tau = 1.0)
+RL_LOO_DEFAULT_BETA = 0.3      # smooth-max sharpness (reference beta = 0.3)
+
+
+def rl_fp32(t: torch.Tensor) -> torch.Tensor:
+    """FP32 RL island: upcast a router tensor to float32 for log-prob / reward /
+    reduction math (the rest of the model stays BF16). No-op for float32 inputs."""
+    return t if t.dtype == torch.float32 else t.float()
+
+
+def rl_ordered_logprob(logits: torch.Tensor, pool_idx: torch.Tensor,
+                       pos: torch.Tensor, tau: float = RL_PL_DEFAULT_TAU) -> torch.Tensor:
+    """Ordered Plackett-Luce log-prob over a FIXED detached candidate pool.
+
+    Faithful port of pl_pool() in unit_gates.py / pl() in pl_verify.py. Unbiased
+    for the pool-restricted conditional policy ONLY (Q4).
+
+    Args:
+        logits:   [..., E]     grad-tracked router logits (current policy).
+        pool_idx: [..., POOL]  FIXED global expert ids of the detached pool (from OLD logits).
+        pos:      [..., k]     ordered positions WITHIN the pool of the sampled action.
+        tau:      Plackett-Luce temperature.
+    Returns:
+        lp: [...]  ordered log-prob of the sampled action (grad flows through `logits`).
+    """
+    logits = rl_fp32(logits)
+    s = logits.gather(-1, pool_idx) / tau            # [..., POOL] scores over the FIXED pool
+    lp = s.new_zeros(s.shape[:-1])
+    masked = s.clone()
+    k = pos.shape[-1]
+    for j in range(k):
+        pj = pos[..., j]                             # [...] position of j-th chosen in pool
+        lp = lp + s.gather(-1, pj[..., None]).squeeze(-1) - torch.logsumexp(masked, dim=-1)
+        masked = masked.scatter(-1, pj[..., None], float('-inf'))
+    return lp
+
+
+def rl_loo_smoothmax_reward(global_counts: torch.Tensor, S: torch.Tensor,
+                            beta: float = RL_LOO_DEFAULT_BETA) -> torch.Tensor:
+    """Global leave-one-out smooth-max (congestion) reward, CORRECTED SIGN.
+
+    Faithful port of loo() in unit_gates.py (G3/G4):
+        J(n) = logsumexp(beta*n)/beta                        # smooth max = congestion cost
+        r_t  = J(n - Delta_{A_t}) - J(n)   <= 0              # remove token t's k assignments
+    r_t is MORE NEGATIVE for tokens on hot experts (leaving relieves more congestion).
+    This is NOT J(n)-J(n-Delta) (that would REINFORCE hot experts).
+
+    Args:
+        global_counts: [E]     GLOBAL per-expert counts (all-reduced, FP32).
+        S:             [T, k]  each token's k GLOBAL expert ids (the sampled set; order irrelevant).
+        beta:          smooth-max sharpness.
+    Returns:
+        r: [T]  per-token reward (<= 0).
+    """
+    n = rl_fp32(global_counts)
+    J_full = torch.logsumexp(beta * n, dim=0) / beta            # scalar J(n)
+    T = S.shape[0]
+    nm = n[None, :].repeat(T, 1)                                # [T, E]
+    nm.scatter_add_(1, S, -torch.ones_like(S, dtype=nm.dtype))  # n - Delta_{A_t}
+    return torch.logsumexp(beta * nm, dim=1) / beta - J_full    # [T] <= 0
+
+
+def rl_policy_loss_reduction(advantages: torch.Tensor, ptlp: torch.Tensor,
+                             denominator, coeff: float = 1.0):
+    """Single-normalization reduction contract (PORT_SPEC 'Reduction contract').
+
+        numerator = -(A.detach() * ptlp).sum()
+        rl_loss   = coeff * numerator / denominator   # tune strength via coeff, NOT a hidden /94
+
+    Returns (rl_loss, diag) where diag logs every factor for the reviewer.
+    """
+    A = advantages.detach()
+    numerator = -(A * ptlp).sum()
+    if not isinstance(denominator, torch.Tensor):
+        denominator = torch.as_tensor(float(denominator), device=ptlp.device, dtype=ptlp.dtype)
+    denom = denominator.clamp(min=1.0)
+    rl_loss = coeff * numerator / denom
+    diag = {
+        'numerator': float(numerator.detach().item()),
+        'denominator': float(denom.detach().item()),
+        'coeff': float(coeff),
+        'num_terms': int(ptlp.numel()),
+    }
+    return rl_loss, diag
+
+
+def rl_all_reduce_global_loads(local_counts: torch.Tensor, group=None) -> torch.Tensor:
+    """All-reduce (SUM) local per-expert counts into GLOBAL counts for the H2 reward.
+
+    ***NEEDS REVIEW / G7***: the correct collective is the TOKEN-COVERING group, which must
+    be discovered/asserted at RUNTIME on the real topology -- it is NOT necessarily the
+    data-parallel group. The group must sum each expert's count exactly once over the ranks
+    holding DISTINCT tokens, with NO TP/SP/PP-replicated double counting (g7_test.py
+    invariants: sum(counts)==unique_tokens*k; collective==offline reconstruction; CP match;
+    a double-counting group is CAUGHT by the sum gate). This helper deliberately takes the
+    process group as an ARGUMENT and does not hardcode DP.
+    """
+    counts = rl_fp32(local_counts)
+    if group is not None and torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_world_size(group=group) > 1:
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM, group=group)
+    return counts
+
+
+def rl_resolve_token_covering_group():
+    """***NEEDS REVIEW / G7 stub***: return the process group over which per-expert token
+    counts must be summed EXACTLY ONCE (the 'token-covering collective').
+
+    Left intentionally unresolved: the correct group depends on the live EP/TP/SP/PP layout
+    and must be validated by the G7 no-update capture (sum gate) before use. Returning None
+    means rl_all_reduce_global_loads() is a no-op (LOCAL counts) -- a safe default that
+    preserves current behavior until the reviewer wires the verified group.
+    """
+    # TODO(G7): e.g. a group covering DP x context/sequence but NOT double-counting TP/SP
+    #           replicas or PP stages. Resolve + assert at runtime; DO NOT hardcode DP.
+    return None
+
+
 class CriticNetwork(nn.Module):
     """MLP critic network for value function estimation.
     
@@ -200,6 +330,13 @@ class RouterTrajectoryTracker:
         self.normalize_rewards = False  # Enable running-mean/std reward normalization
         self._reward_normalizer = RewardNormalizer(momentum=0.01)
         self._num_layers = 48  # Updated from actual data on first forward pass
+        # --- H1/H2 port (default OFF => current behavior preserved) ---
+        self.rl_sampling = 'argmax'          # 'argmax' (default) or 'hard_gumbel_pl'
+        self.rl_candidate_pool = 0           # Gumbel-top-k pool size N (0 => all experts)
+        self.rl_stochastic_temperature = 1.0 # tau for Gumbel sampling + PL log-prob
+        self.global_loads = False            # H2: all-reduce loads over token-covering group (G7)
+        self.loo_beta = RL_LOO_DEFAULT_BETA  # smooth-max sharpness for loo_smoothmax reward
+        self.pl_decisions = {}               # layer -> {pool_idx, pos, experts, old_ptlp} (safeguard bundle)
         self.use_ema_loads = False  # Use EMA expert loads for reward (more stable)
         self._ema_expert_loads = None  # [num_experts] running average of per-expert load
         self._ema_momentum = 0.1  # EMA update rate for expert loads
@@ -247,6 +384,7 @@ class RouterTrajectoryTracker:
                 self._replay_buffer.pop(0)
         
         self.layer_decisions = {}
+        self.pl_decisions = {}  # H1: fixed pool + ordered action + old PL log-prob, per layer
         self.reeval_logits = {}  # layer_num -> re-evaluated logits (current weights, old states)
 
     def schedule_extra_ppo_epochs(self, rl_loss_coeff: float, discount_factor: float, clip_ratio: float):
@@ -361,7 +499,7 @@ class RouterTrajectoryTracker:
         
         return critic(critic_input)
         
-    def add_layer_decision(self, layer_num: int, latent_token_representations: torch.Tensor, routing_map: torch.Tensor, routing_logits: torch.Tensor):
+    def add_layer_decision(self, layer_num: int, latent_token_representations: torch.Tensor, routing_map: torch.Tensor, routing_logits: torch.Tensor, rl_action: dict = None):
         """Add routing decision from a MoE layer.
         
         Args:   
@@ -407,7 +545,7 @@ class RouterTrajectoryTracker:
                 self._ema_expert_loads = (1 - self._ema_momentum) * self._ema_expert_loads + self._ema_momentum * batch_loads
 
         # Auto-set per_token_rewards for reward types that are inherently per-token
-        _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "expert0", "diff_lse_load"}
+        _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "expert0", "diff_lse_load", "loo_smoothmax"}
         if self.reward_type in _PER_TOKEN_REWARD_TYPES:
             self.per_token_rewards = True
 
@@ -436,6 +574,10 @@ class RouterTrajectoryTracker:
             reward = self.per_token_load_weighted_reward(routing_map)
         elif self.reward_type == "diff_lse_load":
             reward = self.diff_lse_load_reward(routing_map, routing_logits)
+        elif self.reward_type == "loo_smoothmax":
+            # H2: global leave-one-out smooth-max reward (corrected sign). Uses the ordered
+            # sampled action when threaded (rl_action), else reconstructs the set from routing_map.
+            reward = self.loo_smoothmax_reward(routing_map, rl_action)
         else:  # "expert0" (default)
             reward = self.focus_tokens_on_expert_0_reward(routing_map)
         
@@ -463,6 +605,23 @@ class RouterTrajectoryTracker:
             routing_logits,
             reward
         )
+
+        # H1 safeguard: store (FIXED detached pool, ordered sampled GLOBAL expert ids, old
+        # ordered PL log-prob) TOGETHER, and assert the stored pool+positions reconstruct the
+        # exact sampled action (identical pool + action guaranteed at recompute time).
+        if rl_action is not None:
+            _tau = float(getattr(self, 'rl_stochastic_temperature', 1.0)) or 1.0
+            with torch.no_grad():
+                _old_ptlp = rl_ordered_logprob(
+                    rl_fp32(routing_logits).detach(), rl_action['pool_idx'], rl_action['pos'], _tau)
+            assert torch.equal(rl_action['pool_idx'].gather(-1, rl_action['pos']), rl_action['experts']), \
+                "[RL] stored pool+pos does not reconstruct the sampled action"
+            self.pl_decisions[layer_num] = {
+                'pool_idx': rl_action['pool_idx'],   # FIXED detached pool   [seq, batch, POOL]
+                'pos': rl_action['pos'],             # ordered positions     [seq, batch, k]
+                'experts': rl_action['experts'],     # ordered GLOBAL ids    [seq, batch, k]
+                'old_ptlp': _old_ptlp,               # old-policy PL logprob [seq, batch]
+            }
 
         # Accumulate expert loads for heatmap visualization
         with torch.no_grad():
@@ -746,6 +905,37 @@ class RouterTrajectoryTracker:
         
         return -(avg_chosen_load - ideal_load) / ideal_load.clamp(min=1.0)
 
+    def loo_smoothmax_reward(self, routing_map: torch.Tensor, rl_action: dict = None) -> torch.Tensor:
+        """H2: global leave-one-out smooth-max (congestion) reward, corrected sign.
+
+        r_t = J(n - Delta_{A_t}) - J(n) <= 0 with J = logsumexp(beta*n)/beta and n the
+        GLOBAL per-expert counts (all-reduced over the token-covering collective, G7).
+        Per-token (state = single token); layer-local mean baseline is applied later in the
+        per-token REINFORCE loss.
+
+        Args:
+            routing_map: [seq, batch, E] boolean assignment mask.
+            rl_action:   optional {'experts': [seq,batch,k], ...} -- the exact ordered sampled
+                         action; when present its k-subset is used (order irrelevant for the set
+                         reward), else the k-subset is reconstructed from routing_map.
+        Returns:
+            reward: [seq, batch] (<= 0).
+        """
+        rm = routing_map.float()
+        seq, bsz, E = rm.shape
+        T = seq * bsz
+        if rl_action is not None and rl_action.get('experts', None) is not None:
+            S = rl_action['experts'].reshape(T, -1).long()                      # [T, k]
+        else:
+            k = int(rm.reshape(T, E).sum(dim=-1).max().item())
+            S = rm.reshape(T, E).topk(max(1, k), dim=-1).indices.long()         # [T, k]
+        local_counts = rm.reshape(T, E).sum(dim=0)                              # [E] LOCAL counts
+        group = rl_resolve_token_covering_group() if getattr(self, 'global_loads', False) else None
+        global_counts = rl_all_reduce_global_loads(local_counts, group=group)   # [E] GLOBAL (G7)
+        beta = float(getattr(self, 'loo_beta', RL_LOO_DEFAULT_BETA))
+        r = rl_loo_smoothmax_reward(global_counts, S, beta=beta)                # [T] <= 0
+        return r.reshape(seq, bsz)
+
     def compute_topn_load(self, routing_map: torch.Tensor) -> torch.Tensor:
         """Compute average load of top N experts (for logging).
         
@@ -972,7 +1162,22 @@ class RouterTrajectoryTracker:
             advantages = layer_advantages[layer_num]  # [seq_length, batch_size]
             
             log_probs = torch.nn.functional.log_softmax(routing_logits, dim=-1)
-            if getattr(self, 'credit_counterfactual', False):
+            _pl_ok = (getattr(self, 'rl_sampling', 'argmax') == 'hard_gumbel_pl'
+                      and layer_num in getattr(self, 'pl_decisions', {}))
+            if _pl_ok:
+                # H1: ordered Plackett-Luce log-prob over the FIXED detached pool (grad-tracked
+                # through routing_logits). Replaces the summed-independent-softmax log-prob.
+                _pld = self.pl_decisions[layer_num]
+                assert torch.equal(_pld['pool_idx'].gather(-1, _pld['pos']), _pld['experts']), \
+                    "[RL] PL recompute pool/action mismatch (safeguard)"
+                _tau = float(getattr(self, 'rl_stochastic_temperature', 1.0)) or 1.0
+                per_token_log_prob = rl_ordered_logprob(
+                    rl_fp32(routing_logits), _pld['pool_idx'], _pld['pos'], _tau)  # [seq, batch]
+                with torch.no_grad():
+                    _isr = (per_token_log_prob - _pld['old_ptlp']).exp().flatten().float()
+                    self._rl_is_ratio_p99 = float(torch.quantile(_isr, 0.99).item())
+                    self._rl_is_ratio_mean = float(_isr.mean().item())
+            elif getattr(self, 'credit_counterfactual', False):
                 # [experiment flag] directed credit toward the counterfactual destination:
                 # per_token_log_prob = logP(primary-chosen e_src) - logP(best-unchosen e_cf).
                 # loss = -per_token_log_prob*A ; diff_lse_load sign (A<0 => beneficial move) =>
@@ -1025,6 +1230,26 @@ class RouterTrajectoryTracker:
             'cov_ptlp_adv': _cov,
             'raw_reward_std': _rrstd,
         }
+        # H1/H2 telemetry (labeled for the reviewer): sampling mode, IS ratio, flip rate,
+        # deterministic-top-k-in-pool rate, advantage/log-prob direction agreement (corr proxy),
+        # and the single-normalization reduction factors.
+        try:
+            _corr = (_cov / (max(_ptlp_std, 1e-8) * max(_adv_std_used, 1e-8))) if (_ptlp_std and _adv_std_used) else 0.0
+            _num = float((-torch.cat(self._dg_adv) * torch.cat(self._dg_ptlp)).sum().item())
+            _den = 1.0 if getattr(self, 'perlayer_norm', False) else float(max(1, total_tokens))
+        except Exception:
+            _corr, _num, _den = 0.0, 0.0, 1.0
+        self.last_loss_components.update({
+            'rl_sampling': getattr(self, 'rl_sampling', 'argmax'),
+            'is_ratio_p99': float(getattr(self, '_rl_is_ratio_p99', 0.0)),
+            'is_ratio_mean': float(getattr(self, '_rl_is_ratio_mean', 1.0)),
+            'flip_rate': float(getattr(self, '_rl_flip_rate', 0.0)),
+            'det_topk_in_pool_rate': float(getattr(self, '_rl_det_topk_in_pool_rate', 1.0)),
+            'adv_dir_agreement': float(_corr),
+            'reduction_numerator': _num,
+            'reduction_denominator': _den,
+            'reduction_num_layers': int(len(sorted_layers)),
+        })
         
         wrap_print_rank_0(f"REINFORCE (per-token) DEBUG: total_loss={total_loss.item():.6f}, total_tokens={total_tokens}")
         return total_loss

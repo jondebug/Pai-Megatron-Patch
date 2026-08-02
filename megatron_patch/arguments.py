@@ -535,7 +535,8 @@ def get_patch_args(parser):
                       help='Hidden dimensions for critic network layers (default: 256). Examples: "256" for 1 layer, "256 64 32" for 3 layers')
     group.add_argument('--rl-reward-type', type=str, default='expert0',
                       choices=['expert0', 'entropy', 'topn_load', 'critical_path',
-                               'per_token_topn_binary', 'per_token_load_weighted', 'diff_lse_load'],
+                               'per_token_topn_binary', 'per_token_load_weighted', 'diff_lse_load',
+                               'loo_smoothmax'],
                       help='Reward function type: expert0 (focus on expert 0), entropy (load balance entropy), '
                            'topn_load (avg/topN load ratio), critical_path (directly targets max expert load), '
                            'per_token_topn_binary (per-token: -1 if hot expert, +1 otherwise), '
@@ -580,6 +581,21 @@ def get_patch_args(parser):
                       help='[fix] All-reduce per-expert loads across the data-parallel group so the '
                            'RL reward uses the TRUE global expert load, not each rank 1/DP-token local '
                            'view. Default False = local (legacy).')
+    # --- H1 (Gumbel-top-k + Plackett-Luce) + H2 (global loo_smoothmax) port flags; defaults OFF ---
+    group.add_argument('--rl-sampling', type=str, default='argmax',
+                      choices=['argmax', 'hard_gumbel_pl'],
+                      help='[H1] Router action sampler. argmax (default) = current deterministic '
+                           'top-k. hard_gumbel_pl = hard Gumbel-top-k on a FIXED detached top-N pool '
+                           '(training only; eval stays deterministic) with an ordered Plackett-Luce '
+                           'log-prob for the policy gradient.')
+    group.add_argument('--rl-candidate-pool', type=int, default=0,
+                      help='[H1] Size N of the FIXED detached candidate pool for hard_gumbel_pl '
+                           'sampling / PL log-prob. 0 = all experts (default). Typical: 32.')
+    group.add_argument('--rl-global-loads', action='store_true', default=False,
+                      help='[H2] All-reduce per-expert loads over the TOKEN-COVERING collective (NOT '
+                           'hardcoded DP -- see G7) so the loo_smoothmax reward uses TRUE global '
+                           'counts. Generalizes --rl-global-load. Default False (local). The correct '
+                           'group must be resolved/asserted at runtime before enabling in a real cell.')
     group.add_argument('--rl-ppo-clip-ratio', type=float, default=0.2,
                       help='PPO clipping ratio for policy updates (default: 0.2). '
                            'Lower values are more conservative, higher allow larger updates.')
