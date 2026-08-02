@@ -358,6 +358,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.rl_candidate_pool = getattr(args, 'rl_candidate_pool', 0)
     trajectory_tracker.rl_stochastic_temperature = getattr(args, 'rl_stochastic_temperature', 1.0)
     trajectory_tracker.global_loads = getattr(args, 'rl_global_loads', False)
+    trajectory_tracker.loo_beta = getattr(args, 'rl_loo_beta', 0.3)
     print(f"[RL CONFIG] reward_type={trajectory_tracker.reward_type}, "
           f"baseline_type={trajectory_tracker.baseline_type}, "
           f"per_token_rewards={trajectory_tracker.per_token_rewards}, "

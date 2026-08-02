@@ -421,6 +421,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
         tracker.rl_candidate_pool = getattr(args, 'rl_candidate_pool', 0)
         tracker.rl_stochastic_temperature = getattr(args, 'rl_stochastic_temperature', 1.0)
         tracker.global_loads = getattr(args, 'rl_global_loads', False)
+        tracker.loo_beta = getattr(args, 'rl_loo_beta', 0.3)
         tracker.reward_type = getattr(args, 'rl_reward_type', 'expert0')
         for module in model.modules():
             if 'router' in module.__class__.__name__.lower():

@@ -596,6 +596,11 @@ def get_patch_args(parser):
                            'hardcoded DP -- see G7) so the loo_smoothmax reward uses TRUE global '
                            'counts. Generalizes --rl-global-load. Default False (local). The correct '
                            'group must be resolved/asserted at runtime before enabling in a real cell.')
+    group.add_argument('--rl-loo-beta', type=float, default=0.3,
+                      help='[H2] smooth-max sharpness beta for the loo_smoothmax reward '
+                           '(J = logsumexp(beta*n)/beta). At 235B scale the per-expert counts n are '
+                           'large, so beta*n must be O(1): use ~0.03. Default 0.3 = small-scale '
+                           'reference beta (preserves prior behavior when the flag is absent).')
     group.add_argument('--rl-ppo-clip-ratio', type=float, default=0.2,
                       help='PPO clipping ratio for policy updates (default: 0.2). '
                            'Lower values are more conservative, higher allow larger updates.')
