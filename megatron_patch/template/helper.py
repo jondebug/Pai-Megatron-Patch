@@ -584,6 +584,17 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         except Exception as e:
             print_rank_0(f"[KL] WARNING: KL computation failed: {e}")
 
+    # P3: snapshot the just-completed rollout (sampled actions/pools/advantages/old log-prob)
+    # BEFORE the reset clears pl_decisions. The post-step recompute happens at the top of the
+    # next forward_step (after this rollout's optimizer.step()). Best-effort; never fatal.
+    try:
+        from megatron_patch.model.qwen3_moe.moe import rl_probe as _rl_probe
+        if _rl_probe.audit_enabled():
+            _audit_iter = getattr(args, 'curr_iteration', getattr(args, 'iteration', 0)) or 0
+            _rl_probe.snapshot_audit(trajectory_tracker, _audit_iter)
+    except Exception as _e_audit_snap:
+        print_rank_0(f"[AUDIT] WARNING: snapshot hook failed: {_e_audit_snap}")
+
     # Reset trajectory for next iteration (moves current layer_decisions → old_layer_decisions)
     reset_trajectory_tracker()
 

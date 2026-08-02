@@ -374,8 +374,101 @@ def _run_churn(iteration, base, cur, tracker):
 
 
 def snapshot_audit(tracker, iteration):
-    return None
+    """P3: snapshot the just-completed REINFORCE+hard_gumbel_pl rollout BEFORE the reset
+    clears pl_decisions. Stores, per layer, the frozen latent (router input), the FIXED
+    sampled action (pool_idx / pos), the old-policy ordered PL log-prob and the per-token
+    advantages used in the loss. run_audit() recomputes the SAME action log-prob after the
+    optimizer step. Best-effort; a no-op off the PL path or off the audit cadence."""
+    if not audit_enabled():
+        return
+    if _PROBE['audit_interval'] <= 0 or (iteration % _PROBE['audit_interval']) != 0:
+        return
+    try:
+        pl = getattr(tracker, 'pl_decisions', {}) or {}
+        ld = getattr(tracker, 'layer_decisions', {}) or {}
+        adv_list = getattr(tracker, '_dg_adv', []) or []
+        if not pl or not ld:
+            return  # not the hard_gumbel_pl per-token REINFORCE path -> nothing to audit
+        tau = float(getattr(tracker, 'rl_stochastic_temperature', 1.0)) or 1.0
+        sorted_layers = sorted(ld.keys())  # SAME order the loss used to fill _dg_adv
+        layers = {}
+        for i, ln in enumerate(sorted_layers):
+            d = pl.get(ln)
+            if d is None or i >= len(adv_list):
+                continue
+            old_ptlp = d['old_ptlp']
+            adv = adv_list[i]
+            try:
+                adv2d = adv.view(old_ptlp.shape)
+            except Exception:
+                continue
+            layers[ln] = {
+                'latent': ld[ln][0].detach(),   # router input [seq, batch, hidden]
+                'pool_idx': d['pool_idx'],       # FIXED detached pool [seq, batch, POOL]
+                'pos': d['pos'],                 # ordered positions  [seq, batch, k]
+                'old_ptlp': old_ptlp.detach(),   # old-policy PL log-prob [seq, batch]
+                'adv': adv2d.detach(),           # per-token advantage    [seq, batch]
+            }
+        if layers:
+            _PROBE['audit_frozen'] = {'iter': iteration, 'tau': tau, 'layers': layers}
+    except Exception as e:
+        _print0(f"[AUDIT] WARNING: snapshot failed: {e}")
 
 
 def run_audit(tracker, iteration):
-    return None
+    """P3: recompute the FROZEN action's log-prob under the POST-STEP router and verify the
+    causal chain: audit loss L=-E[A_old . logpi_theta(a_old)] decreased, E[dlogpi|A>0]>0,
+    E[dlogpi|A<0]<0. Emits an [AUDIT] rank-0 line. Best-effort; never fatal."""
+    fz = _PROBE.get('audit_frozen')
+    if fz is None:
+        return
+    _PROBE['audit_frozen'] = None
+    try:
+        from .rl_trajectory import rl_ordered_logprob, rl_fp32
+        rmods = getattr(tracker, '_router_modules', {}) or {}
+        tau = fz['tau']
+        num_before = num_after = denom = 0.0
+        dpos_sum = dneg_sum = 0.0
+        dpos_n = dneg_n = 0
+        for ln, d in fz['layers'].items():
+            router = rmods.get(ln)
+            if router is None:
+                continue
+            with torch.no_grad():
+                new_logits = router.gating(d['latent'])                                  # post-step logits
+                new_ptlp = rl_ordered_logprob(rl_fp32(new_logits), d['pool_idx'], d['pos'], tau)
+            A = d['adv']
+            old = d['old_ptlp']
+            new_ptlp = new_ptlp.view_as(old)
+            num_before += float((A * old).sum().item())
+            num_after += float((A * new_ptlp).sum().item())
+            denom += float(A.numel())
+            dlp = (new_ptlp - old)
+            pos = A > 0
+            neg = A < 0
+            if bool(pos.any()):
+                dpos_sum += float(dlp[pos].sum().item())
+                dpos_n += int(pos.sum().item())
+            if bool(neg.any()):
+                dneg_sum += float(dlp[neg].sum().item())
+                dneg_n += int(neg.sum().item())
+        if denom <= 0:
+            return
+        L_before = -num_before / denom
+        L_after = -num_after / denom
+        d_pos = dpos_sum / max(1, dpos_n)
+        d_neg = dneg_sum / max(1, dneg_n)
+        ok_loss = L_after < L_before
+        ok_pos = d_pos > 0
+        ok_neg = d_neg < 0
+        agree = ok_loss and ok_pos and ok_neg
+        # predicted objective change = first-order descent (dL<0 expected after a grad step);
+        # realized = the actual audit-loss change on the frozen actions.
+        _print0(
+            f"[AUDIT] iter={fz['iter']} audit_loss_before={L_before:+.6e} after={L_after:+.6e} "
+            f"realized_dL={L_after - L_before:+.6e} predicted=descent(<0) loss_decreased={int(ok_loss)} | "
+            f"E[dlogpi|A>0]={d_pos:+.6e}(>0:{int(ok_pos)}) E[dlogpi|A<0]={d_neg:+.6e}(<0:{int(ok_neg)}) | "
+            f"direction_agreement={int(agree)} n={int(denom)}")
+    except Exception as e:
+        _print0(f"[AUDIT] WARNING: audit recompute failed: {e}; disabling audit")
+        _PROBE['audit_disabled'] = True
