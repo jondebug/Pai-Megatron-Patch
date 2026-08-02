@@ -13,6 +13,22 @@ def wrap_print_rank_0(str):
         print(f"{str}")
 
 
+def _rl_print_rank0(msg):
+    """Raw stdout print on global rank 0, always on (unlike wrap_print_rank_0, which is
+    gated by debug_mode=False). Used for the [RL TELEM] causal-check line so SIGNED metrics
+    (e.g. cov_ptlp_adv) reach the SLURM .out even though Megatron's training_log only prints
+    loss_dict keys with avg > 0.0. Mirrors the [G7] raw-print pattern."""
+    try:
+        import torch.distributed as _d
+        if (not _d.is_available()) or (not _d.is_initialized()) or _d.get_rank() == 0:
+            print(msg, flush=True)
+    except Exception:
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass
+
+
 # =============================================================================
 # H1 (Gumbel-top-k + ordered Plackett-Luce) + H2 (global leave-one-out smooth-max
 # reward). PORT of the reviewer-verified single-process reference in
@@ -1299,14 +1315,14 @@ class RouterTrajectoryTracker:
         # Surface the H1/H2 reviewer telemetry to the .out (values live in last_loss_components).
         try:
             _lc = self.last_loss_components
-            wrap_print_rank_0(
-                f"[RL TELEM] sampling={_lc.get('rl_sampling','?')} "
+            _rl_print_rank0(
+                f"[RL TELEM] path=reinforce_per_token sampling={_lc.get('rl_sampling','?')} "
+                f"cov_ptlp_adv={_lc.get('cov_ptlp_adv',0.0):.6e} "
                 f"is_ratio_mean={_lc.get('is_ratio_mean',0.0):.4f} "
                 f"is_ratio_p99={_lc.get('is_ratio_p99',0.0):.4f} "
                 f"flip_rate={_lc.get('flip_rate',0.0):.4f} "
                 f"det_topk_in_pool_rate={_lc.get('det_topk_in_pool_rate',0.0):.4f} "
                 f"adv_dir_agreement={_lc.get('adv_dir_agreement',0.0):.4f} "
-                f"cov_ptlp_adv={_lc.get('cov_ptlp_adv',0.0):.6f} "
                 f"mean_reward={_lc.get('mean_reward',0.0):.6f} "
                 f"raw_reward_std={_lc.get('raw_reward_std',0.0):.6f} "
                 f"num_layers={_lc.get('reduction_num_layers',0)}")
@@ -1644,7 +1660,9 @@ class RouterTrajectoryTracker:
         total_tokens = 0
         entropy_coeff = self.ppo_entropy_coeff
         legacy_mode = getattr(self, 'ppo_legacy_mode', False)
-        
+        # H1/H2 causal-check telemetry accumulators (observational; detached).
+        self._dg_ptlp = []; self._dg_adv = []; _is_ratios = []
+
         for layer_num in sorted_layers:
             _, routing_map, routing_logits, reward = trajectory_data[layer_num]
             advantages = layer_advantages[layer_num]  # [seq_length, batch_size]
@@ -1701,7 +1719,11 @@ class RouterTrajectoryTracker:
             total_approx_kl += approx_kl.sum()
             total_clip_fraction += clip_fraction.sum()
             total_tokens += per_token_loss.numel()
-            
+            # causal-check telemetry (detached): per-token logprob, advantage, PPO IS ratio
+            self._dg_ptlp.append(current_per_token_log_prob.detach().flatten())
+            self._dg_adv.append(advantages.detach().flatten())
+            _is_ratios.append(ratio.detach().flatten().float())
+
             if layer_num == sorted_layers[0]:
                 wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) Layer {layer_num}: advantages_mean={advantages.mean().item():.4f}, ratio_mean={ratio.mean().item():.4f}")
         
@@ -1723,6 +1745,44 @@ class RouterTrajectoryTracker:
             'approx_kl': (total_approx_kl / max(1, total_tokens)).item(),
             'clip_fraction': (total_clip_fraction / max(1, total_tokens)).item(),
         }
+        # H1/H2 causal-check telemetry (observational; no training effect). cov_ptlp_adv > 0
+        # means the advantage points the loss the right way (REINFORCE view: loss = -Cov).
+        # is_ratio_* is the PPO importance ratio (=1 on-policy, single epoch); flip_rate /
+        # det_topk_in_pool_rate are set by the Gumbel-PL router forward and read off the tracker.
+        try:
+            _pp = torch.cat(self._dg_ptlp); _aa = torch.cat(self._dg_adv)
+            _ptlp_std = float(_pp.std().item()); _adv_std_used = float(_aa.std().item())
+            _cov = float(((_pp - _pp.mean()) * (_aa - _aa.mean())).mean().item())
+            _isr = torch.cat(_is_ratios) if _is_ratios else torch.ones(1, device=device)
+            _is_p99 = float(torch.quantile(_isr, 0.99).item()); _is_mean = float(_isr.mean().item())
+            _rrstd = float(getattr(self, '_last_raw_reward_std', 0.0))
+        except Exception:
+            _ptlp_std = _adv_std_used = _cov = _rrstd = 0.0; _is_p99 = _is_mean = 1.0
+        self.last_loss_components.update({
+            'ptlp_std': _ptlp_std,
+            'adv_std_used': _adv_std_used,
+            'cov_ptlp_adv': _cov,
+            'raw_reward_std': _rrstd,
+            'is_ratio_p99': _is_p99,
+            'is_ratio_mean': _is_mean,
+            'flip_rate': float(getattr(self, '_rl_flip_rate', 0.0)),
+            'det_topk_in_pool_rate': float(getattr(self, '_rl_det_topk_in_pool_rate', 1.0)),
+            'rl_sampling': getattr(self, 'rl_sampling', 'argmax'),
+        })
+        try:
+            _lc = self.last_loss_components
+            _rl_print_rank0(
+                f"[RL TELEM] path=ppo_per_token sampling={_lc.get('rl_sampling','?')} "
+                f"cov_ptlp_adv={_lc.get('cov_ptlp_adv',0.0):.6e} "
+                f"is_ratio_mean={_lc.get('is_ratio_mean',1.0):.4f} "
+                f"is_ratio_p99={_lc.get('is_ratio_p99',1.0):.4f} "
+                f"flip_rate={_lc.get('flip_rate',0.0):.4f} "
+                f"det_topk_in_pool_rate={_lc.get('det_topk_in_pool_rate',1.0):.4f} "
+                f"ptlp_std={_lc.get('ptlp_std',0.0):.4f} adv_std={_lc.get('adv_std_used',0.0):.4f} "
+                f"mean_reward={_lc.get('mean_reward',0.0):.6f} raw_reward_std={_lc.get('raw_reward_std',0.0):.6f} "
+                f"approx_kl={_lc.get('approx_kl',0.0):.4e} num_layers={len(sorted_layers)}")
+        except Exception:
+            pass
         wrap_print_rank_0(f"PPO (per-token, baseline={self.baseline_type}) DEBUG: total_loss={total_loss.item():.6f}, critic_loss={logged_value_loss:.6f}, adv_std={self.last_loss_components['advantage_std']:.4f}, total_tokens={total_tokens}")
 
 

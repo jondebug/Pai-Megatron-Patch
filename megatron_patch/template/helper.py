@@ -429,7 +429,14 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         loss_dict["rl_ptlp_std"] = torch.tensor(components.get('ptlp_std', 0.0))
         loss_dict["rl_cov_ptlp_adv"] = torch.tensor(components.get('cov_ptlp_adv', 0.0))
         loss_dict["rl_raw_reward_std"] = torch.tensor(components.get('raw_reward_std', 0.0))
-        
+        # H1/H2 causal-check telemetry -> iteration line (positive-valued; survive the
+        # training_log `avg > 0.0` print filter). Signed cov_ptlp_adv is ALSO emitted as a
+        # raw [RL TELEM] stdout line by the loss method so its sign is never hidden.
+        loss_dict["rl_is_ratio_p99"] = torch.tensor(components.get('is_ratio_p99', 0.0))
+        loss_dict["rl_is_ratio_mean"] = torch.tensor(components.get('is_ratio_mean', 0.0))
+        loss_dict["rl_flip_rate"] = torch.tensor(components.get('flip_rate', 0.0))
+        loss_dict["rl_det_topk_in_pool_rate"] = torch.tensor(components.get('det_topk_in_pool_rate', 0.0))
+
         # Critical metrics for policy and value loss
         critical_metrics['critical/policy_loss'] = policy_loss.item() if hasattr(policy_loss, 'item') else float(policy_loss)
         critical_metrics['critical/value_loss'] = value_loss.item() if hasattr(value_loss, 'item') else float(value_loss)
