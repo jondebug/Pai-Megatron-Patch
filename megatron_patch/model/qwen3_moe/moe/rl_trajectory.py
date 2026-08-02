@@ -566,7 +566,7 @@ class RouterTrajectoryTracker:
                 self._ema_expert_loads = (1 - self._ema_momentum) * self._ema_expert_loads + self._ema_momentum * batch_loads
 
         # Auto-set per_token_rewards for reward types that are inherently per-token
-        _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "expert0", "diff_lse_load", "loo_smoothmax"}
+        _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "expert0", "diff_lse_load", "loo_smoothmax", "loo_maxrelative"}
         if self.reward_type in _PER_TOKEN_REWARD_TYPES:
             self.per_token_rewards = True
 
@@ -599,6 +599,9 @@ class RouterTrajectoryTracker:
             # H2: global leave-one-out smooth-max reward (corrected sign). Uses the ordered
             # sampled action when threaded (rl_action), else reconstructs the set from routing_map.
             reward = self.loo_smoothmax_reward(routing_map, rl_action)
+        elif self.reward_type == "loo_maxrelative":
+            # P5: max-relative reward tied directly to the per-layer MAX (the CP bottleneck).
+            reward = self.loo_maxrelative_reward(routing_map, rl_action)
         else:  # "expert0" (default)
             reward = self.focus_tokens_on_expert_0_reward(routing_map)
         
@@ -995,6 +998,45 @@ class RouterTrajectoryTracker:
                           f"config_ground_truth_mb_seq_dp_k={_cfg_gt}", flush=True)
         except Exception:
             pass
+        return r.reshape(seq, bsz)
+
+    def loo_maxrelative_reward(self, routing_map: torch.Tensor, rl_action: dict = None) -> torch.Tensor:
+        """P5: MAX-RELATIVE per-token reward, tied directly to the per-layer MAX load (the true
+        critical-path bottleneck) rather than the smooth-max surrogate of loo_smoothmax.
+
+        With n the GLOBAL per-expert counts (all-reduced over the token-covering collective when
+        --rl-global-loads, else local) and M = max_e n the layer's critical-path load, each token
+        is penalized by the mean load of its chosen experts RELATIVE to the max:
+
+            r_t = -(1/k) * sum_{e in A_t} n_e / M   <= 0
+
+        A token on the hottest expert (n_e == M) contributes -1; a token on a near-empty expert
+        contributes ~0. The per-layer mean baseline is subtracted later in the per-token REINFORCE
+        loss, so it is the SHAPE (tokens nearest the bottleneck are most penalized) that drives
+        probability mass off the CP-defining experts. This is the 2x2 fallback reward for the case
+        audit-down but probe-CP-flat (loo_smoothmax reward misalignment). NOT the default.
+
+        Args:
+            routing_map: [seq, batch, E] boolean assignment mask.
+            rl_action:   optional {'experts': [seq,batch,k], ...} sampled action; else the k-subset
+                         is reconstructed from routing_map.
+        Returns:
+            reward: [seq, batch] (<= 0).
+        """
+        rm = routing_map.float()
+        seq, bsz, E = rm.shape
+        T = seq * bsz
+        if rl_action is not None and rl_action.get('experts', None) is not None:
+            S = rl_action['experts'].reshape(T, -1).long()                      # [T, k]
+        else:
+            k = int(rm.reshape(T, E).sum(dim=-1).max().item())
+            S = rm.reshape(T, E).topk(max(1, k), dim=-1).indices.long()         # [T, k]
+        local_counts = rm.reshape(T, E).sum(dim=0)                              # [E] LOCAL counts
+        group = rl_resolve_token_covering_group() if getattr(self, 'global_loads', False) else None
+        n = rl_all_reduce_global_loads(local_counts, group=group)              # [E] GLOBAL (G7)
+        M = n.max().clamp(min=1.0)                                              # per-layer critical-path load
+        share = n[S] / M                                                        # [T, k] load relative to max
+        r = -share.mean(dim=1)                                                  # [T] <= 0
         return r.reshape(seq, bsz)
 
     def compute_topn_load(self, routing_map: torch.Tensor) -> torch.Tensor:

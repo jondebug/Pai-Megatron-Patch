@@ -332,7 +332,7 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.reward_topn = getattr(args, 'rl_reward_topn', 12)
     trajectory_tracker.per_token_rewards = getattr(args, 'rl_per_token_rewards', False)
     # Auto-detect per_token_rewards for reward types that are inherently per-token
-    _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "loo_smoothmax"}
+    _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "loo_smoothmax", "loo_maxrelative"}
     if trajectory_tracker.reward_type in _PER_TOKEN_REWARD_TYPES:
         trajectory_tracker.per_token_rewards = True
     trajectory_tracker.ppo_entropy_coeff = getattr(args, 'rl_ppo_entropy_coeff', 0.01)

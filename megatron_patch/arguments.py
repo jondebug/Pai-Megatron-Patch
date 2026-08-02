@@ -536,7 +536,7 @@ def get_patch_args(parser):
     group.add_argument('--rl-reward-type', type=str, default='expert0',
                       choices=['expert0', 'entropy', 'topn_load', 'critical_path',
                                'per_token_topn_binary', 'per_token_load_weighted', 'diff_lse_load',
-                               'loo_smoothmax'],
+                               'loo_smoothmax', 'loo_maxrelative'],
                       help='Reward function type: expert0 (focus on expert 0), entropy (load balance entropy), '
                            'topn_load (avg/topN load ratio), critical_path (directly targets max expert load), '
                            'per_token_topn_binary (per-token: -1 if hot expert, +1 otherwise), '
