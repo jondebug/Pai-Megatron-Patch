@@ -412,7 +412,43 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
         print_rank_0(f"RL LOSS ENABLED: Using {args.rl_algorithm.upper()} algorithm with coefficient {args.rl_loss_coeff}")
         if not args.router_only_training:
             print_rank_0("WARNING: RL loss is typically used with router-only training")
-        
+
+        # --- P1: fail-fast H1-mismatch guard + prominent config banner ---------------------------
+        # hard_gumbel_pl samples a stochastic action on a FIXED detached candidate pool and scores
+        # it with an ORDERED Plackett-Luce log-prob (rl_ordered_logprob). Only the REINFORCE
+        # per-token loss differentiates that PL log-prob; the PPO path re-scores with a summed
+        # independent-softmax log-prob and NEVER touches the PL log-prob, so pairing PPO with
+        # hard_gumbel_pl silently trains the wrong objective (the H1 mismatch). Assert it away.
+        _rl_sampling = getattr(args, 'rl_sampling', 'argmax')
+        _rl_algorithm = getattr(args, 'rl_algorithm', 'reinforce')
+        if _rl_sampling == 'hard_gumbel_pl':
+            assert _rl_algorithm == 'reinforce', (
+                "hard_gumbel_pl requires --rl-algorithm reinforce (PPO bypasses the "
+                "Plackett-Luce log-prob: it re-scores actions with a summed independent-softmax "
+                "log-prob and never differentiates rl_ordered_logprob -> H1 mismatch)")
+        # scoring_distribution := which log-prob the policy loss differentiates.
+        if _rl_sampling == 'hard_gumbel_pl' and _rl_algorithm == 'reinforce':
+            _scoring = 'ordered_plackett_luce(rl_ordered_logprob, per-token REINFORCE)'
+        elif _rl_algorithm == 'reinforce':
+            _scoring = 'summed_independent_softmax(log_softmax chosen, per-token REINFORCE)'
+        else:
+            _scoring = 'summed_independent_softmax(log_softmax chosen, PPO ratio)'
+        _pool = int(getattr(args, 'rl_candidate_pool', 0)) or 'ALL_EXPERTS'
+        _nepochs = int(getattr(args, 'rl_ppo_epochs', 1)) if _rl_algorithm == 'ppo' else 1
+        print_rank_0(
+            "[RL CONFIG BANNER] "
+            f"sampling_distribution={_rl_sampling} | "
+            f"scoring_distribution={_scoring} | "
+            f"candidate_pool_size={_pool} | "
+            f"algorithm={_rl_algorithm} | "
+            f"num_policy_epochs={_nepochs} | "
+            f"reward_type={getattr(args, 'rl_reward_type', 'expert0')} | "
+            f"loo_beta={getattr(args, 'rl_loo_beta', 0.3)} | "
+            f"global_loads={getattr(args, 'rl_global_loads', False)} | "
+            f"perlayer_norm={getattr(args, 'rl_perlayer_norm', False)} | "
+            f"rl_loss_coeff={getattr(args, 'rl_loss_coeff', 0.0)}")
+        # -----------------------------------------------------------------------------------------
+
         from megatron_patch.model.qwen3_moe.moe.rl_trajectory import get_trajectory_tracker
         tracker = get_trajectory_tracker()
         # --- H1/H2 port: set sampling/reward config on the tracker BEFORE the first forward so the
