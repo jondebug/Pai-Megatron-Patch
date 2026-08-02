@@ -140,14 +140,23 @@ def _dp_group():
         return None
 
 
-def _register_hooks(router_modules, captured):
+def _register_hooks(router_modules, captured, capture_logits=False):
     handles = []
     for ln, mod in router_modules.items():
         def hook(m, inp, out, _ln=ln):
             try:
                 # router.forward returns (scores, routing_map); routing_map is [T, E] bool.
                 rm = out[1].detach()
-                captured[_ln] = rm
+                lg = None
+                # P4: rank-0 only, recompute dense router logits for the categorical-KL churn
+                # measure (the router policy distribution over the fixed pool of experts).
+                if capture_logits and _is_rank0():
+                    try:
+                        with torch.no_grad():
+                            lg = m.gating(inp[0]).detach().float().view(-1, rm.shape[-1])
+                    except Exception:
+                        lg = None
+                captured[_ln] = {'rm': rm, 'logits': lg}
             except Exception:
                 pass
         handles.append(mod.register_forward_hook(hook))
@@ -164,19 +173,25 @@ def _allreduce_counts(counts, group):
         pass
 
 
-def _probe_once(model, tracker, group):
+def _probe_once(model, tracker, group, k):
     """Run the deterministic probe over ALL frozen batches; return CP + per-layer
-    GLOBAL (DP-all-reduced) expert counts.
+    GLOBAL (DP-all-reduced) expert counts, plus (rank-0) per-token top-k SETS and dense
+    router logits for the P4 churn/KL metrics.
 
     per_batch_cp : list of per-batch global CP (for mean +/- CI across batches).
     counts       : {layer -> [E]} global counts SUMMED over all probe batches
-                   (stable per-layer structure: max load, hot expert, load CV)."""
+                   (stable per-layer structure: max load, hot expert, load CV).
+    topk         : {layer -> [T_total, k]} rank-0 deterministic top-k sets (fixed states).
+    logits       : {layer -> [T_total, E]} rank-0 dense router logits (for categorical KL)."""
     router_modules = tracker._router_modules
     per_batch_cp = []
     agg = {}
+    r0 = _is_rank0()
+    topk = {}
+    logits = {}
     for (tokens, pos, attn, pack) in _PROBE['batches']:
         captured = {}
-        handles = _register_hooks(router_modules, captured)
+        handles = _register_hooks(router_modules, captured, capture_logits=r0)
         try:
             with torch.no_grad():
                 # eval + no_grad => the router's Gumbel path is bypassed
@@ -185,28 +200,36 @@ def _probe_once(model, tracker, group):
         finally:
             for h in handles:
                 h.remove()
-        batch_counts = {ln: rm.float().sum(dim=0) for ln, rm in captured.items()}  # [E] local
-        _allreduce_counts(batch_counts, group)                                     # [E] GLOBAL
+        batch_counts = {ln: cap['rm'].float().sum(dim=0) for ln, cap in captured.items()}  # [E] local
+        _allreduce_counts(batch_counts, group)                                             # [E] GLOBAL
         if batch_counts:
             per_batch_cp.append(sum(float(c.max().item()) for c in batch_counts.values()))
         for ln, c in batch_counts.items():
             agg[ln] = c.clone() if ln not in agg else (agg[ln] + c)
-    return {'per_batch_cp': per_batch_cp, 'counts': agg}
+        if r0:
+            for ln, cap in captured.items():
+                # deterministic top-k SET on this rank's fixed tokens (the actual routing decision)
+                tk = cap['rm'].float().topk(k, dim=-1).indices.sort(dim=-1).values.to(torch.int16)
+                topk[ln] = tk if ln not in topk else torch.cat([topk[ln], tk], dim=0)
+                if cap['logits'] is not None:
+                    lg = cap['logits'].half()
+                    logits[ln] = lg if ln not in logits else torch.cat([logits[ln], lg], dim=0)
+    return {'per_batch_cp': per_batch_cp, 'counts': agg, 'topk': topk, 'logits': logits, 'k': k}
 
 
-def _probe_once_with_theta0(model, tracker, group):
+def _probe_once_with_theta0(model, tracker, group, k):
     """Deterministic probe with the INITIAL router theta0 swapped in (weight swap
     exactly like _run_reference_forward), then restore current weights."""
     theta0 = _PROBE['theta0_weights']
     if not theta0:
-        return _probe_once(model, tracker, group)
+        return _probe_once(model, tracker, group, k)
     saved = {}
     try:
         for name, p in model.named_parameters():
             if name in theta0:
                 saved[name] = p.data.clone()
                 p.data.copy_(theta0[name])
-        return _probe_once(model, tracker, group)
+        return _probe_once(model, tracker, group, k)
     finally:
         for name, p in model.named_parameters():
             if name in saved:
@@ -302,10 +325,10 @@ def run_probe(model, tracker, iteration):
         kl_prev = _set_kl_capture(True)
 
         if _PROBE['baseline'] is None:
-            _PROBE['baseline'] = _probe_once_with_theta0(model, tracker, group)
-        cur = _probe_once(model, tracker, group)
+            _PROBE['baseline'] = _probe_once_with_theta0(model, tracker, group, k)
+        cur = _probe_once(model, tracker, group, k)
         _emit(iteration, _PROBE['baseline'], cur, k, E)
-        _run_churn(iteration, _PROBE['baseline'], cur, tracker)  # P4 (no-op until implemented)
+        _run_churn(iteration, _PROBE['baseline'], cur, k)  # P4: old-vs-new deterministic top-k churn
         _PROBE['prev'] = cur
     except Exception as e:
         _print0(f"[PROBE] WARNING: probe failed at iter {iteration}: {e}; disabling probe")
@@ -369,8 +392,74 @@ def _set_kl_capture(disabled):
 # -----------------------------------------------------------------------------
 # P4 churn / P3 audit -- filled in by later commits; safe no-ops for now.
 # -----------------------------------------------------------------------------
-def _run_churn(iteration, base, cur, tracker):
-    return None
+def _set_metrics(old_idx, new_idx, k):
+    """old_idx, new_idx: [T, k] int expert-id sets (per token). Returns mean set_churn and
+    mean top-k Jaccard over the T tokens. set_churn = 1 - |old ∩ new|/k."""
+    o = old_idx.long()
+    n = new_idx.long()
+    inter = (n.unsqueeze(-1) == o.unsqueeze(-2)).any(dim=-1).sum(dim=-1).float()  # [T] |new ∩ old|
+    churn = (1.0 - inter / k).mean().item()
+    union = (2 * k - inter).clamp(min=1.0)
+    jacc = (inter / union).mean().item()
+    return churn, jacc
+
+
+def _cat_kl(logits_ref, logits_cur):
+    """Mean per-token categorical KL(softmax(ref) || softmax(cur)) over the expert axis."""
+    pr = torch.log_softmax(logits_ref.float(), dim=-1)
+    pc = torch.log_softmax(logits_cur.float(), dim=-1)
+    p = pr.exp()
+    kl = (p * (pr - pc)).sum(dim=-1)  # [T]
+    return kl.mean().item()
+
+
+def _run_churn(iteration, base, cur, k):
+    """P4: replace the saturated sampled-vs-argmax flip_rate with OLD-vs-NEW DETERMINISTIC
+    top-k SET replacement on the identical fixed probe states. Reports set_churn / Jaccard
+    vs the INITIAL router theta0 (cumulative) AND vs the PREVIOUS probe (incremental drift,
+    the quantity the 0.1-1% guard watches), plus categorical KL vs theta0. Rank-0 only."""
+    if not _is_rank0():
+        return
+    try:
+        cur_tk = cur.get('topk', {}) or {}
+        base_tk = base.get('topk', {}) or {}
+        if not cur_tk:
+            return
+        prev = _PROBE.get('prev')
+        prev_tk = (prev or {}).get('topk', {}) if prev else {}
+
+        def _avg_sets(ref_tk):
+            cs, js, nl = [], [], 0
+            for ln, tk in cur_tk.items():
+                r = ref_tk.get(ln)
+                if r is None or r.shape != tk.shape:
+                    continue
+                c, j = _set_metrics(r, tk, k)
+                cs.append(c)
+                js.append(j)
+                nl += 1
+            if nl == 0:
+                return None
+            return sum(cs) / nl, sum(js) / nl, nl
+
+        v0 = _avg_sets(base_tk)
+        vp = _avg_sets(prev_tk) if prev_tk else None
+
+        # categorical KL vs theta0 (dense router logits), averaged over layers
+        cur_lg = cur.get('logits', {}) or {}
+        base_lg = base.get('logits', {}) or {}
+        kls = []
+        for ln, lg in cur_lg.items():
+            r = base_lg.get(ln)
+            if r is not None and r.shape == lg.shape:
+                kls.append(_cat_kl(r, lg))
+        kl0 = (sum(kls) / len(kls)) if kls else float('nan')
+
+        s0 = f"vs_theta0 set_churn={v0[0]:.4f} jaccard={v0[1]:.4f}" if v0 else "vs_theta0 n/a"
+        sp = f"vs_prev set_churn={vp[0]:.4f} jaccard={vp[1]:.4f}" if vp else "vs_prev n/a(first)"
+        _print0(f"[PROBE] iter={iteration} churn {s0} | {sp} | cat_KL_vs_theta0={kl0:.6e} k={k}")
+    except Exception as e:
+        _print0(f"[PROBE] WARNING: churn failed at iter {iteration}: {e}")
 
 
 def snapshot_audit(tracker, iteration):
