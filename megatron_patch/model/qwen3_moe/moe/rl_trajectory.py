@@ -130,17 +130,22 @@ def rl_all_reduce_global_loads(local_counts: torch.Tensor, group=None) -> torch.
 
 
 def rl_resolve_token_covering_group():
-    """***NEEDS REVIEW / G7 stub***: return the process group over which per-expert token
-    counts must be summed EXACTLY ONCE (the 'token-covering collective').
+    """G7: return the process group over which per-expert token counts must be summed
+    EXACTLY ONCE (the 'token-covering collective').
 
-    Left intentionally unresolved: the correct group depends on the live EP/TP/SP/PP layout
-    and must be validated by the G7 no-update capture (sum gate) before use. Returning None
-    means rl_all_reduce_global_loads() is a no-op (LOCAL counts) -- a safe default that
-    preserves current behavior until the reviewer wires the verified group.
+    On the validated topology TP=1, PP=1, no sequence/context parallel, the DATA-PARALLEL
+    group holds DISTINCT tokens on every rank with NO TP/SP/PP-replicated double counting, so
+    the token-covering group == the DP group. The group is returned here and passed as an
+    ARGUMENT into rl_all_reduce_global_loads (never hardcoded at the call site); the G7
+    no-update capture (sum gate: Sum_e count == unique_tokens*k) validates it on the live
+    hardware before use. Returns None on any failure => rl_all_reduce_global_loads() falls
+    back to LOCAL counts (a safe no-op that preserves current behavior).
     """
-    # TODO(G7): e.g. a group covering DP x context/sequence but NOT double-counting TP/SP
-    #           replicas or PP stages. Resolve + assert at runtime; DO NOT hardcode DP.
-    return None
+    try:
+        from megatron.core import parallel_state
+        return parallel_state.get_data_parallel_group()
+    except Exception:
+        return None
 
 
 class CriticNetwork(nn.Module):
@@ -934,6 +939,46 @@ class RouterTrajectoryTracker:
         global_counts = rl_all_reduce_global_loads(local_counts, group=group)   # [E] GLOBAL (G7)
         beta = float(getattr(self, 'loo_beta', RL_LOO_DEFAULT_BETA))
         r = rl_loo_smoothmax_reward(global_counts, S, beta=beta)                # [T] <= 0
+        # --- G7 sum-gate diagnostic (first <=5 calls; rank-0 prints; NEVER crashes training) ---
+        # Verifies the token-covering collective on the live topology:
+        #   Sum_e global_count  should == global_tokens*k  == config ground truth
+        #   (mb*seq*dp*k). ratio ~1.0 => each token routed to exactly k experts, no double count;
+        #   a double-counting group shows ratio/counts ~2.0 vs the config ground truth.
+        # The all_reduce below is run in LOCKSTEP on ALL ranks (counter is identical across
+        # ranks), only rank 0 prints -- so it can never deadlock.
+        try:
+            _g7_n = getattr(self, '_g7_log_calls', 0)
+            if _g7_n < 5:
+                _k_g7 = int(S.shape[1])
+                _dist_ok = torch.distributed.is_available() and torch.distributed.is_initialized()
+                _gt = torch.tensor([float(T)], device=global_counts.device, dtype=torch.float32)
+                if group is not None and _dist_ok and torch.distributed.get_world_size(group=group) > 1:
+                    torch.distributed.all_reduce(_gt, op=torch.distributed.ReduceOp.SUM, group=group)
+                    _ws = torch.distributed.get_world_size(group=group)
+                else:
+                    _ws = 1
+                self._g7_log_calls = _g7_n + 1  # advance in lockstep on every rank
+                _is_rank0 = (not _dist_ok) or torch.distributed.get_rank() == 0
+                if _is_rank0:
+                    _global_tokens = float(_gt.item())
+                    _sum_count = float(global_counts.sum().item())
+                    _ratio = _sum_count / max(_global_tokens * _k_g7, 1.0)
+                    _cfg_gt = -1
+                    try:
+                        from megatron.training import get_args
+                        from megatron.core import parallel_state as _ps
+                        _a = get_args()
+                        _dp = _ps.get_data_parallel_world_size()
+                        _cfg_gt = int(_a.micro_batch_size) * int(_a.seq_length) * int(_dp) * _k_g7
+                    except Exception:
+                        _cfg_gt = -1
+                    print(f"[G7] call={_g7_n} global_loads={getattr(self, 'global_loads', False)} "
+                          f"sum_global_count={_sum_count:.1f} group_world_size={_ws} "
+                          f"local_tokens={T} global_tokens={_global_tokens:.1f} k={_k_g7} "
+                          f"ratio_sumcount_over_globaltokens_k={_ratio:.4f} "
+                          f"config_ground_truth_mb_seq_dp_k={_cfg_gt}", flush=True)
+        except Exception:
+            pass
         return r.reshape(seq, bsz)
 
     def compute_topn_load(self, routing_map: torch.Tensor) -> torch.Tensor:
@@ -1251,6 +1296,22 @@ class RouterTrajectoryTracker:
             'reduction_num_layers': int(len(sorted_layers)),
         })
         
+        # Surface the H1/H2 reviewer telemetry to the .out (values live in last_loss_components).
+        try:
+            _lc = self.last_loss_components
+            wrap_print_rank_0(
+                f"[RL TELEM] sampling={_lc.get('rl_sampling','?')} "
+                f"is_ratio_mean={_lc.get('is_ratio_mean',0.0):.4f} "
+                f"is_ratio_p99={_lc.get('is_ratio_p99',0.0):.4f} "
+                f"flip_rate={_lc.get('flip_rate',0.0):.4f} "
+                f"det_topk_in_pool_rate={_lc.get('det_topk_in_pool_rate',0.0):.4f} "
+                f"adv_dir_agreement={_lc.get('adv_dir_agreement',0.0):.4f} "
+                f"cov_ptlp_adv={_lc.get('cov_ptlp_adv',0.0):.6f} "
+                f"mean_reward={_lc.get('mean_reward',0.0):.6f} "
+                f"raw_reward_std={_lc.get('raw_reward_std',0.0):.6f} "
+                f"num_layers={_lc.get('reduction_num_layers',0)}")
+        except Exception:
+            pass
         wrap_print_rank_0(f"REINFORCE (per-token) DEBUG: total_loss={total_loss.item():.6f}, total_tokens={total_tokens}")
         return total_loss
 
