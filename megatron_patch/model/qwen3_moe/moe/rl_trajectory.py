@@ -389,6 +389,10 @@ class RouterTrajectoryTracker:
         """Reset the trajectory for a new forward pass."""
         # Store old trajectory for PPO importance sampling
         self.old_layer_decisions = getattr(self, 'layer_decisions', {}).copy()
+        # H1: mirror the PL safeguard bundle (FIXED pool + ordered action + frozen old PL log-prob)
+        # into old_pl_decisions so the post-step extra PPO epochs can re-score the SAME action with
+        # the ordered Plackett-Luce log-prob instead of the summed independent-softmax (H1 fix).
+        self.old_pl_decisions = getattr(self, 'pl_decisions', {}).copy()
         
         # Populate replay buffer with the completed trajectory (moved to CPU)
         if self.replay_buffer_size > 0 and self.old_layer_decisions:
@@ -1712,8 +1716,25 @@ class RouterTrajectoryTracker:
             
             # Current policy log probabilities per token
             log_probs = torch.nn.functional.log_softmax(routing_logits, dim=-1)
-            chosen_log_probs = log_probs * routing_map.float()
-            current_per_token_log_prob = chosen_log_probs.sum(dim=-1)
+            # H1: under hard_gumbel_pl, score the SAMPLED action with the ordered Plackett-Luce
+            # log-prob over the FIXED detached pool (the SAME path REINFORCE differentiates) so PPO
+            # no longer bypasses the PL log-prob with a summed independent-softmax (the H1 mismatch).
+            _pl_ok = (getattr(self, 'rl_sampling', 'argmax') == 'hard_gumbel_pl'
+                      and layer_num in getattr(self, 'pl_decisions', {}))
+            if _pl_ok:
+                _pld = self.pl_decisions[layer_num]
+                assert torch.equal(_pld['pool_idx'].gather(-1, _pld['pos']), _pld['experts']), \
+                    "[RL] PPO PL recompute pool/action mismatch (safeguard)"
+                _tau = float(getattr(self, 'rl_stochastic_temperature', 1.0)) or 1.0
+                current_per_token_log_prob = rl_ordered_logprob(
+                    rl_fp32(routing_logits), _pld['pool_idx'], _pld['pos'], _tau)  # grad-tracked
+                # OLD-policy PL log-prob = the frozen rollout-time ordered log-prob (== current
+                # detached at epoch 1 => ratio 1). Stored in pl_decisions at decision time.
+                _old_ptlp_pl = _pld['old_ptlp']
+            else:
+                chosen_log_probs = log_probs * routing_map.float()
+                current_per_token_log_prob = chosen_log_probs.sum(dim=-1)
+                _old_ptlp_pl = None
             
             if legacy_mode:
                 # Legacy behavior (REINFORCE-style main PPO update).
@@ -1722,9 +1743,13 @@ class RouterTrajectoryTracker:
                 approx_kl = torch.zeros_like(current_per_token_log_prob)
                 clip_fraction = torch.zeros_like(current_per_token_log_prob)
             else:
-                old_log_probs = torch.nn.functional.log_softmax(routing_logits.detach(), dim=-1)
-                old_chosen_log_probs = old_log_probs * routing_map.float()
-                old_per_token_log_prob = old_chosen_log_probs.sum(dim=-1)
+                if _pl_ok:
+                    # PPO ratio = exp(new_ordered_logprob - old_ordered_logprob) over the FIXED pool.
+                    old_per_token_log_prob = _old_ptlp_pl
+                else:
+                    old_log_probs = torch.nn.functional.log_softmax(routing_logits.detach(), dim=-1)
+                    old_chosen_log_probs = old_log_probs * routing_map.float()
+                    old_per_token_log_prob = old_chosen_log_probs.sum(dim=-1)
 
                 log_ratio = torch.clamp(current_per_token_log_prob - old_per_token_log_prob, -10.0, 10.0)
                 ratio = torch.exp(log_ratio)
@@ -1892,7 +1917,7 @@ class RouterTrajectoryTracker:
         return gpu_trajectory
 
     def _compute_ppo_epoch_loss(self, trajectory, original_logits, layer_advantages,
-                                 clip_ratio, rl_loss_coeff, device):
+                                 clip_ratio, rl_loss_coeff, device, pl_decisions=None):
         """Compute PPO clipped loss for a single trajectory (shared between current + replay)."""
         sorted_layers = sorted(trajectory.keys())
         total_loss = torch.tensor(0.0, device=device)
@@ -1913,8 +1938,21 @@ class RouterTrajectoryTracker:
             old_rm = old_routing_map.float()
 
             if self.per_token_rewards:
-                new_per_token = (new_lp * old_rm).sum(dim=-1)
-                orig_per_token = (orig_lp * old_rm).sum(dim=-1)
+                # H1: extra-epoch importance ratio on the SAME ordered PL log-prob under hard_gumbel_pl.
+                # new = current-policy PL log-prob over the FIXED pool; orig = frozen rollout-policy PL
+                # log-prob (pl_decisions['old_ptlp']). After the main optimizer step the router has
+                # moved, so this ratio genuinely differs from 1 (real off-policy importance sampling).
+                _epl_ok = (getattr(self, 'rl_sampling', 'argmax') == 'hard_gumbel_pl'
+                           and pl_decisions is not None and layer_num in pl_decisions)
+                if _epl_ok:
+                    _pld = pl_decisions[layer_num]
+                    _tau = float(getattr(self, 'rl_stochastic_temperature', 1.0)) or 1.0
+                    new_per_token = rl_ordered_logprob(
+                        rl_fp32(new_logits), _pld['pool_idx'], _pld['pos'], _tau)
+                    orig_per_token = _pld['old_ptlp']
+                else:
+                    new_per_token = (new_lp * old_rm).sum(dim=-1)
+                    orig_per_token = (orig_lp * old_rm).sum(dim=-1)
                 log_ratio = torch.clamp(new_per_token - orig_per_token, -10.0, 10.0)
                 ratio = torch.exp(log_ratio)
 
@@ -1923,6 +1961,10 @@ class RouterTrajectoryTracker:
                 per_token_loss = -torch.min(pg1, pg2)
                 total_loss += per_token_loss.sum()
                 total_tokens += per_token_loss.numel()
+                try:
+                    self._extra_epoch_is_ratios.append(ratio.detach().flatten().float())
+                except Exception:
+                    pass
             else:
                 adv = advantages if isinstance(advantages, torch.Tensor) else torch.tensor(advantages, device=device)
                 if adv.dim() > 0:
@@ -2004,13 +2046,15 @@ class RouterTrajectoryTracker:
         cached_advantages = self._recompute_rollout_advantages(discount_factor) if legacy_mode else None
 
         # Run K-1 extra epochs
+        self._extra_epoch_is_ratios = []  # H1: collect off-policy PL importance ratios for telemetry
         for epoch in range(self.ppo_epochs - 1):
             layer_advantages = cached_advantages if legacy_mode else self._recompute_rollout_advantages(discount_factor)
 
             # Loss from current trajectory
             total_loss, total_tokens = self._compute_ppo_epoch_loss(
                 self.old_layer_decisions, original_logits, layer_advantages,
-                clip_ratio, rl_loss_coeff, device)
+                clip_ratio, rl_loss_coeff, device,
+                pl_decisions=getattr(self, 'old_pl_decisions', None))
 
             # Add losses from replay buffer trajectories
             for rp_traj, rp_orig in zip(replay_rollouts, replay_orig_logits):
@@ -2049,9 +2093,28 @@ class RouterTrajectoryTracker:
             self._ppo_optimizer.step()
 
         opt_name = self._ppo_optimizer.__class__.__name__ if self._ppo_optimizer is not None else "None"
+        # H1: surface the extra-epoch (off-policy) PL importance-sampling ratio. With hard_gumbel_pl
+        # this differs from 1 once the router has moved -> confirms PPO is doing REAL importance
+        # sampling that single-epoch REINFORCE cannot (ratio is identically 1 on the fresh rollout).
+        try:
+            if getattr(self, '_extra_epoch_is_ratios', None):
+                _eir = torch.cat(self._extra_epoch_is_ratios)
+                _eir_mean = float(_eir.mean().item()); _eir_p99 = float(torch.quantile(_eir, 0.99).item())
+                _eir_max = float(_eir.max().item())
+            else:
+                _eir_mean = _eir_p99 = _eir_max = 1.0
+        except Exception:
+            _eir_mean = _eir_p99 = _eir_max = 1.0
+        try:
+            self.last_loss_components['is_extra_ratio_mean'] = _eir_mean
+            self.last_loss_components['is_extra_ratio_p99'] = _eir_p99
+        except Exception:
+            pass
         print(f"[PPO MULTI-EPOCH] Ran {self.ppo_epochs - 1} extra epochs "
                          f"(lr={extra_lr:.2e}, opt={opt_name}, legacy={legacy_mode}, buf={len(replay_rollouts)}), "
-                         f"last_loss={total_loss.item():.6f}")
+                         f"last_loss={total_loss.item():.6f} "
+                         f"is_extra_ratio_mean={_eir_mean:.4f} is_extra_ratio_p99={_eir_p99:.4f} "
+                         f"is_extra_ratio_max={_eir_max:.4f}")
 
 
 # Global trajectory tracker instance

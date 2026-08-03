@@ -84,6 +84,8 @@ def banner_once(args):
         algo = getattr(args, 'rl_algorithm', 'reinforce')
         if samp == 'hard_gumbel_pl' and algo == 'reinforce':
             scoring = 'ordered_plackett_luce(rl_ordered_logprob, per-token REINFORCE)'
+        elif samp == 'hard_gumbel_pl' and algo == 'ppo':
+            scoring = 'ordered_plackett_luce(rl_ordered_logprob, PPO clipped ratio)'
         elif algo == 'reinforce':
             scoring = 'summed_independent_softmax(log_softmax chosen, per-token REINFORCE)'
         else:

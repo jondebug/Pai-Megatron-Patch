@@ -422,13 +422,19 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel]:
         _rl_sampling = getattr(args, 'rl_sampling', 'argmax')
         _rl_algorithm = getattr(args, 'rl_algorithm', 'reinforce')
         if _rl_sampling == 'hard_gumbel_pl':
-            assert _rl_algorithm == 'reinforce', (
-                "hard_gumbel_pl requires --rl-algorithm reinforce (PPO bypasses the "
-                "Plackett-Luce log-prob: it re-scores actions with a summed independent-softmax "
-                "log-prob and never differentiates rl_ordered_logprob -> H1 mismatch)")
+            # PPO now scores the sampled action with the SAME ordered Plackett-Luce log-prob
+            # (rl_ordered_logprob over the FIXED detached pool) that REINFORCE differentiates, so the
+            # H1 action/log-prob mismatch is fixed for BOTH. Allow reinforce OR ppo; still fail-fast
+            # on any algorithm that would fall back to the summed independent-softmax bypass.
+            assert _rl_algorithm in ('reinforce', 'ppo'), (
+                "hard_gumbel_pl requires --rl-algorithm reinforce or ppo (both now differentiate the "
+                "ordered Plackett-Luce log-prob; any other path re-scores with a summed "
+                "independent-softmax log-prob and never touches rl_ordered_logprob -> H1 mismatch)")
         # scoring_distribution := which log-prob the policy loss differentiates.
         if _rl_sampling == 'hard_gumbel_pl' and _rl_algorithm == 'reinforce':
             _scoring = 'ordered_plackett_luce(rl_ordered_logprob, per-token REINFORCE)'
+        elif _rl_sampling == 'hard_gumbel_pl' and _rl_algorithm == 'ppo':
+            _scoring = 'ordered_plackett_luce(rl_ordered_logprob, PPO clipped ratio)'
         elif _rl_algorithm == 'reinforce':
             _scoring = 'summed_independent_softmax(log_softmax chosen, per-token REINFORCE)'
         else:
