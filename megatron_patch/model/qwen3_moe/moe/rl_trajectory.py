@@ -360,6 +360,11 @@ class RouterTrajectoryTracker:
         self.pl_decisions = {}               # layer -> {pool_idx, pos, experts, old_ptlp} (safeguard bundle)
         self.use_ema_loads = False  # Use EMA expert loads for reward (more stable)
         self._ema_expert_loads = None  # [num_experts] running average of per-expert load
+        self.ep_size = 1             # expert-parallel size; sets m = num_experts // ep_size for per_token_topm
+        self.reward_topm = 0         # 0 => auto (num_experts // ep_size); else fixed m for the top-m mean reward
+        self.reward_c = 0.1          # smoothmax temperature factor: tau = reward_c * (max - mean)
+        self.reward_c_end = 0.0      # >0 => linearly anneal reward_c -> reward_c_end over train_iters
+        self._reward_diag_calls = 0  # throttle counter for the [RL REWARD] N_eff diagnostic
         self._ema_momentum = 0.1  # EMA update rate for expert loads
         self.ppo_reeval = False  # Proper PPO: re-evaluate old states under current policy
         self.reeval_logits = {}  # Populated by router.forward() when ppo_reeval=True
@@ -570,7 +575,7 @@ class RouterTrajectoryTracker:
                 self._ema_expert_loads = (1 - self._ema_momentum) * self._ema_expert_loads + self._ema_momentum * batch_loads
 
         # Auto-set per_token_rewards for reward types that are inherently per-token
-        _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "expert0", "diff_lse_load", "loo_smoothmax", "loo_maxrelative"}
+        _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "per_token_topm", "per_token_smoothmax", "expert0", "diff_lse_load", "loo_smoothmax", "loo_maxrelative"}
         if self.reward_type in _PER_TOKEN_REWARD_TYPES:
             self.per_token_rewards = True
 
@@ -597,6 +602,10 @@ class RouterTrajectoryTracker:
             reward = self.per_token_topn_binary_reward(routing_map)
         elif self.reward_type == "per_token_load_weighted":
             reward = self.per_token_load_weighted_reward(routing_map)
+        elif self.reward_type == "per_token_topm":
+            reward = self.per_token_topm_reward(routing_map)
+        elif self.reward_type == "per_token_smoothmax":
+            reward = self.per_token_smoothmax_reward(routing_map)
         elif self.reward_type == "diff_lse_load":
             reward = self.diff_lse_load_reward(routing_map, routing_logits)
         elif self.reward_type == "loo_smoothmax":
@@ -905,6 +914,109 @@ class RouterTrajectoryTracker:
             reward = (torch.log(S_cf) - torch.log(S)) * mean_load
         return reward
 
+    def _per_token_from_weights(self, routing_map: torch.Tensor, w: torch.Tensor,
+                                w_floor: float = 1.0) -> torch.Tensor:
+        """Per-token leave-one-out attribution of ANY global load functional F(N).
+
+        For F(N) with gradient w = grad F(N) (shape [E], detached), the first-order
+        per-token credit is  r_t = -((1/k) * sum_{e in S_t} w_e - w_bar) / w_bar,
+        with w_bar = mean(w).  Setting w = expert_loads (F = 1/2||N||^2) reproduces
+        per_token_load_weighted_reward EXACTLY; w = (1/m)*1_{top-m} gives the top-m mean
+        (CVaR); w = softmax(N/tau) gives the smooth-max.  One family, one code path.
+        """
+        w_bar = w.mean()
+        token_w = (routing_map.float() * w).sum(dim=-1)               # [seq, batch]  sum_{e in S_t} w_e
+        num_chosen = routing_map.float().sum(dim=-1).clamp(min=1.0)   # [seq, batch]  k
+        avg_chosen_w = token_w / num_chosen
+        return -(avg_chosen_w - w_bar) / w_bar.clamp(min=w_floor)
+
+    def _current_c(self) -> float:
+        """Smoothmax temperature factor c, optionally annealed reward_c -> reward_c_end
+        linearly over training (Nesterov smoothing: start soft, end sharp)."""
+        c0 = float(getattr(self, "reward_c", 0.1))
+        c1 = float(getattr(self, "reward_c_end", 0.0))
+        if c1 <= 0.0:
+            return c0
+        frac = 0.0
+        try:
+            from megatron import get_args
+            a = get_args()
+            it = float(getattr(a, "curr_iteration", 0) or 0)
+            T = float(getattr(a, "train_iters", 0) or 0)
+            if T > 0:
+                frac = min(1.0, max(0.0, it / T))
+        except Exception:
+            frac = 0.0
+        return c0 + (c1 - c0) * frac
+
+    def per_token_topm_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
+        """Per-token attribution of the top-m mean load - CVaR at level alpha = 1 - m/E.
+
+        F(N) = mean of the m largest expert loads;  w = grad F = 1/m on the top-m experts.
+        m = num_experts // ep_size makes F a placement-free upper bound on the per-rank
+        makespan (Graham's quantity): the hottest EP rank holds <= m experts, so its load
+        <= m * (top-m mean).  m=1 -> hard max (L-inf, the CP metric);  m=E -> mean (no
+        pressure).  w = expert_loads instead recovers per_token_load_weighted exactly (L2),
+        so this is a strict generalisation.  topk is non-differentiable but loads are
+        detached - the gradient flows through the log-prob, not through w.
+        """
+        loads = (self._ema_expert_loads
+                 if self.use_ema_loads and self._ema_expert_loads is not None
+                 else routing_map.sum(dim=(0, 1)).float())
+        E = loads.numel()
+        m = self.reward_topm if getattr(self, "reward_topm", 0) else max(1, E // max(1, int(getattr(self, "ep_size", 1))))
+        m = int(min(max(1, m), E))
+        self._last_reward_m = m
+        w = torch.zeros_like(loads)
+        w[loads.topk(m).indices] = 1.0 / m                           # grad of the top-m mean
+        self._log_reward_diag(w, f"m={m}")
+        # w_bar = m*(1/m)/E = 1/E (tiny) -> must NOT reuse the load-weighted floor of 1.0
+        return self._per_token_from_weights(routing_map, w, w_floor=1e-12)
+
+    def per_token_smoothmax_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
+        """LOO attribution of a smooth-max whose temperature tracks the load spread.
+
+        tau = c * (max - mean) makes the sharpness INVARIANT to batch size / seq len
+        (a fixed beta is a scale-dependent constant in a scale-varying quantity - you
+        would train a softer objective than you deploy).  c is annealed ~0.3 (moves the
+        whole head, no whack-a-mole) -> ~0.02 (squeezes the true argmax).  tau is per
+        LAYER: this is invoked per layer with that layer's routing_map, so tau adapts to
+        each layer's own spread (run use_ema_loads=False to keep tau strictly per-layer;
+        the EMA mixes layers).  w = softmax(N/tau) = grad of tau*logsumexp(N/tau);
+        w = expert_loads recovers per_token_load_weighted bit-for-bit.
+        """
+        loads = (self._ema_expert_loads
+                 if self.use_ema_loads and self._ema_expert_loads is not None
+                 else routing_map.sum(dim=(0, 1)).float())
+        c = self._current_c()
+        spread = (loads.max() - loads.mean()).clamp(min=1.0)
+        tau = (c * spread).clamp(min=1e-3)
+        w = torch.softmax(loads / tau, dim=0)                        # grad of tau*LSE(N/tau); sums to 1
+        self._log_reward_diag(w, f"c={c:.3f} tau={tau.item():.1f} spread={spread.item():.1f}")
+        return self._per_token_from_weights(routing_map, w, w_floor=1e-12)
+
+    def _log_reward_diag(self, w: torch.Tensor, extra: str = "") -> None:
+        """Sanity instrument: a max at the wrong sharpness is a mean in disguise.
+        Logs w_max_share (~1/E => mean; ~1 => whack-a-mole) and N_eff = exp(entropy(p)),
+        the effective number of experts under pressure (target ~m for top-m; ~8-32 early
+        and ~1-4 late for annealed smoothmax).  Rank-0, ~once per 94-layer pass."""
+        try:
+            import torch.distributed as _dist
+            if _dist.is_initialized() and _dist.get_rank() != 0:
+                return
+            self._reward_diag_calls = getattr(self, "_reward_diag_calls", 0) + 1
+            if self._reward_diag_calls % 94 != 1:
+                return
+            with torch.no_grad():
+                p = w / w.sum().clamp(min=1e-12)
+                w_max_share = p.max().item()
+                N_eff = torch.exp(-(p * p.clamp_min(1e-12).log()).sum()).item()
+            print(f"[RL REWARD] reward={self.reward_type} {extra} E={w.numel()} "
+                  f"w_max_share={w_max_share:.4f} N_eff={N_eff:.2f} "
+                  f"(N_eff~E => mean in disguise; w_max_share~1 => whack-a-mole)", flush=True)
+        except Exception:
+            pass
+
     def per_token_load_weighted_reward(self, routing_map: torch.Tensor) -> torch.Tensor:
         """Per-token reward proportional to how overloaded the chosen experts are.
         
@@ -931,7 +1043,9 @@ class RouterTrajectoryTracker:
         num_chosen = routing_map.float().sum(dim=-1).clamp(min=1.0)  # [seq, batch]
         avg_chosen_load = token_load / num_chosen
         
-        return -(avg_chosen_load - ideal_load) / ideal_load.clamp(min=1.0)
+        # equivalent to the shared gradF attribution with w = expert_loads (F = 1/2||N||^2);
+        # per_token_topm / per_token_smoothmax generalise this to w = grad F for other F.
+        return self._per_token_from_weights(routing_map, expert_loads, w_floor=1.0)
 
     def loo_smoothmax_reward(self, routing_map: torch.Tensor, rl_action: dict = None) -> torch.Tensor:
         """H2: global leave-one-out smooth-max (congestion) reward, corrected sign.
@@ -1377,6 +1491,35 @@ class RouterTrajectoryTracker:
         wrap_print_rank_0(f"REINFORCE (per-token) DEBUG: total_loss={total_loss.item():.6f}, total_tokens={total_tokens}")
         return total_loss
 
+
+    def compute_soft_smoothmax_loss(self, trajectory_data):
+        """DIFFERENTIABLE soft-smooth-max control (answers 'do we even need RL?').
+
+        For each MoE layer: soft_loads_e = sum_t softmax(logits_t)_e — differentiable in the
+        router. Loss = mean over layers of (J - ideal)/ideal, with J = tau*logsumexp(soft_loads/tau)
+        (a smooth max of the SOFT loads) and tau = c*(max-mean) scale-invariant. This backprops the
+        smooth-max through the router logits directly — NO policy gradient, NO sampling, NO reward.
+        If RL-loo_smoothmax Pareto-dominates this on accuracy-vs-CP, RL earns its keep (it optimises
+        the TRUE, non-differentiable hard argmax-CP; this optimises a differentiable soft surrogate).
+        """
+        sorted_layers = sorted(trajectory_data.keys())
+        c = float(getattr(self, 'reward_c', 0.1))
+        total = None; dev = None
+        for ln in sorted_layers:
+            _, _rm, routing_logits, _ = trajectory_data[ln]
+            logits = routing_logits.float(); dev = logits.device
+            E = logits.shape[-1]
+            probs = torch.softmax(logits.reshape(-1, E), dim=-1)   # [T, E], differentiable
+            soft_loads = probs.sum(dim=0)                          # [E]
+            ideal = soft_loads.mean().clamp(min=1e-6)
+            spread = (soft_loads.max() - soft_loads.mean()).clamp(min=1e-6)
+            tau = (c * spread).clamp(min=1e-6)
+            J = tau * torch.logsumexp(soft_loads / tau, dim=0)     # smooth max, differentiable
+            layer_loss = (J - ideal) / ideal
+            total = layer_loss if total is None else total + layer_loss
+        if total is None:
+            return torch.zeros((), device=dev if dev is not None else 'cuda')
+        return total / max(1, len(sorted_layers))
 
     def compute_ppo_loss(self, trajectory_data: Dict, old_trajectory_data: Dict = None, 
                         discount_factor: float = 0.99, clip_ratio: float = 0.2, 
@@ -1869,6 +2012,10 @@ class RouterTrajectoryTracker:
             _, routing_map, _, _ = self.old_layer_decisions[layer_num]
             if self.reward_type == 'per_token_load_weighted':
                 reward = self.per_token_load_weighted_reward(routing_map)
+            elif self.reward_type == 'per_token_topm':
+                reward = self.per_token_topm_reward(routing_map)
+            elif self.reward_type == 'per_token_smoothmax':
+                reward = self.per_token_smoothmax_reward(routing_map)
             elif self.reward_type == 'diff_lse_load':
                 _, _, _rl_logits, _ = self.old_layer_decisions[layer_num]
                 reward = self.diff_lse_load_reward(routing_map, _rl_logits)
@@ -2064,6 +2211,10 @@ class RouterTrajectoryTracker:
                     _, rm, _, _ = rp_traj[ln]
                     if self.reward_type == 'per_token_load_weighted':
                         rp_rewards[ln] = self.per_token_load_weighted_reward(rm)
+                    elif self.reward_type == 'per_token_topm':
+                        rp_rewards[ln] = self.per_token_topm_reward(rm)
+                    elif self.reward_type == 'per_token_smoothmax':
+                        rp_rewards[ln] = self.per_token_smoothmax_reward(rm)
                     elif self.reward_type == 'per_token_topn_binary':
                         rp_rewards[ln] = self.per_token_topn_binary_reward(rm)
                     else:
@@ -2138,6 +2289,10 @@ def get_trajectory_tracker() -> RouterTrajectoryTracker:
             _global_trajectory_tracker.ppo_entropy_coeff = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
             _global_trajectory_tracker.reward_type = getattr(args, 'rl_reward_type', 'expert0')
             _global_trajectory_tracker.reward_topn = getattr(args, 'rl_reward_topn', 12)
+            _global_trajectory_tracker.reward_topm = getattr(args, 'rl_reward_topm', 0)
+            _global_trajectory_tracker.reward_c = getattr(args, 'rl_reward_c', 0.1)
+            _global_trajectory_tracker.reward_c_end = getattr(args, 'rl_reward_c_end', 0.0)
+            _global_trajectory_tracker.ep_size = getattr(args, 'expert_model_parallel_size', 1)
             _global_trajectory_tracker.baseline_type = getattr(args, 'rl_ppo_baseline_type', 'mean')
             _global_trajectory_tracker.critic_hidden_dims = getattr(args, 'rl_critic_hidden_dims', [256])
             _global_trajectory_tracker.critic_lr = getattr(args, 'rl_critic_lr', 1e-3)

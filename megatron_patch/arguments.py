@@ -535,7 +535,8 @@ def get_patch_args(parser):
                       help='Hidden dimensions for critic network layers (default: 256). Examples: "256" for 1 layer, "256 64 32" for 3 layers')
     group.add_argument('--rl-reward-type', type=str, default='expert0',
                       choices=['expert0', 'entropy', 'topn_load', 'critical_path',
-                               'per_token_topn_binary', 'per_token_load_weighted', 'diff_lse_load',
+                               'per_token_topn_binary', 'per_token_load_weighted', 'per_token_topm',
+                               'per_token_smoothmax', 'diff_lse_load',
                                'loo_smoothmax', 'loo_maxrelative'],
                       help='Reward function type: expert0 (focus on expert 0), entropy (load balance entropy), '
                            'topn_load (avg/topN load ratio), critical_path (directly targets max expert load), '
@@ -543,6 +544,14 @@ def get_patch_args(parser):
                            'per_token_load_weighted (per-token: continuous reward based on chosen expert load)')
     group.add_argument('--rl-reward-topn', type=int, default=12,
                       help='Number of top experts to consider for topn_load reward (default: 12)')
+    group.add_argument('--rl-reward-topm', type=int, default=0,
+                      help='Top-m for per_token_topm CVaR reward (per-token attribution of the top-m mean load). 0 => auto (num_experts // expert_model_parallel_size). m=1 => hard max (the CP metric).')
+    group.add_argument('--rl-reward-c', type=float, default=0.1,
+                      help='Smoothmax temperature factor c: tau = c*(max-mean), scale-invariant (default 0.1).')
+    group.add_argument('--rl-reward-c-end', type=float, default=0.0,
+                      help='If >0, linearly anneal smoothmax c from --rl-reward-c to this over train_iters.')
+    group.add_argument('--rl-soft-smoothmax', action='store_true', default=False,
+                      help='DIFFERENTIABLE soft-smooth-max aux loss (NO RL): backprop the smooth-max of the soft loads through the router. Control for whether RL is needed.')
     group.add_argument('--rl-discount-factor', type=float, default=0.9,
                       help='Discount factor (gamma) for RL returns calculation (default: 0.9). Lower values weight immediate rewards more.')
     group.add_argument('--rl-normalize-rewards', action='store_true', default=False,
@@ -661,6 +670,9 @@ def get_patch_args(parser):
                       help='KL divergence loss coefficient. 0 = disabled. '
                            'Penalizes deviation of LM output distribution from pretrained reference. '
                            'Requires one extra no-grad forward pass per step (~1.5x wall time).')
+    group.add_argument('--router-kl-coeff', type=float, default=0.0,
+                      help='Router-KL anchor coeff; penalizes routing-distribution drift '
+                           'from the frozen iter-0 router. 0 = disabled.')
     group.add_argument('--moe-router-topology-aware', action='store_true', default=False,
                       help='Enable topology-aware routing: adds a non-trainable bias to local '
                            'expert logits before top-k selection, reducing cross-GPU communication. '

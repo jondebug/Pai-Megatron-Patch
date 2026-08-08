@@ -50,6 +50,10 @@ _kl_state = {
     # clobber current_logits with the frozen-router outputs, making the
     # subsequent KL computation collapse to ~0).
     'capture_disabled': False,
+    # Router-KL: when True, the core router stashes per-layer routing logits into
+    # ref_routing_logits during the frozen-router reference forward (analogous to
+    # capture_disabled). Only set True when router_kl_coeff>0.
+    'capture_ref_routing': False,
 }
 
 def _kl_capture_logits_hook(module, input, output):
@@ -330,9 +334,13 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.baseline_type = getattr(args, 'rl_ppo_baseline_type', 'mean')
     trajectory_tracker.reward_type = getattr(args, 'rl_reward_type', 'expert0')
     trajectory_tracker.reward_topn = getattr(args, 'rl_reward_topn', 12)
+    trajectory_tracker.reward_topm = getattr(args, 'rl_reward_topm', 0)
+    trajectory_tracker.reward_c = getattr(args, 'rl_reward_c', 0.1)
+    trajectory_tracker.reward_c_end = getattr(args, 'rl_reward_c_end', 0.0)
+    trajectory_tracker.ep_size = getattr(args, 'expert_model_parallel_size', 1)
     trajectory_tracker.per_token_rewards = getattr(args, 'rl_per_token_rewards', False)
     # Auto-detect per_token_rewards for reward types that are inherently per-token
-    _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "loo_smoothmax", "loo_maxrelative"}
+    _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "per_token_topm", "per_token_smoothmax", "loo_smoothmax", "loo_maxrelative"}
     if trajectory_tracker.reward_type in _PER_TOKEN_REWARD_TYPES:
         trajectory_tracker.per_token_rewards = True
     trajectory_tracker.ppo_entropy_coeff = getattr(args, 'rl_ppo_entropy_coeff', 0.01)
@@ -392,7 +400,9 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         trajectory_tracker.inject_lm_reward(output_tensor, lm_reward_coeff)
     
     # Compute RL loss based on selected algorithm
-    if rl_algorithm == 'ppo':
+    if getattr(args, 'rl_soft_smoothmax', False):
+        rl_loss = trajectory_tracker.compute_soft_smoothmax_loss(trajectory_tracker.layer_decisions)
+    elif rl_algorithm == 'ppo':
         rl_loss = trajectory_tracker.compute_ppo_loss(
             trajectory_tracker.layer_decisions,
             trajectory_tracker.old_layer_decisions,
@@ -584,6 +594,39 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         except Exception as e:
             print_rank_0(f"[KL] WARNING: KL computation failed: {e}")
 
+    # --- Router-KL anchor (sibling of head-KL; independently gated) ---
+    router_kl_coeff = getattr(args, 'router_kl_coeff', 0.0)
+    if router_kl_coeff > 0 and _kl_state.get('ref_routing_logits'):
+        try:
+            import torch.nn.functional as F
+            ref_routing = _kl_state['ref_routing_logits']
+            per_layer_kl = []
+            for layer_num, decision in trajectory_tracker.layer_decisions.items():
+                if layer_num not in ref_routing:
+                    continue
+                cur_l = decision[2]                # [seq, batch, E] — in grad graph
+                ref_l = ref_routing[layer_num]     # [seq, batch, E] — frozen, detached
+                if cur_l.shape != ref_l.shape:
+                    continue
+                # Match head-KL EXACTLY: KL(ref || cur), reverse-KL, T=1.
+                cur_lp = F.log_softmax(cur_l.float(), dim=-1)
+                ref_p = F.softmax(ref_l.float(), dim=-1)
+                kl_l = F.kl_div(cur_lp, ref_p, reduction='none').sum(dim=-1).mean()
+                per_layer_kl.append(kl_l)
+            if per_layer_kl:
+                router_kl = torch.stack(per_layer_kl).mean()   # average over layers
+                rl_loss = rl_loss + router_kl_coeff * router_kl
+                loss_dict['router_kl_loss'] = router_kl.detach()
+                critical_metrics['critical/router_kl_loss'] = router_kl.item()
+                _rk_n = getattr(loss_func_with_rl, '_router_kl_print_count', 0)
+                if _rk_n < 10 or _rk_n % 100 == 0:
+                    print(f"[ROUTER-KL DEBUG] call={_rk_n} router_kl={router_kl.item():.4e} "
+                          f"scaled={(router_kl_coeff * router_kl).item():.4e} "
+                          f"coeff={router_kl_coeff} n_layers={len(per_layer_kl)}", flush=True)
+                loss_func_with_rl._router_kl_print_count = _rk_n + 1
+        except Exception as e:
+            print_rank_0(f"[ROUTER-KL] WARNING: router-KL computation failed: {e}")
+
     # P3: snapshot the just-completed rollout (sampled actions/pools/advantages/old log-prob)
     # BEFORE the reset clears pl_decisions. The post-step recompute happens at the top of the
     # next forward_step (after this rollout's optimizer.step()). Best-effort; never fatal.
@@ -721,6 +764,13 @@ def _run_reference_forward(model, tokens, position_ids, attention_mask, packed_s
     # both end up holding the frozen-router output and KL collapses to ~0.
     _kl_state['capture_disabled'] = True
 
+    # Router-KL: capture the frozen-router per-layer routing logits during this
+    # reference forward. Only when router-KL is enabled (keeps head-KL-only runs unchanged).
+    _router_kl_on = getattr(get_args(), 'router_kl_coeff', 0.0) > 0
+    if _router_kl_on:
+        _kl_state['ref_routing_logits'] = {}
+        _kl_state['capture_ref_routing'] = True
+
     # Reference forward (no grad, labels=None to get logits)
     try:
         with torch.no_grad():
@@ -741,6 +791,7 @@ def _run_reference_forward(model, tokens, position_ids, attention_mask, packed_s
     finally:
         # Re-enable logit capture before any subsequent forwards
         _kl_state['capture_disabled'] = False
+        _kl_state['capture_ref_routing'] = False
         # Restore current router weights
         for name, param in model.named_parameters():
             if name in saved_weights:
@@ -765,11 +816,12 @@ def forward_step(data_iterator, model):
     args = get_args()
 
     kl_loss_coeff = getattr(args, 'kl_loss_coeff', 0.0)
+    router_kl_coeff = getattr(args, 'router_kl_coeff', 0.0)
 
     # One-time initialization: always register logit capture hook (for output metrics),
     # only snapshot router weights when KL loss is enabled
     if not _kl_state['initialized']:
-        _init_kl_state(model, snapshot_weights=(kl_loss_coeff > 0))
+        _init_kl_state(model, snapshot_weights=(kl_loss_coeff > 0 or router_kl_coeff > 0))
 
     # --- P2/P3: measurement infrastructure. Cheap/idempotent; all no-ops unless the
     # probe/audit intervals are set. snapshot_theta0 runs on the very first forward_step,
@@ -806,6 +858,8 @@ def forward_step(data_iterator, model):
 
     # Clear previous logits
     _kl_state['current_logits'] = None
+    if router_kl_coeff > 0:
+        _kl_state['ref_routing_logits'] = {}
 
     if 'loss_mask' in inspect.signature(GPTModel.forward).parameters:
         # NOTE: MTP-head (since 0328) requires loss_mask to compute correct loss scale.
@@ -815,7 +869,7 @@ def forward_step(data_iterator, model):
     # After normal forward, _kl_state['current_logits'] is populated by the hook (if KL enabled)
 
     # Run reference forward for KL constraint (only during training with grad)
-    if kl_loss_coeff > 0 and torch.is_grad_enabled():
+    if (kl_loss_coeff > 0 or router_kl_coeff > 0) and torch.is_grad_enabled():
         _run_reference_forward(model, tokens, position_ids, attention_mask, packed_seq_params)
 
     # Periodic HellaSwag benchmark via subprocess after checkpoint saves.
