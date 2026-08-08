@@ -394,10 +394,6 @@ class RouterTrajectoryTracker:
         """Reset the trajectory for a new forward pass."""
         # Store old trajectory for PPO importance sampling
         self.old_layer_decisions = getattr(self, 'layer_decisions', {}).copy()
-        # H1: mirror the PL safeguard bundle (FIXED pool + ordered action + frozen old PL log-prob)
-        # into old_pl_decisions so the post-step extra PPO epochs can re-score the SAME action with
-        # the ordered Plackett-Luce log-prob instead of the summed independent-softmax (H1 fix).
-        self.old_pl_decisions = getattr(self, 'pl_decisions', {}).copy()
         
         # Populate replay buffer with the completed trajectory (moved to CPU)
         if self.replay_buffer_size > 0 and self.old_layer_decisions:
@@ -575,7 +571,7 @@ class RouterTrajectoryTracker:
                 self._ema_expert_loads = (1 - self._ema_momentum) * self._ema_expert_loads + self._ema_momentum * batch_loads
 
         # Auto-set per_token_rewards for reward types that are inherently per-token
-        _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "per_token_topm", "per_token_smoothmax", "expert0", "diff_lse_load", "loo_smoothmax", "loo_maxrelative"}
+        _PER_TOKEN_REWARD_TYPES = {"per_token_topn_binary", "per_token_load_weighted", "per_token_topm", "per_token_smoothmax", "expert0", "diff_lse_load", "loo_smoothmax", "loo_maxrelative", "loo_smoothmax_adaptive"}
         if self.reward_type in _PER_TOKEN_REWARD_TYPES:
             self.per_token_rewards = True
 
@@ -612,12 +608,60 @@ class RouterTrajectoryTracker:
             # H2: global leave-one-out smooth-max reward (corrected sign). Uses the ordered
             # sampled action when threaded (rl_action), else reconstructs the set from routing_map.
             reward = self.loo_smoothmax_reward(routing_map, rl_action)
+        elif self.reward_type == "loo_smoothmax_adaptive":
+            reward = self.loo_smoothmax_adaptive_reward(routing_map, rl_action)
         elif self.reward_type == "loo_maxrelative":
             # P5: max-relative reward tied directly to the per-layer MAX (the CP bottleneck).
             reward = self.loo_maxrelative_reward(routing_map, rl_action)
         else:  # "expert0" (default)
             reward = self.focus_tokens_on_expert_0_reward(routing_map)
         
+        # [GAMMA-PHASE1 2026-08-06] DEVICE-LOCALITY COUPLING TERM
+        # ---------------------------------------------------------------------
+        # WHY: CP = sum_l max_e n_{l,e} is effectively SEPARABLE across layers --
+        # every layer owns its router (48 independent gate.weight tensors), so
+        # layer l+1 can rebalance whatever state layer l hands it. Measured:
+        # rerouting 100% of tokens at layer l moves the downstream load vector by
+        # only 3.5-5%. If the objective is separable there is nothing for gamma to
+        # propagate, and no estimator/critic/budget can change that.
+        #
+        # This term makes r_{l+1} an EXPLICIT function of a_l: under EP, expert e
+        # lives on device e // (E/ep), and a token is rewarded for reusing the
+        # devices it used at the previous layer. A myopic (gamma=0) policy is then
+        # provably blind to something real -- it gets credit for matching layer
+        # l-1, but none for leaving layer l+1 an easy set to match. gamma>0 sees
+        # exactly that. It is also a genuine systems objective: device reuse cuts
+        # all-to-all traffic.
+        #
+        # PREDICTION: gamma>0 beats gamma=0 with this term ON and not with it OFF.
+        # A significant interaction proves the separability mechanism; no
+        # interaction disproves it.
+        _loc_coeff = float(getattr(self, 'locality_coeff', 0.0) or 0.0)
+        if _loc_coeff > 0.0 and reward.dim() > 0:
+            try:
+                _prev = [l for l in self.layer_decisions.keys() if l < layer_num]
+                if _prev:
+                    _pl = max(_prev)
+                    _prev_rm = self.layer_decisions[_pl][1]           # [seq,batch,E] bool
+                    _sq, _bs, _E = routing_map.shape
+                    _ep = int(getattr(self, 'ep_size_for_locality', 0)) or 8
+                    if _E % _ep == 0:
+                        _per = _E // _ep
+                        _cur_dev = routing_map.reshape(_sq, _bs, _ep, _per).any(-1).float()
+                        _prv_dev = _prev_rm.reshape(_sq, _bs, _ep, _per).any(-1).float()
+                        # fraction of THIS token's devices that it also used last layer
+                        _reuse = (_cur_dev * _prv_dev).sum(-1) / _cur_dev.sum(-1).clamp(min=1.0)
+                        reward = reward + _loc_coeff * _reuse.to(reward.dtype)
+                        self._last_locality_reuse = float(_reuse.mean().item())
+                        self._locality_fired = 1.0
+                        if layer_num in (1, 2):
+                            wrap_print_rank_0(
+                                f"[RL LOCALITY] layer={layer_num} coeff={_loc_coeff} ep={_ep} "
+                                f"mean_device_reuse={self._last_locality_reuse:.4f} "
+                                f"(r_l now depends on a_(l-1) => gamma has something to propagate)")
+            except Exception as _e:
+                wrap_print_rank_0(f"[RL LOCALITY] disabled after error: {_e}")
+
         # Apply reward normalization if enabled (expands compressed reward ranges)
         raw_reward_summary = reward.mean().item() if reward.dim() > 0 else reward.item()
         self._last_raw_reward_std = float(reward.std().item()) if (reward.dim() > 0 and reward.numel() > 1) else 0.0
@@ -1118,6 +1162,54 @@ class RouterTrajectoryTracker:
             pass
         return r.reshape(seq, bsz)
 
+    def loo_smoothmax_adaptive_reward(self, routing_map: torch.Tensor, rl_action: dict = None) -> torch.Tensor:
+        """loo_smoothmax with SCALE-INVARIANT, annealed sharpness (fixes the fixed-beta flaw).
+
+        loo_smoothmax uses J(n)=logsumexp(beta*n)/beta with a FIXED beta=0.01 in raw load units,
+        so the effective sharpness beta*spread drifts with batch/seq/model scale and will not
+        transfer 30B->235B->8k prefill. Here beta = 1/(c*(max-mean)) => beta*spread = 1/c is
+        constant; c is annealed reward_c -> reward_c_end (soft->sharp, avoids whack-a-mole).
+        Exact per-token leave-one-out r_t = J(n-Delta_t)-J(n) <= 0 on the smooth max of loads
+        (a differentiable surrogate for CP). This is the exact-counterfactual analog of
+        per_token_smoothmax (which uses the gradient softmax(n/tau), tau=c*spread).
+        """
+        rm = routing_map.float()
+        seq, bsz, E = rm.shape
+        Tt = seq * bsz
+        if rl_action is not None and rl_action.get('experts', None) is not None:
+            S = rl_action['experts'].reshape(Tt, -1).long()
+        else:
+            k = int(rm.reshape(Tt, E).sum(dim=-1).max().item())
+            S = rm.reshape(Tt, E).topk(max(1, k), dim=-1).indices.long()
+        local_counts = rm.reshape(Tt, E).sum(dim=0)
+        group = rl_resolve_token_covering_group() if getattr(self, 'global_loads', False) else None
+        global_counts = rl_all_reduce_global_loads(local_counts, group=group)
+        n = global_counts.float()
+        c = float(getattr(self, 'reward_c', 0.1))
+        _ce = float(getattr(self, 'reward_c_end', 0.0))
+        if _ce > 0.0:
+            try:
+                from megatron import get_args as _ga
+                _a = _ga(); _it = float(getattr(_a, 'curr_iteration', 0) or 0); _Ti = float(getattr(_a, 'train_iters', 0) or 0)
+                if _Ti > 0:
+                    c = c + (_ce - c) * min(1.0, max(0.0, _it / _Ti))
+            except Exception:
+                pass
+        spread = (n.max() - n.mean()).clamp(min=1.0)
+        beta = float((1.0 / (c * spread)).clamp(min=1e-12).item())   # beta*spread = 1/c (scale-invariant)
+        r = rl_loo_smoothmax_reward(global_counts, S, beta=beta)
+        try:
+            import torch.distributed as _d
+            if (not _d.is_initialized()) or _d.get_rank() == 0:
+                _w = torch.softmax(beta * n, dim=0); _p = _w / _w.sum().clamp(min=1e-12)
+                _neff = torch.exp(-(_p * _p.clamp_min(1e-12).log()).sum()).item()
+                self._reward_diag_calls = getattr(self, '_reward_diag_calls', 0) + 1
+                if self._reward_diag_calls % 94 == 1:
+                    print(f"[RL REWARD] reward=loo_smoothmax_adaptive c={c:.3f} beta={beta:.3e} N_eff={_neff:.2f}", flush=True)
+        except Exception:
+            pass
+        return r.reshape(seq, bsz)
+
     def loo_maxrelative_reward(self, routing_map: torch.Tensor, rl_action: dict = None) -> torch.Tensor:
         """P5: MAX-RELATIVE per-token reward, tied directly to the per-layer MAX load (the true
         critical-path bottleneck) rather than the smooth-max surrogate of loo_smoothmax.
@@ -1356,16 +1448,92 @@ class RouterTrajectoryTracker:
             reward_to_go = layer_rewards[layer_num] + discount_factor * reward_to_go
             layer_returns[layer_num] = reward_to_go.clone()
         
-        # Compute baseline per layer (mean return across tokens) for variance reduction
+        # ---------------------------------------------------------------- baseline
+        # [GAMMA-PHASE1 2026-08-06] A state-dependent baseline is the precondition
+        # for gamma>0 to be usable. With gamma>0 the return G_l folds up to L future
+        # rewards into every layer, of which only a small share is causally
+        # attributable to a_l (measured: ~4-5% of the load vector at full policy
+        # dose, job 31571229). A single scalar per layer cannot absorb that, so the
+        # variance swamps the signal -- which is what the gamma sweep actually
+        # measured. The critic path existed but was reachable only from PPO, whose
+        # log-prob differs (summed-softmax vs ordered Plackett-Luce), so it could
+        # not be used without confounding the estimator. This makes it reachable
+        # from REINFORCE while keeping the PL log-prob.
+        #
+        # EXACT-EQUIVALENCE CONTRACT: with baseline_type != "critic" and
+        # gae_lambda == 1.0 this block must reproduce the previous behaviour
+        # bit-for-bit -- per-LAYER mean of returns (note: the PPO path uses a
+        # GLOBAL mean instead; they are not interchangeable). Verified by
+        # gamma_multistep/test_phase1_equivalence.py.
         layer_baselines = {}
-        for layer_num in sorted_layers:
-            layer_baselines[layer_num] = layer_returns[layer_num].mean()
-        
-        # Compute per-token advantages
+        if getattr(self, 'baseline_type', 'mean') == "critic":
+            critic_loss = torch.tensor(0.0, device=device)
+            total_critic_tokens = 0
+            for layer_num in sorted_layers:
+                latent_repr, _, _, _ = trajectory_data[layer_num]
+                value = self.compute_critic_baseline(latent_repr, layer_num=layer_num)
+                target = layer_returns[layer_num].detach()
+                critic_loss = critic_loss + 0.5 * torch.square(target - value).sum()
+                total_critic_tokens += value.numel()
+                layer_baselines[layer_num] = value.detach()
+            critic_loss = critic_loss / max(1, total_critic_tokens)
+            if self._critic_optimizer is not None:
+                self._critic_optimizer.zero_grad()
+                critic_loss.backward()
+                self._critic_optimizer.step()
+            self._last_critic_loss = critic_loss.item()
+            # PROOF-OF-LIFE: without this there is no way to tell a critic run from a
+            # mean-baseline run in the logs. Printed once, then every 50 calls.
+            self._critic_calls = getattr(self, '_critic_calls', 0) + 1
+            if self._critic_calls == 1 or self._critic_calls % 50 == 0:
+                wrap_print_rank_0(
+                    f"[RL CRITIC ACTIVE] call={self._critic_calls} "
+                    f"layer_aware={getattr(self, 'critic_layer_aware', False)} "
+                    f"value_loss={self._last_critic_loss:.6e} "
+                    f"opt={'yes' if self._critic_optimizer is not None else 'NO-OPTIMIZER'} "
+                    f"baseline_shape={tuple(layer_baselines[sorted_layers[0]].shape)} "
+                    f"(scalar shape would mean the mean-baseline path ran)")
+        else:
+            self._last_critic_loss = 0.0
+            for layer_num in sorted_layers:
+                layer_baselines[layer_num] = layer_returns[layer_num].mean()
+
+        # ---------------------------------------------------------------- advantage
+        # GAE(lambda) needs gamma>0 AND lambda<1 AND a state-dependent baseline to
+        # do anything; at lambda=1 it collapses to (return - baseline).
         layer_advantages = {}
-        for layer_num in sorted_layers:
-            layer_advantages[layer_num] = (layer_returns[layer_num] - layer_baselines[layer_num]).detach()
-        
+        gae_lambda = getattr(self, 'gae_lambda', 1.0)
+        if gae_lambda < 1.0 and len(sorted_layers) > 1:
+            td_residuals = {}
+            for i, layer_num in enumerate(sorted_layers):
+                r = layer_rewards[layer_num]
+                v = layer_baselines[layer_num]
+                if i < len(sorted_layers) - 1:
+                    next_v = layer_baselines[sorted_layers[i + 1]]
+                    td_residuals[layer_num] = (r + discount_factor * next_v - v).detach()
+                else:
+                    td_residuals[layer_num] = (r - v).detach()
+            gae = torch.zeros_like(first_reward)
+            for layer_num in reversed(sorted_layers):
+                gae = td_residuals[layer_num] + discount_factor * gae_lambda * gae
+                layer_advantages[layer_num] = gae.clone().detach()
+        else:
+            for layer_num in sorted_layers:
+                layer_advantages[layer_num] = (layer_returns[layer_num] - layer_baselines[layer_num]).detach()
+
+        # ------------------------------------------------- pre-whitening telemetry
+        # [GAMMA-PHASE1] rl_advantage_std is identically 1.0 in every historical log
+        # because advantages are whitened before logging, which made the question
+        # "would a small cross-layer signal be detectable?" unanswerable from the
+        # telemetry. Record the moments BEFORE whitening.
+        with torch.no_grad():
+            _pre = torch.cat([layer_advantages[ln].flatten() for ln in sorted_layers])
+            self._rl_adv_std_prewhiten = float(_pre.std().item())
+            self._rl_adv_mean_prewhiten = float(_pre.mean().item())
+            self._rl_adv_std_perlayer = {
+                int(ln): float(layer_advantages[ln].std().item()) for ln in sorted_layers
+            }
+
         # Normalize advantages across all tokens and layers to zero mean, unit variance
         # [experiment flag] --rl-no-advantage-norm skips this to preserve the reward calibrated scale.
         if not getattr(self, 'no_advantage_norm', False):
@@ -1374,7 +1542,7 @@ class RouterTrajectoryTracker:
             adv_std = all_advs.std().clamp(min=1e-8)
             for ln in sorted_layers:
                 layer_advantages[ln] = (layer_advantages[ln] - adv_mean) / adv_std
-        
+
         total_loss = torch.tensor(0.0, device=device)
         total_tokens = 0
         
@@ -1441,7 +1609,16 @@ class RouterTrajectoryTracker:
             _ptlp_std = _adv_std_used = _cov = _rrstd = 0.0
         self.last_loss_components = {
             'policy_loss': total_loss.item(),
-            'value_loss': 0.0,
+            # [GAMMA-PHASE1 2026-08-06] was hardcoded 0.0 -- written when REINFORCE had
+            # no critic. Left unchanged it silently discards _last_critic_loss, so a run
+            # configured with baseline_type=critic is INDISTINGUISHABLE in the logs from
+            # one running a mean baseline. That is the exact failure signature of the
+            # 2026-07-30 disconnection bug. Surface it.
+            'value_loss': float(getattr(self, '_last_critic_loss', 0.0)),
+            # [GAMMA-PHASE1] wrap_print_rank_0 is SWALLOWED in this container ([RL DEBUG]
+            # never appears), so proof-of-life must travel as a METRIC, not a print.
+            'locality_reuse': float(getattr(self, '_last_locality_reuse', 0.0)),
+            'critic_active': float(getattr(self, '_critic_calls', 0) > 0),
             'entropy_bonus': 0.0,
             'mean_advantage': 0.0,
             'mean_reward': mean_reward,
@@ -1859,25 +2036,8 @@ class RouterTrajectoryTracker:
             
             # Current policy log probabilities per token
             log_probs = torch.nn.functional.log_softmax(routing_logits, dim=-1)
-            # H1: under hard_gumbel_pl, score the SAMPLED action with the ordered Plackett-Luce
-            # log-prob over the FIXED detached pool (the SAME path REINFORCE differentiates) so PPO
-            # no longer bypasses the PL log-prob with a summed independent-softmax (the H1 mismatch).
-            _pl_ok = (getattr(self, 'rl_sampling', 'argmax') == 'hard_gumbel_pl'
-                      and layer_num in getattr(self, 'pl_decisions', {}))
-            if _pl_ok:
-                _pld = self.pl_decisions[layer_num]
-                assert torch.equal(_pld['pool_idx'].gather(-1, _pld['pos']), _pld['experts']), \
-                    "[RL] PPO PL recompute pool/action mismatch (safeguard)"
-                _tau = float(getattr(self, 'rl_stochastic_temperature', 1.0)) or 1.0
-                current_per_token_log_prob = rl_ordered_logprob(
-                    rl_fp32(routing_logits), _pld['pool_idx'], _pld['pos'], _tau)  # grad-tracked
-                # OLD-policy PL log-prob = the frozen rollout-time ordered log-prob (== current
-                # detached at epoch 1 => ratio 1). Stored in pl_decisions at decision time.
-                _old_ptlp_pl = _pld['old_ptlp']
-            else:
-                chosen_log_probs = log_probs * routing_map.float()
-                current_per_token_log_prob = chosen_log_probs.sum(dim=-1)
-                _old_ptlp_pl = None
+            chosen_log_probs = log_probs * routing_map.float()
+            current_per_token_log_prob = chosen_log_probs.sum(dim=-1)
             
             if legacy_mode:
                 # Legacy behavior (REINFORCE-style main PPO update).
@@ -1886,13 +2046,9 @@ class RouterTrajectoryTracker:
                 approx_kl = torch.zeros_like(current_per_token_log_prob)
                 clip_fraction = torch.zeros_like(current_per_token_log_prob)
             else:
-                if _pl_ok:
-                    # PPO ratio = exp(new_ordered_logprob - old_ordered_logprob) over the FIXED pool.
-                    old_per_token_log_prob = _old_ptlp_pl
-                else:
-                    old_log_probs = torch.nn.functional.log_softmax(routing_logits.detach(), dim=-1)
-                    old_chosen_log_probs = old_log_probs * routing_map.float()
-                    old_per_token_log_prob = old_chosen_log_probs.sum(dim=-1)
+                old_log_probs = torch.nn.functional.log_softmax(routing_logits.detach(), dim=-1)
+                old_chosen_log_probs = old_log_probs * routing_map.float()
+                old_per_token_log_prob = old_chosen_log_probs.sum(dim=-1)
 
                 log_ratio = torch.clamp(current_per_token_log_prob - old_per_token_log_prob, -10.0, 10.0)
                 ratio = torch.exp(log_ratio)
@@ -2064,7 +2220,7 @@ class RouterTrajectoryTracker:
         return gpu_trajectory
 
     def _compute_ppo_epoch_loss(self, trajectory, original_logits, layer_advantages,
-                                 clip_ratio, rl_loss_coeff, device, pl_decisions=None):
+                                 clip_ratio, rl_loss_coeff, device):
         """Compute PPO clipped loss for a single trajectory (shared between current + replay)."""
         sorted_layers = sorted(trajectory.keys())
         total_loss = torch.tensor(0.0, device=device)
@@ -2085,21 +2241,8 @@ class RouterTrajectoryTracker:
             old_rm = old_routing_map.float()
 
             if self.per_token_rewards:
-                # H1: extra-epoch importance ratio on the SAME ordered PL log-prob under hard_gumbel_pl.
-                # new = current-policy PL log-prob over the FIXED pool; orig = frozen rollout-policy PL
-                # log-prob (pl_decisions['old_ptlp']). After the main optimizer step the router has
-                # moved, so this ratio genuinely differs from 1 (real off-policy importance sampling).
-                _epl_ok = (getattr(self, 'rl_sampling', 'argmax') == 'hard_gumbel_pl'
-                           and pl_decisions is not None and layer_num in pl_decisions)
-                if _epl_ok:
-                    _pld = pl_decisions[layer_num]
-                    _tau = float(getattr(self, 'rl_stochastic_temperature', 1.0)) or 1.0
-                    new_per_token = rl_ordered_logprob(
-                        rl_fp32(new_logits), _pld['pool_idx'], _pld['pos'], _tau)
-                    orig_per_token = _pld['old_ptlp']
-                else:
-                    new_per_token = (new_lp * old_rm).sum(dim=-1)
-                    orig_per_token = (orig_lp * old_rm).sum(dim=-1)
+                new_per_token = (new_lp * old_rm).sum(dim=-1)
+                orig_per_token = (orig_lp * old_rm).sum(dim=-1)
                 log_ratio = torch.clamp(new_per_token - orig_per_token, -10.0, 10.0)
                 ratio = torch.exp(log_ratio)
 
@@ -2108,10 +2251,6 @@ class RouterTrajectoryTracker:
                 per_token_loss = -torch.min(pg1, pg2)
                 total_loss += per_token_loss.sum()
                 total_tokens += per_token_loss.numel()
-                try:
-                    self._extra_epoch_is_ratios.append(ratio.detach().flatten().float())
-                except Exception:
-                    pass
             else:
                 adv = advantages if isinstance(advantages, torch.Tensor) else torch.tensor(advantages, device=device)
                 if adv.dim() > 0:
@@ -2193,15 +2332,13 @@ class RouterTrajectoryTracker:
         cached_advantages = self._recompute_rollout_advantages(discount_factor) if legacy_mode else None
 
         # Run K-1 extra epochs
-        self._extra_epoch_is_ratios = []  # H1: collect off-policy PL importance ratios for telemetry
         for epoch in range(self.ppo_epochs - 1):
             layer_advantages = cached_advantages if legacy_mode else self._recompute_rollout_advantages(discount_factor)
 
             # Loss from current trajectory
             total_loss, total_tokens = self._compute_ppo_epoch_loss(
                 self.old_layer_decisions, original_logits, layer_advantages,
-                clip_ratio, rl_loss_coeff, device,
-                pl_decisions=getattr(self, 'old_pl_decisions', None))
+                clip_ratio, rl_loss_coeff, device)
 
             # Add losses from replay buffer trajectories
             for rp_traj, rp_orig in zip(replay_rollouts, replay_orig_logits):
@@ -2244,28 +2381,9 @@ class RouterTrajectoryTracker:
             self._ppo_optimizer.step()
 
         opt_name = self._ppo_optimizer.__class__.__name__ if self._ppo_optimizer is not None else "None"
-        # H1: surface the extra-epoch (off-policy) PL importance-sampling ratio. With hard_gumbel_pl
-        # this differs from 1 once the router has moved -> confirms PPO is doing REAL importance
-        # sampling that single-epoch REINFORCE cannot (ratio is identically 1 on the fresh rollout).
-        try:
-            if getattr(self, '_extra_epoch_is_ratios', None):
-                _eir = torch.cat(self._extra_epoch_is_ratios)
-                _eir_mean = float(_eir.mean().item()); _eir_p99 = float(torch.quantile(_eir, 0.99).item())
-                _eir_max = float(_eir.max().item())
-            else:
-                _eir_mean = _eir_p99 = _eir_max = 1.0
-        except Exception:
-            _eir_mean = _eir_p99 = _eir_max = 1.0
-        try:
-            self.last_loss_components['is_extra_ratio_mean'] = _eir_mean
-            self.last_loss_components['is_extra_ratio_p99'] = _eir_p99
-        except Exception:
-            pass
         print(f"[PPO MULTI-EPOCH] Ran {self.ppo_epochs - 1} extra epochs "
                          f"(lr={extra_lr:.2e}, opt={opt_name}, legacy={legacy_mode}, buf={len(replay_rollouts)}), "
-                         f"last_loss={total_loss.item():.6f} "
-                         f"is_extra_ratio_mean={_eir_mean:.4f} is_extra_ratio_p99={_eir_p99:.4f} "
-                         f"is_extra_ratio_max={_eir_max:.4f}")
+                         f"last_loss={total_loss.item():.6f}")
 
 
 # Global trajectory tracker instance

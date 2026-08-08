@@ -367,6 +367,8 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
     trajectory_tracker.rl_stochastic_temperature = getattr(args, 'rl_stochastic_temperature', 1.0)
     trajectory_tracker.global_loads = getattr(args, 'rl_global_loads', False)
     trajectory_tracker.loo_beta = getattr(args, 'rl_loo_beta', 0.3)
+    trajectory_tracker.locality_coeff = getattr(args, 'rl_locality_coeff', 0.0)
+    trajectory_tracker.ep_size_for_locality = getattr(args, 'rl_locality_ep', 8)
     print(f"[RL CONFIG] reward_type={trajectory_tracker.reward_type}, "
           f"baseline_type={trajectory_tracker.baseline_type}, "
           f"per_token_rewards={trajectory_tracker.per_token_rewards}, "
@@ -428,6 +430,8 @@ def loss_func_with_rl(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_te
         
         loss_dict["rl_policy_loss"] = policy_loss
         loss_dict["rl_value_loss"] = value_loss
+        loss_dict["rl_locality_reuse"] = torch.tensor(components.get("locality_reuse", 0.0))
+        loss_dict["rl_critic_active"] = torch.tensor(components.get("critic_active", 0.0))
         loss_dict["rl_entropy_bonus"] = torch.tensor(components.get('entropy_bonus', 0.0))
         loss_dict["rl_mean_advantage"] = torch.tensor(components.get('mean_advantage', 0.0))
         loss_dict["rl_mean_reward"] = torch.tensor(components.get('mean_reward', 0.0))

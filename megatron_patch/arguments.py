@@ -537,7 +537,7 @@ def get_patch_args(parser):
                       choices=['expert0', 'entropy', 'topn_load', 'critical_path',
                                'per_token_topn_binary', 'per_token_load_weighted', 'per_token_topm',
                                'per_token_smoothmax', 'diff_lse_load',
-                               'loo_smoothmax', 'loo_maxrelative'],
+                               'loo_smoothmax', 'loo_smoothmax_adaptive', 'loo_maxrelative'],
                       help='Reward function type: expert0 (focus on expert 0), entropy (load balance entropy), '
                            'topn_load (avg/topN load ratio), critical_path (directly targets max expert load), '
                            'per_token_topn_binary (per-token: -1 if hot expert, +1 otherwise), '
@@ -605,6 +605,10 @@ def get_patch_args(parser):
                            'hardcoded DP -- see G7) so the loo_smoothmax reward uses TRUE global '
                            'counts. Generalizes --rl-global-load. Default False (local). The correct '
                            'group must be resolved/asserted at runtime before enabling in a real cell.')
+    group.add_argument('--rl-locality-coeff', type=float, default=0.0,
+                       help='[GAMMA-PHASE1] device-locality coupling weight; makes r_l depend on a_(l-1)')
+    group.add_argument('--rl-locality-ep', type=int, default=8,
+                       help='[GAMMA-PHASE1] EP degree for expert->device mapping')
     group.add_argument('--rl-loo-beta', type=float, default=0.3,
                       help='[H2] smooth-max sharpness beta for the loo_smoothmax reward '
                            '(J = logsumexp(beta*n)/beta). At 235B scale the per-expert counts n are '
